@@ -111,8 +111,12 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
       larger model fits in memory.
 - [ ] **A5 — GPU (CUDA via `cudarc`).** Move matmul / attention onto the 3060.
       Kernels in CUDA C or PTX. This is where it gets fast.
-- [ ] **A6 — CLI chat.** Terminal interface with sampling controls. First
-      point where PoeziAI is a usable standalone tool.
+- [x] **A6 — CLI chat.** Interactive REPL (`poezi chat <model>`) using Qwen2's
+      ChatML template, a persistent KV-cache across turns, and sampling
+      (temperature / top-k / top-p, greedy at temp 0; configurable --system,
+      --seed). Verified: coherent code answers and correct multi-turn context
+      recall. Done ahead of A4/A5 so PoeziAI is usable now. First point where
+      PoeziAI is a usable standalone tool.
 
 ### Phase D — Security agent
 
@@ -181,3 +185,7 @@ here is judged against a fixed eval set so "smarter" is measured, not felt.
   byte-identical to llama-completion at temp 0. The engine generates real text
   end to end. Reference for raw completion: llama-completion -no-cnv --temp 0.
   Next: A4 (Q4 quantization) or A6 (chat CLI) — user's choice.
+- 2026-09-28: A6 done (chose it over A4). `poezi chat` REPL with ChatML,
+  persistent KV-cache, and temp/top-k/top-p sampling. Multi-turn context works.
+  PoeziAI is now a usable local chat tool. Remaining in A: A4 (Q4 quant, to fit a
+  bigger model) and A5 (CUDA GPU). Then Phase D (security agent).

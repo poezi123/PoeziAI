@@ -8,6 +8,16 @@ use std::process::ExitCode;
 
 use poezi_gguf::MetaValue;
 
+mod chat;
+
+/// Read the value after a `--flag` on the command line, if present.
+fn flag_val<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
 use std::io::Write;
 
 /// Greedy (argmax) generation — the deterministic path we compare against
@@ -110,6 +120,31 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Some("chat") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: poezi chat <model.gguf> [--system S] [--temp T] [--top-k K] [--top-p P] [--seed N]");
+                return ExitCode::FAILURE;
+            };
+            let seed = flag_val(&args, "--seed")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0x9E3779B9)
+                });
+            let opts = chat::ChatOpts {
+                system: flag_val(&args, "--system")
+                    .unwrap_or("You are PoeziAI, a helpful and knowledgeable assistant.")
+                    .to_string(),
+                temp: flag_val(&args, "--temp").and_then(|s| s.parse().ok()).unwrap_or(0.7),
+                top_k: flag_val(&args, "--top-k").and_then(|s| s.parse().ok()).unwrap_or(40),
+                top_p: flag_val(&args, "--top-p").and_then(|s| s.parse().ok()).unwrap_or(0.95),
+                seed,
+                max_tokens: flag_val(&args, "-n").and_then(|s| s.parse().ok()).unwrap_or(512),
+            };
+            chat::run(path, opts)
         }
         Some("gen") => {
             let (Some(path), Some(prompt)) = (args.get(1), args.get(2)) else {
