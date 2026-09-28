@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/poezi-gguf",
+    "crates/poezi-tensor",
+    "crates/poezi-model",
+    "crates/poezi-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/poezi123/PoeziAI"
+
+[workspace.dependencies]
+poezi-gguf = { path = "crates/poezi-gguf" }
+poezi-tensor = { path = "crates/poezi-tensor" }
+poezi-model = { path = "crates/poezi-model" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

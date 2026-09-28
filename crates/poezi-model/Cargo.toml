@@ -1,0 +1,10 @@
+[package]
+name = "poezi-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+poezi-gguf.workspace = true
+poezi-tensor.workspace = true

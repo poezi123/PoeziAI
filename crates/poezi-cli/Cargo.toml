@@ -1,0 +1,15 @@
+[package]
+name = "poezi-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "poezi"
+path = "src/main.rs"
+
+[dependencies]
+poezi-gguf.workspace = true
+poezi-tensor.workspace = true
+poezi-model.workspace = true

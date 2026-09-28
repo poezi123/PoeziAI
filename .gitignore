@@ -1,0 +1,30 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Scratch / temporary work (never committed)
+/tmp/
+/scratch/
+
+# Models, weights, checkpoints (too large for git)
+/models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# Training data & outputs
+/data/
+/outputs/
+/checkpoints/
+
+# Reference build (llama.cpp used as test oracle)
+/vendor/llama.cpp/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
