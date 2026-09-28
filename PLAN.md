@@ -100,9 +100,13 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
       match `llama-tokenize` on all 8 stress cases (digits, unicode, emoji,
       indentation, trailing whitespace, special tokens, operators); decode
       round-trips exactly incl. multibyte UTF-8.
-- [ ] **A3 — CPU forward pass (f32).** Full transformer: embeddings, RMSNorm,
-      RoPE, grouped-query attention, SwiGLU MLP, KV-cache, final projection.
-      Slow but correct. **Success = logits match llama.cpp within tolerance.**
+- [x] **A3 — CPU forward pass (f32).** Full Qwen2 transformer: token embedding,
+      RMSNorm, qkv (with Qwen2 bias), NEOX RoPE, grouped-query attention with a
+      KV-cache, SwiGLU MLP, final norm, LM head. Q8_0 matmul kernel in
+      poezi-tensor (multithreaded via std::thread::scope). `poezi gen <model>
+      <prompt> -n N` greedy-generates. **Verified: identical output to
+      llama-completion at temp 0** across factual + Python + Rust prompts
+      (incl. 40-token generations).
 - [ ] **A4 — Quantization (Q8/Q4).** Read and compute on 4-bit weights so a
       larger model fits in memory.
 - [ ] **A5 — GPU (CUDA via `cudarc`).** Move matmul / attention onto the 3060.
@@ -173,3 +177,7 @@ here is judged against a fixed eval set so "smarter" is measured, not felt.
   checked against llama-gguf, exact match. Next: A2 tokenizer.
 - 2026-09-28: A2 done. Byte-level BPE tokenizer in poezi-model; IDs match
   llama-tokenize on 8 stress cases, decode round-trips. Next: A3 forward pass.
+- 2026-09-28: A3 done. Full f32 Qwen2 forward pass; `poezi gen` output is
+  byte-identical to llama-completion at temp 0. The engine generates real text
+  end to end. Reference for raw completion: llama-completion -no-cnv --temp 0.
+  Next: A4 (Q4 quantization) or A6 (chat CLI) — user's choice.

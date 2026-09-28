@@ -8,6 +8,76 @@ use std::process::ExitCode;
 
 use poezi_gguf::MetaValue;
 
+use std::io::Write;
+
+/// Greedy (argmax) generation — the deterministic path we compare against
+/// llama.cpp at temp 0.
+fn generate(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
+    let gguf = match poezi_gguf::GgufFile::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = match poezi_model::Tokenizer::from_gguf(&gguf) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let model = match poezi_model::Model::load(&gguf) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let ids = tok.encode(prompt, tok.add_bos, true);
+    eprintln!("prompt: {} tokens", ids.len());
+
+    let mut cache = poezi_model::KvCache::new(model.cfg.n_layer);
+    let mut last_logits = Vec::new();
+    for &id in &ids {
+        last_logits = model.forward(id, &mut cache);
+    }
+
+    let mut generated: Vec<u32> = Vec::new();
+    let mut out = std::io::stdout();
+    for _ in 0..n_predict {
+        let next = argmax(&last_logits) as u32;
+        if Some(next) == tok.eos_id {
+            break;
+        }
+        generated.push(next);
+        // Stream bytes as they decode.
+        let mut bytes = Vec::new();
+        tok.push_token_bytes(next, &mut bytes);
+        let _ = out.write_all(&bytes);
+        let _ = out.flush();
+        last_logits = model.forward(next, &mut cache);
+    }
+    println!();
+    eprintln!("\ngenerated {} tokens", generated.len());
+    let ids_str: Vec<String> = generated.iter().map(|i| i.to_string()).collect();
+    eprintln!("ids: [{}]", ids_str.join(", "));
+    ExitCode::SUCCESS
+}
+
+fn argmax(v: &[f32]) -> usize {
+    let mut best = 0;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > best_val {
+            best_val = x;
+            best = i;
+        }
+    }
+    best
+}
+
 /// Print a metadata value; arrays are summarized (count + a window of items
 /// starting at `start`).
 fn print_meta(v: &MetaValue, start: usize) {
@@ -40,6 +110,19 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Some("gen") => {
+            let (Some(path), Some(prompt)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: poezi gen <model.gguf> <prompt> [-n N]");
+                return ExitCode::FAILURE;
+            };
+            let n_predict: usize = args
+                .iter()
+                .position(|a| a == "-n")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(32);
+            generate(path, prompt, n_predict)
         }
         Some("tokenize") => {
             let (Some(path), Some(text)) = (args.get(1), args.get(2)) else {

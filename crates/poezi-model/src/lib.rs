@@ -9,9 +9,9 @@
 //! Phase A3 target: given a GGUF file + token IDs, produce next-token logits
 //! that match llama.cpp within tolerance.
 
-// TODO(A3): Config from GGUF metadata + forward pass.
-
+pub mod model;
 pub mod tokenizer;
+pub use model::{Config, KvCache, Model, ModelError};
 pub use tokenizer::{Tokenizer, TokenizerError};
 
 /// Crate version string.
