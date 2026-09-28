@@ -78,9 +78,17 @@ sandbox), `poezi-cuda` (GPU kernels).
 
 The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
 
-- [ ] **A0 — Setup.** Workspace, `.gitignore`, private repo. Build `llama.cpp`,
-      pull a small model (Qwen2.5-Coder-1.5B, ~1 GB, Q8) and run it once. This
-      is the reference.
+- [x] **A0 — Setup.** Workspace, `.gitignore`, private repo. Built `llama.cpp`
+      (CPU-only, no CUDA toolkit installed yet), pulled Qwen2.5-Coder-1.5B-
+      Instruct Q8 into `models/`, ran it once. This is the reference oracle.
+
+      Reference invocation (deterministic — use for A1–A3 comparison):
+      ```sh
+      vendor/llama.cpp/build/bin/llama-cli \
+        -m models/qwen2.5-coder-1.5b-instruct-q8_0.gguf \
+        -p "<prompt>" -n <N> -st --temp 0
+      ```
+      `--temp 0` = greedy/deterministic. `llama.cpp` build: b1-680a036.
 - [ ] **A1 — GGUF loader.** Read the file format in Rust: header, metadata,
       tensor table, mmap the weights. No math yet — just load and print info.
 - [ ] **A2 — Tokenizer.** BPE tokenizer matching the model's vocab. Round-trip
@@ -144,10 +152,13 @@ here is judged against a fixed eval set so "smarter" is measured, not felt.
 ## Open questions / decisions
 
 - Disk space: 82 GB free. May need a second drive once training data grows.
-- Exact reference model version to pin for A0.
+- Reference model pinned: Qwen2.5-Coder-1.5B-Instruct Q8 (in `models/`).
+- CUDA toolkit (`nvcc`) not installed yet — needed for Phase A5 (GPU).
 
 ## Status log
 
 - 2026-09-28: Project kicked off. Workspace scaffolded, repo created.
 - 2026-09-28: Goal sharpened to intelligence-per-watt on CS/security; added
   Phase E (reasoning & agent layer) and the "spend time, not size" principle.
+- 2026-09-28: A0 done. llama.cpp built (CPU), Qwen2.5-Coder-1.5B Q8 runs and
+  emits correct Rust at temp 0. Reference oracle ready. Next: A1 GGUF loader.
