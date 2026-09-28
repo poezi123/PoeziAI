@@ -89,8 +89,11 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
         -p "<prompt>" -n <N> -st --temp 0
       ```
       `--temp 0` = greedy/deterministic. `llama.cpp` build: b1-680a036.
-- [ ] **A1 — GGUF loader.** Read the file format in Rust: header, metadata,
-      tensor table, mmap the weights. No math yet — just load and print info.
+- [x] **A1 — GGUF loader.** Reads header, metadata, and tensor table in Rust;
+      mmaps the weights; validates every tensor offset against the data blob.
+      `poezi info <model.gguf>` prints a summary. Verified byte-for-byte against
+      llama.cpp's `llama-gguf` reader (version, alignment, data offset, tensor
+      count, per-tensor size/offset/dims all match).
 - [ ] **A2 — Tokenizer.** BPE tokenizer matching the model's vocab. Round-trip
       test: encode→decode must equal input; compare token IDs vs. llama.cpp.
 - [ ] **A3 — CPU forward pass (f32).** Full transformer: embeddings, RMSNorm,
@@ -162,3 +165,5 @@ here is judged against a fixed eval set so "smarter" is measured, not felt.
   Phase E (reasoning & agent layer) and the "spend time, not size" principle.
 - 2026-09-28: A0 done. llama.cpp built (CPU), Qwen2.5-Coder-1.5B Q8 runs and
   emits correct Rust at temp 0. Reference oracle ready. Next: A1 GGUF loader.
+- 2026-09-28: A1 done. poezi-gguf parses the format; `poezi info` output cross-
+  checked against llama-gguf, exact match. Next: A2 tokenizer.
