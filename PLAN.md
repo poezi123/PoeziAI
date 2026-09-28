@@ -17,6 +17,32 @@ built-in filter (there is none to add or remove).
 - GPU: NVIDIA RTX 3060, 12 GB VRAM (CUDA)
 - Free disk on /home: ~82 GB (watch this — models + data add up fast)
 
+## The real goal: intelligence-per-watt, in one domain
+
+The aim is a system that punches above its hardware — strong reasoning, adapted
+to a single RTX 3060, specialized for CS/security. Honest framing:
+
+- A 7–14B model on this GPU will **not** out-think a frontier model in general.
+  Raw intelligence scales with parameters × data × training compute, and that
+  gap can't be closed on one consumer GPU. This is physics, not effort.
+- But a **specialized system can beat a generalist on a narrow field**. On
+  CS/security specifically, that is within reach.
+- The lever we actually have: **speed doesn't matter to us.** Almost every
+  "more from less" technique trades time for quality. We can spend it freely.
+
+Where the intelligence is won (and where we can genuinely invent things — the
+model weights of a 7B aren't where a single person adds value; the layers above
+are):
+
+1. **Test-time compute / reasoning** — think long: generate multiple lines of
+   attack, self-check, discard, retry. Our biggest lever. (Phase E)
+2. **Domain fine-tuning** — a 7B that only does CS/security, but does it well,
+   trained on exploit-db, CVEs, writeups, our own reports. (Phase B)
+3. **RAG + real tools** — knowledge need not live in the weights; look it up and
+   run actual tools (nmap, gdb, debuggers) and read the results. (Phase D)
+4. **Agent scaffolding** — plan → act → verify → correct. Good scaffolding
+   around a mediocre model beats a strong model with none. (Phase D/E)
+
 ## Guiding principles
 
 1. **Test oracle first.** Every stage of our own engine is validated against
@@ -26,6 +52,11 @@ built-in filter (there is none to add or remove).
    then GPU. Never optimize code we haven't proven correct.
 3. **No unnecessary machinery.** Build what the project needs, nothing more.
 4. **Everything local.** No data leaves the machine.
+5. **Spend time, not size.** When there's a choice, trade compute-time for
+   quality — we don't optimize for latency, we optimize for how good the answer
+   gets when allowed to think.
+6. **Measure, don't guess.** "Smarter" only counts if a benchmark says so — see
+   Phase E. Every reasoning idea is judged against a fixed CS/security eval set.
 
 ## Architecture (Cargo workspace)
 
@@ -88,6 +119,26 @@ Teach the model our domain and style.
 - [ ] nanoGPT-style, ~50–150M params, trained on the 3060. Won't be smart;
       the point is to have done every step once.
 
+### Phase E — Reasoning & agent layer (the "more from less" core)
+
+This is where the system becomes smarter than its size suggests. Everything
+here is judged against a fixed eval set so "smarter" is measured, not felt.
+
+- [ ] **Eval harness first.** A held-out set of CS/security tasks (CTF-style
+      challenges, code fixes, exploit reasoning, log analysis) with checkable
+      answers. Every technique below is a diff against this baseline.
+- [ ] **Test-time compute.** Let the model think long: chain-of-thought,
+      self-consistency (sample many, vote), best-of-N with a verifier,
+      iterative refine (draft → critique → revise). Speed is free to spend.
+- [ ] **Verifier loop.** For code/exploits, the ground truth is execution —
+      run it in the sandbox, feed failures back, let the model fix. A cheap
+      model + a real verifier often beats a bigger model alone.
+- [ ] **Tree/graph search over reasoning.** Explore multiple solution paths,
+      prune dead ends, backtrack. Where our own inventions can live.
+- [ ] **Structured planning.** Decompose a task into sub-goals, solve, compose.
+- [ ] Room to experiment: this phase is deliberately open-ended. Any new idea
+      ships only if it moves the eval numbers.
+
 ---
 
 ## Open questions / decisions
@@ -98,3 +149,5 @@ Teach the model our domain and style.
 ## Status log
 
 - 2026-09-28: Project kicked off. Workspace scaffolded, repo created.
+- 2026-09-28: Goal sharpened to intelligence-per-watt on CS/security; added
+  Phase E (reasoning & agent layer) and the "spend time, not size" principle.
