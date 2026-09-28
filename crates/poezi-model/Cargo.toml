@@ -8,3 +8,7 @@ repository.workspace = true
 [dependencies]
 poezi-gguf.workspace = true
 poezi-tensor.workspace = true
+# Backtracking regex: the Qwen2 pre-tokenizer pattern uses a `(?!\S)`
+# lookahead, which the standard `regex` crate does not support. fancy-regex
+# also matches Python/PCRE semantics, which is what GPT-2-style BPE expects.
+fancy-regex = "0.14"

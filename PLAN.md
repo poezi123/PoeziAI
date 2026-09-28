@@ -94,8 +94,12 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
       `poezi info <model.gguf>` prints a summary. Verified byte-for-byte against
       llama.cpp's `llama-gguf` reader (version, alignment, data offset, tensor
       count, per-tensor size/offset/dims all match).
-- [ ] **A2 — Tokenizer.** BPE tokenizer matching the model's vocab. Round-trip
-      test: encode→decode must equal input; compare token IDs vs. llama.cpp.
+- [x] **A2 — Tokenizer.** Byte-level BPE (GPT-2/Qwen2): byte<->unicode maps,
+      Qwen2 pre-tokenizer regex (fancy-regex for the `(?!\S)` lookahead), greedy
+      merges, special-token parsing. `poezi tokenize <model> <text>`. Token IDs
+      match `llama-tokenize` on all 8 stress cases (digits, unicode, emoji,
+      indentation, trailing whitespace, special tokens, operators); decode
+      round-trips exactly incl. multibyte UTF-8.
 - [ ] **A3 — CPU forward pass (f32).** Full transformer: embeddings, RMSNorm,
       RoPE, grouped-query attention, SwiGLU MLP, KV-cache, final projection.
       Slow but correct. **Success = logits match llama.cpp within tolerance.**
@@ -167,3 +171,5 @@ here is judged against a fixed eval set so "smarter" is measured, not felt.
   emits correct Rust at temp 0. Reference oracle ready. Next: A1 GGUF loader.
 - 2026-09-28: A1 done. poezi-gguf parses the format; `poezi info` output cross-
   checked against llama-gguf, exact match. Next: A2 tokenizer.
+- 2026-09-28: A2 done. Byte-level BPE tokenizer in poezi-model; IDs match
+  llama-tokenize on 8 stress cases, decode round-trips. Next: A3 forward pass.

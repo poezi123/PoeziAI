@@ -9,9 +9,12 @@
 //! Phase A3 target: given a GGUF file + token IDs, produce next-token logits
 //! that match llama.cpp within tolerance.
 
-// TODO(A2): BPE tokenizer. TODO(A3): Config from GGUF metadata + forward pass.
+// TODO(A3): Config from GGUF metadata + forward pass.
 
-/// Placeholder so the crate compiles before the forward pass lands.
+pub mod tokenizer;
+pub use tokenizer::{Tokenizer, TokenizerError};
+
+/// Crate version string.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
