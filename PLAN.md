@@ -166,6 +166,22 @@ here is judged against a fixed eval set so "smarter" is measured, not felt.
 - [ ] Room to experiment: this phase is deliberately open-ended. Any new idea
       ships only if it moves the eval numbers.
 
+### Phase F — Product: OVERFLOW (native GUI, branding, installer)
+
+The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber).
+
+- [x] Branding: name + logo chosen; SVG assets in `brand/` (mark, mono, lockup).
+- [x] Native GUI (`overflow-gui`, binary `overflow`): egui/eframe — pure Rust, no
+      web. Dark terminal theme in the OVERFLOW palette, logo drawn in-code,
+      streaming chat. Inference runs on a worker thread (owns the model, keeps the
+      UI responsive); tokens streamed back UTF-8-safe. Builds + runs on the
+      display. egui 0.36 API note: `App::ui(ui, frame)`, unified `Panel::top/bottom`,
+      `Margin::symmetric(i8,i8)`, `Frame::NONE`.
+- [ ] Polish the look live (fonts: embed JetBrains Mono; spacing; message bubbles).
+- [ ] Settings UI (model picker, temp/top-k/top-p, system prompt).
+- [ ] Bundle the model + ship an installer ("AI comes with the install"), like
+      LM Studio bundling its own CUDA. GPU kernels (A5) bundled later too.
+
 ---
 
 ## Open questions / decisions
@@ -196,3 +212,7 @@ here is judged against a fixed eval set so "smarter" is measured, not felt.
 - 2026-10-01: A4 done. Q4_K/Q5_K/Q6_K dequant + generic matmul; byte-identical
   to llama.cpp on a Q4_K_M model. Any Q4_K_M/Q8_0 qwen2 GGUF now loads (incl. a
   7B once downloaded). CPU ~3 tok/s. Next: A5 (GPU) for speed, then Phase D.
+- 2026-10-01: GPU deferred — no system CUDA (bundle our own later, like LM Studio);
+  training won't need it either (PyTorch bundles CUDA). Started Phase F: product
+  named OVERFLOW (basilisk-eye logo), native egui GUI with streaming chat on a
+  worker thread. Builds + runs. Next: polish the GUI live, then settings + bundling.

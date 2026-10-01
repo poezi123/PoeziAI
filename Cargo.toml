@@ -5,6 +5,7 @@ members = [
     "crates/poezi-tensor",
     "crates/poezi-model",
     "crates/poezi-cli",
+    "crates/overflow-gui",
 ]
 
 [workspace.package]

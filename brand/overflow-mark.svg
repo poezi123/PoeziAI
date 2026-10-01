@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="OVERFLOW mark (basilisk eye)">
+  <!-- Basilisk gaze: a hex scope framing a reptilian slit eye. -->
+  <path d="M32 6 L54 19 L54 45 L32 58 L10 45 L10 19 Z" fill="none" stroke="#f5b94d" stroke-width="2.4" stroke-linejoin="round"/>
+  <ellipse cx="32" cy="32" rx="17" ry="10" fill="#f5b94d" fill-opacity="0.10"/>
+  <path d="M32 20 C36 26 36 38 32 44 C28 38 28 26 32 20 Z" fill="#f5b94d"/>
+</svg>

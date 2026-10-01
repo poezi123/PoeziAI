@@ -1,0 +1,15 @@
+[package]
+name = "overflow-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "overflow"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.36.2"
+poezi-gguf.workspace = true
+poezi-model.workspace = true
