@@ -125,16 +125,27 @@ fn main() -> ExitCode {
             match poezi_cuda::device_name() {
                 Ok(name) => {
                     println!("GPU: {name}");
-                    match poezi_cuda::self_test(4096, 4096) {
+                    let f32_ok = match poezi_cuda::self_test(4096, 4096) {
                         Ok(err) => {
-                            println!("matvec self-test (4096x4096): max error {err:.2e} — OK");
-                            ExitCode::SUCCESS
+                            println!("f32 matvec  (4096x4096): max error {err:.2e} — OK");
+                            true
                         }
                         Err(e) => {
-                            eprintln!("gpu kernel error: {e}");
-                            ExitCode::FAILURE
+                            eprintln!("f32 kernel error: {e}");
+                            false
                         }
-                    }
+                    };
+                    let q8_ok = match poezi_cuda::self_test_q8(4096, 4096) {
+                        Ok(err) => {
+                            println!("Q8_0 matmul (4096x4096): max error {err:.2e} — OK");
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!("Q8_0 kernel error: {e}");
+                            false
+                        }
+                    };
+                    if f32_ok && q8_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
                 }
                 Err(e) => {
                     eprintln!("no CUDA device: {e}");

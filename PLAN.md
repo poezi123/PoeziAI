@@ -120,7 +120,9 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
             runtime (NVRTC) and runs it on the 3060. f32 matvec validated vs CPU
             (max err 1e-6). `poezi gpu` self-test passes. Run GPU paths with
             `LD_LIBRARY_PATH=vendor/cuda/lib`.
-      - [ ] A5.1 — GPU Q8_0 matmul kernel (dequant in-kernel), validate vs CPU.
+      - [x] **A5.1 — GPU Q8_0 matmul** (fp16 decoded in-kernel via bit ops, no
+            CUDA headers). Matches CPU/poezi-tensor on random quants + varied fp16
+            scales (~1e-5); `poezi gpu` checks f32 + Q8_0.
       - [ ] A5.2 — GPU Q4_K/Q6_K kernels.
       - [ ] A5.3 — wire into the forward pass: upload weights to VRAM once, keep
             KV-cache on GPU, run the whole model on the 3060 (the speed win).
@@ -244,3 +246,5 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   (scripts/fetch-cuda.sh) + the driver's libcuda; poezi-cuda compiles kernels via
   NVRTC at runtime and runs on the RTX 3060. f32 matvec matches CPU (1e-6).
   `poezi gpu` passes. Next: GPU quantized matmul kernels, then wire into forward.
+- 2026-10-01: A5.1 done. GPU Q8_0 matmul with in-kernel fp16 decode; validated vs
+  poezi-tensor CPU (varied scales, ~1e-5). Next: A5.2 (Q4_K/Q6_K GPU kernels).
