@@ -180,7 +180,9 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
 - [x] Settings window (top-right gear): live hardware meters (CPU/RAM from /proc,
       GPU/VRAM from nvidia-smi on a 1 Hz monitor thread), tokens/sec, and the
       permission model — sandboxed by default; toggles for file read, file
-      write, shell, network (enforced by the agent in Phase D). Hero reads
+      write, shell, network; plus a workspace folder (free access inside) with
+      "ask before anything outside this folder" (Claude-Code-style approval),
+      all enforced by the agent in Phase D. Hero reads
       "S1BERIA'S CYBERSECURITY AI"; top bar shows sandboxed/tools-enabled state.
 - [ ] Polish the look live (fonts: embed JetBrains Mono; spacing; message bubbles).
 - [ ] Settings UI extras (model picker, expose temp/top-k/top-p, edit system prompt).

@@ -79,16 +79,27 @@ struct Permissions {
     fs_write: bool,
     shell: bool,
     network: bool,
+    /// Folder the AI may act within freely.
+    workspace: String,
+    /// Ask for confirmation before anything outside the workspace folder.
+    confirm_outside: bool,
 }
 
 impl Default for Permissions {
     fn default() -> Self {
+        let workspace = std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+            .or_else(|| std::env::var("HOME").ok())
+            .unwrap_or_else(|| ".".into());
         Permissions {
             sandbox: true,
             fs_read: false,
             fs_write: false,
             shell: false,
             network: false,
+            workspace,
+            confirm_outside: true,
         }
     }
 }
@@ -200,11 +211,28 @@ impl OverflowApp {
                     ui.checkbox(&mut self.perms.fs_write, "Create / modify files");
                     ui.checkbox(&mut self.perms.shell, "Run shell commands");
                     ui.checkbox(&mut self.perms.network, "Network access");
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Workspace folder — free access inside:")
+                            .color(MUTED)
+                            .size(11.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.perms.workspace)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("/path/to/folder"),
+                    );
+                    ui.checkbox(
+                        &mut self.perms.confirm_outside,
+                        "Ask before anything outside this folder",
+                    );
                 });
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "Tool execution ships with the agent (Phase D); these set what it may do.",
+                        "Inside the workspace the agent acts freely; outside, it asks first — \
+                         like Claude Code. Enforced with the agent (Phase D).",
                     )
                     .color(MUTED)
                     .size(11.0),
