@@ -178,8 +178,20 @@ impl OverflowApp {
             .show(ctx, |ui| {
                 ui.set_width(300.0);
 
-                section(ui, "HARDWARE");
                 let hw = self.hw.lock().map(|g| *g).unwrap_or_default();
+
+                section(ui, "MODEL — THIS PROCESS");
+                meter(ui, "CPU", hw.proc_cpu_pct / 100.0, format!("{:.0}%", hw.proc_cpu_pct), GREEN);
+                let rssf = if hw.mem_total_gb > 0.0 { hw.proc_rss_gb / hw.mem_total_gb } else { 0.0 };
+                meter(ui, "RAM", rssf, format!("{:.2} GB", hw.proc_rss_gb), AMBER);
+                ui.label(
+                    egui::RichText::new("GPU   0% — CPU inference (GPU arrives in A5)")
+                        .color(MUTED)
+                        .size(11.0),
+                );
+
+                ui.add_space(12.0);
+                section(ui, "SYSTEM");
                 meter(ui, "CPU", hw.cpu_pct / 100.0, format!("{:.0}%", hw.cpu_pct), GREEN);
                 let memf = if hw.mem_total_gb > 0.0 { hw.mem_used_gb / hw.mem_total_gb } else { 0.0 };
                 meter(ui, "RAM", memf, format!("{:.1} / {:.1} GB", hw.mem_used_gb, hw.mem_total_gb), AMBER);
