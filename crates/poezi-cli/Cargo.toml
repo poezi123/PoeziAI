@@ -13,3 +13,4 @@ path = "src/main.rs"
 poezi-gguf.workspace = true
 poezi-tensor.workspace = true
 poezi-model.workspace = true
+poezi-cuda = { path = "../poezi-cuda" }

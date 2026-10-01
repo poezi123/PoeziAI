@@ -28,3 +28,6 @@ Cargo.lock
 .idea/
 *.swp
 .DS_Store
+
+# Vendored CUDA libs (fetched via scripts/fetch-cuda.sh)
+/vendor/cuda/

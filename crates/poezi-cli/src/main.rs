@@ -121,6 +121,28 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("gpu") => {
+            match poezi_cuda::device_name() {
+                Ok(name) => {
+                    println!("GPU: {name}");
+                    match poezi_cuda::self_test(4096, 4096) {
+                        Ok(err) => {
+                            println!("matvec self-test (4096x4096): max error {err:.2e} — OK");
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("gpu kernel error: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("no CUDA device: {e}");
+                    eprintln!("(run with LD_LIBRARY_PATH=vendor/cuda/lib after scripts/fetch-cuda.sh)");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("chat") => {
             let Some(path) = args.get(1) else {
                 eprintln!("usage: poezi chat <model.gguf> [--system S] [--temp T] [--top-k K] [--top-p P] [--seed N]");

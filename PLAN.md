@@ -113,8 +113,17 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
       model carries each tensor's GgmlType (QTensor). Verified byte-identical to
       llama-completion on the Qwen2.5-Coder-1.5B Q4_K_M model (uses Q4_K + Q6_K),
       and Q8_0 path unchanged. ~3 tok/s on CPU — motivates A5 (GPU).
-- [ ] **A5 — GPU (CUDA via `cudarc`).** Move matmul / attention onto the 3060.
-      Kernels in CUDA C or PTX. This is where it gets fast.
+- [~] **A5 — GPU (CUDA via `cudarc`).** Move matmul / attention onto the 3060.
+      - [x] **A5.0 — toolchain + first kernel.** Vendored CUDA (libnvrtc only, via
+            `scripts/fetch-cuda.sh`) — no system install, no reboot; the driver's
+            libcuda is already present. New `poezi-cuda` crate compiles a kernel at
+            runtime (NVRTC) and runs it on the 3060. f32 matvec validated vs CPU
+            (max err 1e-6). `poezi gpu` self-test passes. Run GPU paths with
+            `LD_LIBRARY_PATH=vendor/cuda/lib`.
+      - [ ] A5.1 — GPU Q8_0 matmul kernel (dequant in-kernel), validate vs CPU.
+      - [ ] A5.2 — GPU Q4_K/Q6_K kernels.
+      - [ ] A5.3 — wire into the forward pass: upload weights to VRAM once, keep
+            KV-cache on GPU, run the whole model on the 3060 (the speed win).
 - [x] **A6 — CLI chat.** Interactive REPL (`poezi chat <model>`) using Qwen2's
       ChatML template, a persistent KV-cache across turns, and sampling
       (temperature / top-k / top-p, greedy at temp 0; configurable --system,
@@ -231,3 +240,7 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   SYSTEM. Added Qwen2.5-Coder-7B Q4_K_M — loads in our engine, generation
   byte-identical to llama.cpp (engine handles 3584-dim/4-kv config). GUI defaults
   to the 7B when present. 7B on CPU is slow (~0.5-1 tok/s) → strong case for A5 (GPU).
+- 2026-10-01: A5.0 done. GPU reachable WITHOUT system CUDA: vendored libnvrtc
+  (scripts/fetch-cuda.sh) + the driver's libcuda; poezi-cuda compiles kernels via
+  NVRTC at runtime and runs on the RTX 3060. f32 matvec matches CPU (1e-6).
+  `poezi gpu` passes. Next: GPU quantized matmul kernels, then wire into forward.
