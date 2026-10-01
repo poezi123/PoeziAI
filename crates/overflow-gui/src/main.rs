@@ -6,7 +6,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod hw;
 mod worker;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use eframe::egui;
 use egui::{Color32, FontFamily, Pos2, Sense, Stroke, Vec2};
@@ -66,11 +70,38 @@ struct Msg {
     text: String,
 }
 
+/// What the AI is allowed to do on the machine. Default is fully sandboxed:
+/// the chat can neither touch the filesystem nor run anything. Enforcement of
+/// these lands with the agent/tools (Phase D); they define what it may do.
+struct Permissions {
+    sandbox: bool,
+    fs_read: bool,
+    fs_write: bool,
+    shell: bool,
+    network: bool,
+}
+
+impl Default for Permissions {
+    fn default() -> Self {
+        Permissions {
+            sandbox: true,
+            fs_read: false,
+            fs_write: false,
+            shell: false,
+            network: false,
+        }
+    }
+}
+
 struct OverflowApp {
     handle: Handle,
     status: Status,
     transcript: Vec<Msg>,
     input: String,
+    settings_open: bool,
+    perms: Permissions,
+    tok_per_s: f32,
+    hw: Arc<Mutex<hw::HwStats>>,
 }
 
 impl OverflowApp {
@@ -80,6 +111,10 @@ impl OverflowApp {
             status: Status::Loading,
             transcript: Vec::new(),
             input: String::new(),
+            settings_open: false,
+            perms: Permissions::default(),
+            tok_per_s: 0.0,
+            hw: hw::spawn(),
         }
     }
 
@@ -107,11 +142,95 @@ impl OverflowApp {
                     }
                     self.status = Status::Generating;
                 }
+                FromWorker::Stats { tok_per_s } => self.tok_per_s = tok_per_s,
                 FromWorker::Done => self.status = Status::Ready,
                 FromWorker::Error(e) => self.status = Status::Error(e),
             }
         }
     }
+
+    /// The top-right settings window: live hardware, generation speed, and the
+    /// permission model (sandboxed by default).
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        egui::Window::new("settings")
+            .open(&mut open)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 52.0))
+            .collapsible(false)
+            .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::same(16))
+                    .stroke(Stroke::new(1.0, LINE)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(300.0);
+
+                section(ui, "HARDWARE");
+                let hw = self.hw.lock().map(|g| *g).unwrap_or_default();
+                meter(ui, "CPU", hw.cpu_pct / 100.0, format!("{:.0}%", hw.cpu_pct), GREEN);
+                let memf = if hw.mem_total_gb > 0.0 { hw.mem_used_gb / hw.mem_total_gb } else { 0.0 };
+                meter(ui, "RAM", memf, format!("{:.1} / {:.1} GB", hw.mem_used_gb, hw.mem_total_gb), AMBER);
+                match (hw.gpu_pct, hw.vram_used_mb, hw.vram_total_mb) {
+                    (Some(g), Some(vu), Some(vt)) => {
+                        meter(ui, "GPU", g / 100.0, format!("{g:.0}%"), GREEN);
+                        let vf = if vt > 0.0 { vu / vt } else { 0.0 };
+                        meter(ui, "VRAM", vf, format!("{vu:.0} / {vt:.0} MB"), AMBER);
+                    }
+                    _ => {
+                        ui.label(egui::RichText::new("GPU   n/a (nvidia-smi)").color(MUTED).size(12.0));
+                    }
+                }
+
+                ui.add_space(12.0);
+                section(ui, "GENERATION");
+                ui.label(
+                    egui::RichText::new(format!("{:.1} tokens / sec", self.tok_per_s))
+                        .color(GREEN)
+                        .size(13.0),
+                );
+
+                ui.add_space(12.0);
+                section(ui, "PERMISSIONS");
+                ui.checkbox(&mut self.perms.sandbox, "Sandbox mode — no system access");
+                let tools = !self.perms.sandbox;
+                ui.add_enabled_ui(tools, |ui| {
+                    ui.checkbox(&mut self.perms.fs_read, "Read files");
+                    ui.checkbox(&mut self.perms.fs_write, "Create / modify files");
+                    ui.checkbox(&mut self.perms.shell, "Run shell commands");
+                    ui.checkbox(&mut self.perms.network, "Network access");
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Tool execution ships with the agent (Phase D); these set what it may do.",
+                    )
+                    .color(MUTED)
+                    .size(11.0),
+                );
+            });
+        self.settings_open = open;
+    }
+}
+
+/// A small uppercase section heading with a rule.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.label(egui::RichText::new(title).color(AMBER).size(11.0).strong());
+    ui.separator();
+}
+
+/// A labeled progress meter: `NAME [=====      ] value`.
+fn meter(ui: &mut egui::Ui, label: &str, frac: f32, text: String, fill: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{label:<5}")).color(MUTED).size(12.0));
+        ui.add(
+            egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                .desired_width(210.0)
+                .fill(fill)
+                .text(egui::RichText::new(text).size(11.0).color(BG)),
+        );
+    });
 }
 
 impl eframe::App for OverflowApp {
@@ -128,6 +247,23 @@ impl eframe::App for OverflowApp {
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new("local engine").color(MUTED).size(12.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // settings button (top-right)
+                        if ui
+                            .button(egui::RichText::new("[ settings ]").color(FG).size(12.0))
+                            .clicked()
+                        {
+                            self.settings_open = !self.settings_open;
+                        }
+                        ui.add_space(12.0);
+                        // security posture
+                        let (plabel, pcol) = if self.perms.sandbox {
+                            ("sandboxed", GREEN)
+                        } else {
+                            ("tools enabled", RED)
+                        };
+                        ui.label(egui::RichText::new(plabel).color(pcol).size(12.0));
+                        ui.add_space(12.0);
+                        // model status
                         let (dot, label, col) = match &self.status {
                             Status::Loading => ("●", "loading model…".to_string(), AMBER),
                             Status::Ready => ("●", "ready".to_string(), GREEN),
@@ -168,9 +304,15 @@ impl eframe::App for OverflowApp {
                     ui.vertical_centered(|ui| {
                         ui.label(egui::RichText::new("OVERFLOW").color(AMBER).size(28.0).strong());
                         ui.label(
-                            egui::RichText::new("a local AI — nothing leaves this machine")
+                            egui::RichText::new("S1BERIA'S CYBERSECURITY AI")
+                                .color(FG)
+                                .size(14.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new("runs entirely on this machine")
                                 .color(MUTED)
-                                .size(13.0),
+                                .size(12.0),
                         );
                     });
                 }
@@ -197,8 +339,13 @@ impl eframe::App for OverflowApp {
                     });
             });
 
+        let ctx = ui.ctx().clone();
+        self.show_settings(&ctx);
+
+        // Keep hardware stats ticking even while idle.
+        ctx.request_repaint_after(Duration::from_millis(1000));
         if matches!(self.status, Status::Generating | Status::Loading) {
-            ui.ctx().request_repaint();
+            ctx.request_repaint();
         }
     }
 }

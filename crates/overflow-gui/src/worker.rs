@@ -21,6 +21,7 @@ pub enum ToWorker {
 pub enum FromWorker {
     Ready,
     Token(String),
+    Stats { tok_per_s: f32 },
     Done,
     Error(String),
 }
@@ -31,7 +32,9 @@ pub struct Handle {
 }
 
 const SYSTEM_PROMPT: &str =
-    "You are OVERFLOW, a local AI assistant running entirely on the user's machine.";
+    "You are OVERFLOW, S1BERIA's local cybersecurity AI. You run entirely on the \
+     user's machine and specialize in security engineering, code, and systems. \
+     Be direct and technical.";
 
 /// Spawn the worker. Returns channels immediately; model loading happens on the
 /// thread and completes with a `Ready` (or `Error`) event.
@@ -80,10 +83,17 @@ fn run(
         // Stream the reply. Buffer bytes so multi-byte UTF-8 split across tokens
         // is never sent as a broken fragment.
         let mut pending: Vec<u8> = Vec::new();
+        let t0 = std::time::Instant::now();
+        let mut produced = 0u32;
         for _ in 0..1024 {
             let next = sample(&logits, 0.7, 40, 0.95, &mut rng);
             if Some(next) == tok.eos_id {
                 break;
+            }
+            produced += 1;
+            let secs = t0.elapsed().as_secs_f32();
+            if secs > 0.0 {
+                let _ = tx_out.send(FromWorker::Stats { tok_per_s: produced as f32 / secs });
             }
             tok.push_token_bytes(next, &mut pending);
             match std::str::from_utf8(&pending) {

@@ -177,8 +177,13 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
       UI responsive); tokens streamed back UTF-8-safe. Builds + runs on the
       display. egui 0.36 API note: `App::ui(ui, frame)`, unified `Panel::top/bottom`,
       `Margin::symmetric(i8,i8)`, `Frame::NONE`.
+- [x] Settings window (top-right gear): live hardware meters (CPU/RAM from /proc,
+      GPU/VRAM from nvidia-smi on a 1 Hz monitor thread), tokens/sec, and the
+      permission model — sandboxed by default; toggles for file read, file
+      write, shell, network (enforced by the agent in Phase D). Hero reads
+      "S1BERIA'S CYBERSECURITY AI"; top bar shows sandboxed/tools-enabled state.
 - [ ] Polish the look live (fonts: embed JetBrains Mono; spacing; message bubbles).
-- [ ] Settings UI (model picker, temp/top-k/top-p, system prompt).
+- [ ] Settings UI extras (model picker, expose temp/top-k/top-p, edit system prompt).
 - [ ] Bundle the model + ship an installer ("AI comes with the install"), like
       LM Studio bundling its own CUDA. GPU kernels (A5) bundled later too.
 
@@ -216,3 +221,7 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   training won't need it either (PyTorch bundles CUDA). Started Phase F: product
   named OVERFLOW (basilisk-eye logo), native egui GUI with streaming chat on a
   worker thread. Builds + runs. Next: polish the GUI live, then settings + bundling.
+- 2026-10-01: Settings window added (hardware meters, tokens/sec, permission model
+  sandboxed-by-default), hero "S1BERIA'S CYBERSECURITY AI". Phase F GUI core done.
+  Then: training (Phase B). Could not screenshot here (XWayland/import limitation);
+  user verifies the look live.
