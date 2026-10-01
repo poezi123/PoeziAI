@@ -123,6 +123,7 @@ struct OverflowApp {
     settings_open: bool,
     perms: Permissions,
     tok_per_s: f32,
+    backend: String,
     hw: Arc<Mutex<hw::HwStats>>,
 }
 
@@ -136,6 +137,7 @@ impl OverflowApp {
             settings_open: false,
             perms: Permissions::default(),
             tok_per_s: 0.0,
+            backend: "…".to_string(),
             hw: hw::spawn(),
         }
     }
@@ -156,6 +158,7 @@ impl OverflowApp {
         while let Ok(ev) = self.handle.rx.try_recv() {
             match ev {
                 FromWorker::Ready => self.status = Status::Ready,
+                FromWorker::Backend(b) => self.backend = b,
                 FromWorker::Token(s) => {
                     if let Some(last) = self.transcript.last_mut() {
                         if matches!(last.role, Role::Assistant) {
@@ -195,9 +198,10 @@ impl OverflowApp {
                 meter(ui, "CPU", hw.proc_cpu_pct / 100.0, format!("{:.0}%", hw.proc_cpu_pct), GREEN);
                 let rssf = if hw.mem_total_gb > 0.0 { hw.proc_rss_gb / hw.mem_total_gb } else { 0.0 };
                 meter(ui, "RAM", rssf, format!("{:.2} GB", hw.proc_rss_gb), AMBER);
+                let bcol = if self.backend == "GPU" { GREEN } else { MUTED };
                 ui.label(
-                    egui::RichText::new("GPU   0% — CPU inference (GPU arrives in A5)")
-                        .color(MUTED)
+                    egui::RichText::new(format!("compute: {}", self.backend))
+                        .color(bcol)
                         .size(11.0),
                 );
 

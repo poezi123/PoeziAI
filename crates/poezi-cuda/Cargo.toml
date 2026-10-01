@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+poezi-gguf.workspace = true
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12090"] }
 
 [dev-dependencies]
 poezi-tensor.workspace = true
-poezi-gguf.workspace = true

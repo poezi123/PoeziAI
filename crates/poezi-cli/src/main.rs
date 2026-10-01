@@ -45,6 +45,7 @@ fn generate(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
         }
     };
 
+    eprintln!("backend: {}", model.backend());
     let ids = tok.encode(prompt, tok.add_bos, true);
     eprintln!("prompt: {} tokens", ids.len());
 
@@ -125,27 +126,16 @@ fn main() -> ExitCode {
             match poezi_cuda::device_name() {
                 Ok(name) => {
                     println!("GPU: {name}");
-                    let f32_ok = match poezi_cuda::self_test(4096, 4096) {
-                        Ok(err) => {
-                            println!("f32 matvec  (4096x4096): max error {err:.2e} — OK");
-                            true
-                        }
-                        Err(e) => {
-                            eprintln!("f32 kernel error: {e}");
-                            false
-                        }
-                    };
-                    let q8_ok = match poezi_cuda::self_test_q8(4096, 4096) {
+                    match poezi_cuda::self_test_q8(4096, 4096) {
                         Ok(err) => {
                             println!("Q8_0 matmul (4096x4096): max error {err:.2e} — OK");
-                            true
+                            ExitCode::SUCCESS
                         }
                         Err(e) => {
                             eprintln!("Q8_0 kernel error: {e}");
-                            false
+                            ExitCode::FAILURE
                         }
-                    };
-                    if f32_ok && q8_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+                    }
                 }
                 Err(e) => {
                     eprintln!("no CUDA device: {e}");

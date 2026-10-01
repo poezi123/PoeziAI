@@ -20,6 +20,7 @@ pub enum ToWorker {
 /// Messages from the worker to the UI.
 pub enum FromWorker {
     Ready,
+    Backend(String),
     Token(String),
     Stats { tok_per_s: f32 },
     Done,
@@ -61,6 +62,7 @@ fn run(
     let mut rng = Rng::new(0x9E3779B97F4A7C15);
     let mut first_turn = true;
 
+    let _ = tx_out.send(FromWorker::Backend(model.backend().to_string()));
     let _ = tx_out.send(FromWorker::Ready);
 
     while let Ok(msg) = rx_in.recv() {

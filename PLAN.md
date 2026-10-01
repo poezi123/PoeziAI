@@ -123,8 +123,12 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
       - [x] **A5.1 — GPU Q8_0 matmul** (fp16 decoded in-kernel via bit ops, no
             CUDA headers). Matches CPU/poezi-tensor on random quants + varied fp16
             scales (~1e-5); `poezi gpu` checks f32 + Q8_0.
-      - [ ] A5.2 — GPU Q4_K/Q6_K kernels.
-      - [ ] A5.3 — wire into the forward pass: upload weights to VRAM once, keep
+      - [x] **A5.2 — GPU Q4_K/Q6_K kernels** (256-value super-blocks, 6-bit
+            sub-scales). Validated vs poezi-tensor CPU.
+      - [x] **A5.3 — forward pass on GPU.** Weights uploaded to VRAM once at
+            load; per-matmul only x up / y down. CPU fallback if no GPU/libs.
+            7B Q4_K_M output matches llama.cpp; ~4.75 tok/s (vs ~0.5 CPU).
+      - [ ] A5.4 — optimize kernels + keep activations on GPU (target 20-40 tok/s).
             KV-cache on GPU, run the whole model on the 3060 (the speed win).
 - [x] **A6 — CLI chat.** Interactive REPL (`poezi chat <model>`) using Qwen2's
       ChatML template, a persistent KV-cache across turns, and sampling
@@ -248,3 +252,8 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   `poezi gpu` passes. Next: GPU quantized matmul kernels, then wire into forward.
 - 2026-10-01: A5.1 done. GPU Q8_0 matmul with in-kernel fp16 decode; validated vs
   poezi-tensor CPU (varied scales, ~1e-5). Next: A5.2 (Q4_K/Q6_K GPU kernels).
+- 2026-10-01: A5.2+A5.3 done. GPU Q4_K/Q6_K kernels validated vs CPU; forward pass
+  runs matmuls on the 3060 with resident VRAM weights. 7B output == llama.cpp,
+  ~4.75 tok/s (~5-10x CPU). GUI shows compute backend; scripts/run-gui.sh sets the
+  CUDA lib path. Next: A5.4 kernel optimization (keep activations on GPU, coalesced
+  reads) for a bigger speedup.

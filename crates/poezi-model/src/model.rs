@@ -21,21 +21,18 @@
 //!
 //! All matmuls use Q8_0 weights (see `poezi-tensor`); norms and biases are f32.
 
+use std::sync::Arc;
+
+use poezi_cuda::{GpuBackend, GpuWeight};
 use poezi_gguf::{GgmlType, GgufFile, MetaValue};
 use poezi_tensor::{dequant_row, matmul, row_bytes};
 
-/// A quantized weight tensor: borrowed mmap bytes plus its ggml type.
-#[derive(Clone, Copy)]
+/// A quantized weight: borrowed mmap bytes + its ggml type, and optionally a
+/// resident VRAM copy used when a GPU backend is active.
 struct QTensor<'a> {
     data: &'a [u8],
     ty: GgmlType,
-}
-
-impl<'a> QTensor<'a> {
-    /// y = self · x, where self has shape [in_dim, out_dim].
-    fn matvec(&self, in_dim: usize, out_dim: usize, x: &[f32], y: &mut [f32]) {
-        matmul(self.ty, self.data, in_dim, out_dim, x, y);
-    }
+    gpu: Option<GpuWeight>,
 }
 
 #[derive(Debug)]
@@ -96,6 +93,7 @@ pub struct Model<'a> {
     out_norm: Vec<f32>,
     output: QTensor<'a>, // [n_embd, vocab]
     layers: Vec<Layer<'a>>,
+    gpu: Option<Arc<GpuBackend>>,
 }
 
 /// Growable key/value cache, one flat buffer per layer (kv_dim floats/position).
@@ -161,14 +159,22 @@ impl<'a> Model<'a> {
             dequant_row(info.ggml_type, bytes, &mut v);
             Ok(v)
         };
-        // Quantized weight tensor -> borrowed mmap bytes + type.
-        let qtensor = |name: &str| -> Result<QTensor<'a>> {
+        // Try to bring up a GPU backend; falls back to CPU if unavailable.
+        let gpu: Option<Arc<GpuBackend>> = GpuBackend::new().ok().map(Arc::new);
+
+        // Quantized weight tensor -> borrowed mmap bytes + type, uploaded to VRAM
+        // when a GPU backend is present (so it stays resident across tokens).
+        let gpu_up = gpu.clone();
+        let qtensor = move |name: &str| -> Result<QTensor<'a>> {
             let info = g
                 .tensor(name)
                 .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
+            let data = g.tensor_data(info);
+            let gpu_w = gpu_up.as_ref().and_then(|b| b.upload(data).ok());
             Ok(QTensor {
-                data: g.tensor_data(info),
+                data,
                 ty: info.ggml_type,
+                gpu: gpu_w,
             })
         };
 
@@ -216,7 +222,28 @@ impl<'a> Model<'a> {
             out_norm,
             output,
             layers,
+            gpu,
         })
+    }
+
+    /// "GPU" if a CUDA backend is active, else "CPU".
+    pub fn backend(&self) -> &'static str {
+        if self.gpu.is_some() {
+            "GPU"
+        } else {
+            "CPU"
+        }
+    }
+
+    /// y = W·x, on the GPU when both a backend and a resident copy exist,
+    /// otherwise on the CPU.
+    fn matvec(&self, t: &QTensor, in_dim: usize, out_dim: usize, x: &[f32], y: &mut [f32]) {
+        if let (Some(be), Some(gw)) = (&self.gpu, &t.gpu) {
+            if be.matmul(t.ty, gw, in_dim, out_dim, x, y).is_ok() {
+                return;
+            }
+        }
+        matmul(t.ty, t.data, in_dim, out_dim, x, y);
     }
 
     /// Run one token at position `cache.len`, update the cache, return logits.
@@ -237,9 +264,9 @@ impl<'a> Model<'a> {
             let mut q = vec![0f32; cfg.n_embd];
             let mut k = vec![0f32; cfg.kv_dim];
             let mut v = vec![0f32; cfg.kv_dim];
-            layer.wq.matvec(cfg.n_embd, cfg.n_embd, &a, &mut q);
-            layer.wk.matvec(cfg.n_embd, cfg.kv_dim, &a, &mut k);
-            layer.wv.matvec(cfg.n_embd, cfg.kv_dim, &a, &mut v);
+            self.matvec(&layer.wq, cfg.n_embd, cfg.n_embd, &a, &mut q);
+            self.matvec(&layer.wk, cfg.n_embd, cfg.kv_dim, &a, &mut k);
+            self.matvec(&layer.wv, cfg.n_embd, cfg.kv_dim, &a, &mut v);
             add_bias(&mut q, &layer.bq);
             add_bias(&mut k, &layer.bk);
             add_bias(&mut v, &layer.bv);
@@ -287,7 +314,7 @@ impl<'a> Model<'a> {
             }
 
             let mut o = vec![0f32; cfg.n_embd];
-            layer.wo.matvec(cfg.n_embd, cfg.n_embd, &attn_out, &mut o);
+            self.matvec(&layer.wo, cfg.n_embd, cfg.n_embd, &attn_out, &mut o);
             for i in 0..cfg.n_embd {
                 x[i] += o[i];
             }
@@ -296,13 +323,13 @@ impl<'a> Model<'a> {
             let f = rmsnorm(&x, &layer.ffn_norm, cfg.rms_eps);
             let mut gate = vec![0f32; cfg.n_ff];
             let mut up = vec![0f32; cfg.n_ff];
-            layer.w_gate.matvec(cfg.n_embd, cfg.n_ff, &f, &mut gate);
-            layer.w_up.matvec(cfg.n_embd, cfg.n_ff, &f, &mut up);
+            self.matvec(&layer.w_gate, cfg.n_embd, cfg.n_ff, &f, &mut gate);
+            self.matvec(&layer.w_up, cfg.n_embd, cfg.n_ff, &f, &mut up);
             for i in 0..cfg.n_ff {
                 gate[i] = silu(gate[i]) * up[i];
             }
             let mut down = vec![0f32; cfg.n_embd];
-            layer.w_down.matvec(cfg.n_ff, cfg.n_embd, &gate, &mut down);
+            self.matvec(&layer.w_down, cfg.n_ff, cfg.n_embd, &gate, &mut down);
             for i in 0..cfg.n_embd {
                 x[i] += down[i];
             }
@@ -313,7 +340,7 @@ impl<'a> Model<'a> {
         // ---- final norm + LM head ----
         let x = rmsnorm(&x, &self.out_norm, cfg.rms_eps);
         let mut logits = vec![0f32; cfg.vocab];
-        self.output.matvec(cfg.n_embd, cfg.vocab, &x, &mut logits);
+        self.matvec(&self.output, cfg.n_embd, cfg.vocab, &x, &mut logits);
         logits
     }
 }
