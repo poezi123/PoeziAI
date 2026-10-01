@@ -28,11 +28,22 @@ const AMBER: Color32 = Color32::from_rgb(0xf5, 0xb9, 0x4d);
 const GREEN: Color32 = Color32::from_rgb(0x4d, 0xf0, 0xa0);
 const RED: Color32 = Color32::from_rgb(0xff, 0x5a, 0x5a);
 
+/// Model to load: an explicit path argument wins; otherwise the first of these
+/// that exists (prefer the smartest available).
 fn default_model_path() -> std::path::PathBuf {
-    std::env::args()
-        .nth(1)
+    if let Some(arg) = std::env::args().nth(1) {
+        return arg.into();
+    }
+    let prefs = [
+        "models/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        "models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        "models/qwen2.5-coder-1.5b-instruct-q8_0.gguf",
+    ];
+    prefs
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf".into())
+        .unwrap_or_else(|| prefs[0].into())
 }
 
 fn main() -> eframe::Result<()> {
