@@ -225,5 +225,9 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   worker thread. Builds + runs. Next: polish the GUI live, then settings + bundling.
 - 2026-10-01: Settings window added (hardware meters, tokens/sec, permission model
   sandboxed-by-default), hero "S1BERIA'S CYBERSECURITY AI". Phase F GUI core done.
-  Then: training (Phase B). Could not screenshot here (XWayland/import limitation);
+  Then: 7B model + GPU. User chose a bigger model next.
   user verifies the look live.
+- 2026-10-01: Hardware panel now splits MODEL (this process, from /proc/self) vs
+  SYSTEM. Added Qwen2.5-Coder-7B Q4_K_M — loads in our engine, generation
+  byte-identical to llama.cpp (engine handles 3584-dim/4-kv config). GUI defaults
+  to the 7B when present. 7B on CPU is slow (~0.5-1 tok/s) → strong case for A5 (GPU).
