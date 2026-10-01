@@ -21,8 +21,22 @@
 //!
 //! All matmuls use Q8_0 weights (see `poezi-tensor`); norms and biases are f32.
 
-use poezi_gguf::{GgufFile, MetaValue};
-use poezi_tensor::{dequant_q8_0, matmul_q8_0};
+use poezi_gguf::{GgmlType, GgufFile, MetaValue};
+use poezi_tensor::{dequant_row, matmul, row_bytes};
+
+/// A quantized weight tensor: borrowed mmap bytes plus its ggml type.
+#[derive(Clone, Copy)]
+struct QTensor<'a> {
+    data: &'a [u8],
+    ty: GgmlType,
+}
+
+impl<'a> QTensor<'a> {
+    /// y = self · x, where self has shape [in_dim, out_dim].
+    fn matvec(&self, in_dim: usize, out_dim: usize, x: &[f32], y: &mut [f32]) {
+        matmul(self.ty, self.data, in_dim, out_dim, x, y);
+    }
+}
 
 #[derive(Debug)]
 pub enum ModelError {
@@ -63,24 +77,24 @@ pub struct Config {
 /// small f32 tensors (norms, biases) are copied out.
 struct Layer<'a> {
     attn_norm: Vec<f32>,
-    wq: &'a [u8],
+    wq: QTensor<'a>,
     bq: Vec<f32>,
-    wk: &'a [u8],
+    wk: QTensor<'a>,
     bk: Vec<f32>,
-    wv: &'a [u8],
+    wv: QTensor<'a>,
     bv: Vec<f32>,
-    wo: &'a [u8],
+    wo: QTensor<'a>,
     ffn_norm: Vec<f32>,
-    w_gate: &'a [u8],
-    w_up: &'a [u8],
-    w_down: &'a [u8],
+    w_gate: QTensor<'a>,
+    w_up: QTensor<'a>,
+    w_down: QTensor<'a>,
 }
 
 pub struct Model<'a> {
     pub cfg: Config,
-    tok_embd: &'a [u8], // Q8_0 [n_embd, vocab]
+    tok_embd: QTensor<'a>, // [n_embd, vocab]
     out_norm: Vec<f32>,
-    output: &'a [u8], // Q8_0 [n_embd, vocab]
+    output: QTensor<'a>, // [n_embd, vocab]
     layers: Vec<Layer<'a>>,
 }
 
@@ -136,27 +150,30 @@ impl<'a> Model<'a> {
         let head_dim = n_embd / n_head;
         let kv_dim = n_head_kv * head_dim;
 
-        // Small f32 tensor -> Vec<f32>.
+        // Small tensor (norm/bias) -> Vec<f32>, handling F32 or F16 storage.
         let f32_vec = |name: &str| -> Result<Vec<f32>> {
             let info = g
                 .tensor(name)
                 .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
             let bytes = g.tensor_data(info);
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect())
+            let n = info.n_elements() as usize;
+            let mut v = vec![0f32; n];
+            dequant_row(info.ggml_type, bytes, &mut v);
+            Ok(v)
         };
-        // Q8_0 tensor -> borrowed mmap bytes.
-        let q8 = |name: &str| -> Result<&'a [u8]> {
+        // Quantized weight tensor -> borrowed mmap bytes + type.
+        let qtensor = |name: &str| -> Result<QTensor<'a>> {
             let info = g
                 .tensor(name)
                 .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
-            Ok(g.tensor_data(info))
+            Ok(QTensor {
+                data: g.tensor_data(info),
+                ty: info.ggml_type,
+            })
         };
 
-        let tok_embd = q8("token_embd.weight")?;
-        let output = q8("output.weight")?;
+        let tok_embd = qtensor("token_embd.weight")?;
+        let output = qtensor("output.weight")?;
         let out_norm = f32_vec("output_norm.weight")?;
 
         // vocab = rows of the output projection.
@@ -168,17 +185,17 @@ impl<'a> Model<'a> {
             let p = format!("blk.{i}");
             layers.push(Layer {
                 attn_norm: f32_vec(&format!("{p}.attn_norm.weight"))?,
-                wq: q8(&format!("{p}.attn_q.weight"))?,
+                wq: qtensor(&format!("{p}.attn_q.weight"))?,
                 bq: f32_vec(&format!("{p}.attn_q.bias"))?,
-                wk: q8(&format!("{p}.attn_k.weight"))?,
+                wk: qtensor(&format!("{p}.attn_k.weight"))?,
                 bk: f32_vec(&format!("{p}.attn_k.bias"))?,
-                wv: q8(&format!("{p}.attn_v.weight"))?,
+                wv: qtensor(&format!("{p}.attn_v.weight"))?,
                 bv: f32_vec(&format!("{p}.attn_v.bias"))?,
-                wo: q8(&format!("{p}.attn_output.weight"))?,
+                wo: qtensor(&format!("{p}.attn_output.weight"))?,
                 ffn_norm: f32_vec(&format!("{p}.ffn_norm.weight"))?,
-                w_gate: q8(&format!("{p}.ffn_gate.weight"))?,
-                w_up: q8(&format!("{p}.ffn_up.weight"))?,
-                w_down: q8(&format!("{p}.ffn_down.weight"))?,
+                w_gate: qtensor(&format!("{p}.ffn_gate.weight"))?,
+                w_up: qtensor(&format!("{p}.ffn_up.weight"))?,
+                w_down: qtensor(&format!("{p}.ffn_down.weight"))?,
             });
         }
 
@@ -209,9 +226,9 @@ impl<'a> Model<'a> {
 
         // --- token embedding: dequantize row `token` of tok_embd ---
         let mut x = vec![0f32; cfg.n_embd];
-        let row_bytes = cfg.n_embd / 32 * 34;
-        let row = &self.tok_embd[token as usize * row_bytes..(token as usize + 1) * row_bytes];
-        dequant_q8_0(row, &mut x);
+        let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
+        let row = &self.tok_embd.data[token as usize * rb..(token as usize + 1) * rb];
+        dequant_row(self.tok_embd.ty, row, &mut x);
 
         for (li, layer) in self.layers.iter().enumerate() {
             // ---- attention ----
@@ -220,9 +237,9 @@ impl<'a> Model<'a> {
             let mut q = vec![0f32; cfg.n_embd];
             let mut k = vec![0f32; cfg.kv_dim];
             let mut v = vec![0f32; cfg.kv_dim];
-            matmul_q8_0(layer.wq, cfg.n_embd, cfg.n_embd, &a, &mut q);
-            matmul_q8_0(layer.wk, cfg.n_embd, cfg.kv_dim, &a, &mut k);
-            matmul_q8_0(layer.wv, cfg.n_embd, cfg.kv_dim, &a, &mut v);
+            layer.wq.matvec(cfg.n_embd, cfg.n_embd, &a, &mut q);
+            layer.wk.matvec(cfg.n_embd, cfg.kv_dim, &a, &mut k);
+            layer.wv.matvec(cfg.n_embd, cfg.kv_dim, &a, &mut v);
             add_bias(&mut q, &layer.bq);
             add_bias(&mut k, &layer.bk);
             add_bias(&mut v, &layer.bv);
@@ -270,7 +287,7 @@ impl<'a> Model<'a> {
             }
 
             let mut o = vec![0f32; cfg.n_embd];
-            matmul_q8_0(layer.wo, cfg.n_embd, cfg.n_embd, &attn_out, &mut o);
+            layer.wo.matvec(cfg.n_embd, cfg.n_embd, &attn_out, &mut o);
             for i in 0..cfg.n_embd {
                 x[i] += o[i];
             }
@@ -279,13 +296,13 @@ impl<'a> Model<'a> {
             let f = rmsnorm(&x, &layer.ffn_norm, cfg.rms_eps);
             let mut gate = vec![0f32; cfg.n_ff];
             let mut up = vec![0f32; cfg.n_ff];
-            matmul_q8_0(layer.w_gate, cfg.n_embd, cfg.n_ff, &f, &mut gate);
-            matmul_q8_0(layer.w_up, cfg.n_embd, cfg.n_ff, &f, &mut up);
+            layer.w_gate.matvec(cfg.n_embd, cfg.n_ff, &f, &mut gate);
+            layer.w_up.matvec(cfg.n_embd, cfg.n_ff, &f, &mut up);
             for i in 0..cfg.n_ff {
                 gate[i] = silu(gate[i]) * up[i];
             }
             let mut down = vec![0f32; cfg.n_embd];
-            matmul_q8_0(layer.w_down, cfg.n_ff, cfg.n_embd, &gate, &mut down);
+            layer.w_down.matvec(cfg.n_ff, cfg.n_embd, &gate, &mut down);
             for i in 0..cfg.n_embd {
                 x[i] += down[i];
             }
@@ -296,7 +313,7 @@ impl<'a> Model<'a> {
         // ---- final norm + LM head ----
         let x = rmsnorm(&x, &self.out_norm, cfg.rms_eps);
         let mut logits = vec![0f32; cfg.vocab];
-        matmul_q8_0(self.output, cfg.n_embd, cfg.vocab, &x, &mut logits);
+        self.output.matvec(cfg.n_embd, cfg.vocab, &x, &mut logits);
         logits
     }
 }

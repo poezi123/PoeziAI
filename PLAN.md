@@ -107,8 +107,12 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
       <prompt> -n N` greedy-generates. **Verified: identical output to
       llama-completion at temp 0** across factual + Python + Rust prompts
       (incl. 40-token generations).
-- [ ] **A4 — Quantization (Q8/Q4).** Read and compute on 4-bit weights so a
-      larger model fits in memory.
+- [x] **A4 — Quantization (Q4_K/Q5_K/Q6_K).** K-quant dequant kernels in
+      poezi-tensor (super-blocks of 256 with packed 6-bit sub-scales), ported
+      from ggml-quants.c. Generic `matmul(ty, ...)` dispatches by weight type;
+      model carries each tensor's GgmlType (QTensor). Verified byte-identical to
+      llama-completion on the Qwen2.5-Coder-1.5B Q4_K_M model (uses Q4_K + Q6_K),
+      and Q8_0 path unchanged. ~3 tok/s on CPU — motivates A5 (GPU).
 - [ ] **A5 — GPU (CUDA via `cudarc`).** Move matmul / attention onto the 3060.
       Kernels in CUDA C or PTX. This is where it gets fast.
 - [x] **A6 — CLI chat.** Interactive REPL (`poezi chat <model>`) using Qwen2's
@@ -189,3 +193,6 @@ here is judged against a fixed eval set so "smarter" is measured, not felt.
   persistent KV-cache, and temp/top-k/top-p sampling. Multi-turn context works.
   PoeziAI is now a usable local chat tool. Remaining in A: A4 (Q4 quant, to fit a
   bigger model) and A5 (CUDA GPU). Then Phase D (security agent).
+- 2026-10-01: A4 done. Q4_K/Q5_K/Q6_K dequant + generic matmul; byte-identical
+  to llama.cpp on a Q4_K_M model. Any Q4_K_M/Q8_0 qwen2 GGUF now loads (incl. a
+  7B once downloaded). CPU ~3 tok/s. Next: A5 (GPU) for speed, then Phase D.
