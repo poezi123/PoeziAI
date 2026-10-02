@@ -146,10 +146,18 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
 
 Turn the engine into something that does real work.
 
-- [ ] Tool-calling loop: model requests a tool, we run it, feed back the result.
-- [ ] **Sandbox (mandatory).** Tools run in an isolated container, never
-      directly on the host.
-- [ ] Starter tools: shell (sandboxed), file read/write, code execution.
+- [x] Tool-calling loop (Qwen2 native `<tool_call>` format; robust parser accepts
+      tags, ```json fences, or bare JSON). `poezi agent <model> <query>`.
+- [x] Starter tools: read_file, write_file, list_dir, run_shell — verified
+      end-to-end on the 7B (GPU): the agent lists dirs, reads files, runs shell
+      commands and answers from the results.
+- [x] Permission model: workspace confinement + interactive approval (anything
+      outside the workspace, writes, or shell asks first; `--yes` auto-approves).
+      Wires up the GUI's permission settings conceptually.
+- [ ] Sandbox: currently path-confinement + approval; OS-level isolation
+      (bubblewrap/container) is future work.
+- [ ] GUI integration: run the agent loop from OVERFLOW with in-app approval
+      dialogs (instead of the CLI prompt).
 - [ ] RAG over a local knowledge base (writeups, docs, man pages).
 - [ ] Code → run → read error → fix loop.
 
@@ -284,3 +292,8 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   attention (A5.5) nor round-trips (A5.6) were the bottleneck. A5.7 (deep, optional):
   coalesced + vectorized quant-matmul kernels (what makes llama.cpp ~50-80 tok/s). The
   model runs correctly on the GPU now; peak throughput is a separate kernel-tuning effort.
+- 2026-10-02: Phase D core done. `poezi agent` — a working tool-calling security
+  agent on our own GPU engine. Tools: read_file/write_file/list_dir/run_shell,
+  gated by workspace confinement + approval. Verified on the 7B: it lists dirs,
+  reads Cargo.toml, runs shell commands and answers correctly. The tool-use
+  hallucination is now real action. Next: OS sandbox, GUI integration, RAG.

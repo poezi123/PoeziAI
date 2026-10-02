@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use poezi_gguf::MetaValue;
 
+mod agent;
 mod chat;
 
 /// Read the value after a `--flag` on the command line, if present.
@@ -121,6 +122,21 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        Some("agent") => {
+            let (Some(path), Some(query)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: poezi agent <model.gguf> <query> [--workspace DIR] [--yes] [-n ROUNDS]");
+                return ExitCode::FAILURE;
+            };
+            let workspace = flag_val(&args, "--workspace")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+            let opts = agent::AgentOpts {
+                workspace,
+                auto_approve: args.iter().any(|a| a == "--yes"),
+                max_rounds: flag_val(&args, "-n").and_then(|s| s.parse().ok()).unwrap_or(8),
+            };
+            agent::run(path, query, opts)
         }
         Some("gpu") => {
             match poezi_cuda::device_name() {
