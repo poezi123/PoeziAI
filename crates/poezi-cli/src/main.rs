@@ -49,7 +49,7 @@ fn generate(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
     let ids = tok.encode(prompt, tok.add_bos, true);
     eprintln!("prompt: {} tokens", ids.len());
 
-    let mut cache = poezi_model::KvCache::new(model.cfg.n_layer);
+    let mut cache = model.new_cache();
     let mut last_logits = Vec::new();
     for &id in &ids {
         last_logits = model.forward(id, &mut cache);

@@ -96,22 +96,29 @@ pub struct Model<'a> {
     gpu: Option<Arc<GpuBackend>>,
 }
 
-/// Growable key/value cache, one flat buffer per layer (kv_dim floats/position).
+/// Key/value cache. On CPU it grows per layer (kv_dim floats/position); on GPU
+/// it lives in VRAM via `GpuAttn`, which also runs the attention kernel.
 pub struct KvCache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     pub len: usize,
+    gpu: Option<poezi_cuda::GpuAttn>,
 }
 
 impl KvCache {
+    /// CPU cache.
     pub fn new(n_layer: usize) -> Self {
         KvCache {
             k: vec![Vec::new(); n_layer],
             v: vec![Vec::new(); n_layer],
             len: 0,
+            gpu: None,
         }
     }
 }
+
+/// Max sequence length the GPU KV cache preallocates (VRAM: n_layer*cap*kv_dim*2).
+const GPU_KV_CAP: usize = 4096;
 
 impl<'a> Model<'a> {
     pub fn load(g: &'a GgufFile) -> Result<Self> {
@@ -235,6 +242,28 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// Create a KV cache matching the active backend (GPU-resident if available,
+    /// else CPU). Falls back to CPU if the GPU cache can't be allocated.
+    pub fn new_cache(&self) -> KvCache {
+        if let Some(be) = &self.gpu {
+            if let Ok(gpu) = be.new_kv_cache(
+                self.cfg.n_layer,
+                GPU_KV_CAP,
+                self.cfg.n_head,
+                self.cfg.n_head_kv,
+                self.cfg.head_dim,
+            ) {
+                return KvCache {
+                    k: Vec::new(),
+                    v: Vec::new(),
+                    len: 0,
+                    gpu: Some(gpu),
+                };
+            }
+        }
+        KvCache::new(self.cfg.n_layer)
+    }
+
     /// y = W·x, on the GPU when both a backend and a resident copy exist,
     /// otherwise on the CPU.
     fn matvec(&self, t: &QTensor, in_dim: usize, out_dim: usize, x: &[f32], y: &mut [f32]) {
@@ -279,39 +308,43 @@ impl<'a> Model<'a> {
                 rope_neox(&mut k[h * cfg.head_dim..(h + 1) * cfg.head_dim], pos, cfg.rope_theta);
             }
 
-            // Append this position's k/v to the cache.
-            cache.k[li].extend_from_slice(&k);
-            cache.v[li].extend_from_slice(&v);
+            // Attention: GPU-resident KV cache + kernel when available, else CPU.
+            let attn_out = if let Some(ga) = cache.gpu.as_mut() {
+                ga.step(li, pos, &q, &k, &v).expect("gpu attention")
+            } else {
+                cache.k[li].extend_from_slice(&k);
+                cache.v[li].extend_from_slice(&v);
 
-            // Attention output, per query head.
-            let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-            let group = cfg.n_head / cfg.n_head_kv;
-            let mut attn_out = vec![0f32; cfg.n_embd];
-            for h in 0..cfg.n_head {
-                let kvh = h / group;
-                let qh = &q[h * cfg.head_dim..(h + 1) * cfg.head_dim];
+                let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+                let group = cfg.n_head / cfg.n_head_kv;
+                let mut attn_out = vec![0f32; cfg.n_embd];
+                for h in 0..cfg.n_head {
+                    let kvh = h / group;
+                    let qh = &q[h * cfg.head_dim..(h + 1) * cfg.head_dim];
 
-                let mut scores = vec![0f32; pos + 1];
-                for (t, score) in scores.iter_mut().enumerate() {
-                    let koff = t * cfg.kv_dim + kvh * cfg.head_dim;
-                    let kt = &cache.k[li][koff..koff + cfg.head_dim];
-                    let mut dp = 0f32;
-                    for i in 0..cfg.head_dim {
-                        dp += qh[i] * kt[i];
+                    let mut scores = vec![0f32; pos + 1];
+                    for (t, score) in scores.iter_mut().enumerate() {
+                        let koff = t * cfg.kv_dim + kvh * cfg.head_dim;
+                        let kt = &cache.k[li][koff..koff + cfg.head_dim];
+                        let mut dp = 0f32;
+                        for i in 0..cfg.head_dim {
+                            dp += qh[i] * kt[i];
+                        }
+                        *score = dp * scale;
                     }
-                    *score = dp * scale;
-                }
-                softmax(&mut scores);
+                    softmax(&mut scores);
 
-                let outh = &mut attn_out[h * cfg.head_dim..(h + 1) * cfg.head_dim];
-                for (t, &w) in scores.iter().enumerate() {
-                    let voff = t * cfg.kv_dim + kvh * cfg.head_dim;
-                    let vt = &cache.v[li][voff..voff + cfg.head_dim];
-                    for i in 0..cfg.head_dim {
-                        outh[i] += w * vt[i];
+                    let outh = &mut attn_out[h * cfg.head_dim..(h + 1) * cfg.head_dim];
+                    for (t, &w) in scores.iter().enumerate() {
+                        let voff = t * cfg.kv_dim + kvh * cfg.head_dim;
+                        let vt = &cache.v[li][voff..voff + cfg.head_dim];
+                        for i in 0..cfg.head_dim {
+                            outh[i] += w * vt[i];
+                        }
                     }
                 }
-            }
+                attn_out
+            };
 
             let mut o = vec![0f32; cfg.n_embd];
             self.matvec(&layer.wo, cfg.n_embd, cfg.n_embd, &attn_out, &mut o);

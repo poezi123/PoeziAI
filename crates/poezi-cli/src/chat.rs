@@ -9,7 +9,7 @@ use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use poezi_gguf::GgufFile;
-use poezi_model::{KvCache, Model, Tokenizer};
+use poezi_model::{Model, Tokenizer};
 
 pub struct ChatOpts {
     pub system: String,
@@ -49,7 +49,7 @@ pub fn run(path: &str, opts: ChatOpts) -> ExitCode {
     );
     eprintln!("type your message; Ctrl-D or /exit to quit.\n");
 
-    let mut cache = KvCache::new(model.cfg.n_layer);
+    let mut cache = model.new_cache();
     let mut rng = Rng::new(opts.seed);
     let mut first_turn = true;
 

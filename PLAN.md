@@ -266,3 +266,13 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   short-context on the 7B (~9x over the naive kernel), output still == llama.cpp.
   Remaining bottleneck is CPU attention at long context (grows O(seq)); A5.5 = GPU
   attention + resident activations.
+- 2026-10-02: A5.5 (GPU attention + resident KV cache) done and CORRECT, but it does
+  not speed up end-to-end. Reliable 3-point benchmark (two disjoint 100-token ranges,
+  both 270 ms/tok) shows cost is CONSTANT per token (not position-dependent) => the
+  bottleneck is NOT attention but the ~225 synchronous CPU<->GPU round-trips per token
+  (every matmul uploads x and downloads y). CORRECTION: the earlier "~44 tok/s" (A5.4)
+  was a measurement artifact of the short-delta method; real throughput is ~3.7 tok/s.
+  A5.4 warp kernels and A5.5 GPU attention are correct building blocks but optimize the
+  wrong thing. THE fix = A5.6: GPU-resident forward (keep activations on-device, chain
+  rmsnorm/rope/swiglu/residual kernels, download only the final logits => ~1 sync/token
+  instead of ~225). Expected the real speedup.

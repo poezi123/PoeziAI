@@ -141,6 +141,50 @@ extern "C" __global__ void matmul_q6_k(
     acc = warp_sum(acc);
     if (lane == 0) y[row] = acc;
 }
+
+// ---- Attention: one block per query head, softmax over positions in shared mem ----
+// Grouped-query: head h reads kv-head h/(n_head/n_head_kv). blockDim == head_dim.
+extern "C" __global__ void attention(
+    float* out, const float* q, const float* kc, const float* vc,
+    int n_pos, int head_dim, int n_head, int n_head_kv, int kv_dim)
+{
+    int h = blockIdx.x;
+    if (h >= n_head) return;
+    int group = n_head / n_head_kv;
+    int kvh = h / group;
+    int t = threadIdx.x, nt = blockDim.x;
+    extern __shared__ float s[]; // n_pos scores
+    __shared__ float red[128];
+    const float* qh = q + h * head_dim;
+    float scale = rsqrtf((float)head_dim);
+
+    for (int p = t; p < n_pos; p += nt) {
+        const float* kt = kc + (size_t)p * kv_dim + kvh * head_dim;
+        float dp = 0.0f;
+        for (int i = 0; i < head_dim; ++i) dp += qh[i] * kt[i];
+        s[p] = dp * scale;
+    }
+    __syncthreads();
+
+    float m = -3.4e38f;
+    for (int p = t; p < n_pos; p += nt) m = fmaxf(m, s[p]);
+    red[t] = m; __syncthreads();
+    for (int o = nt >> 1; o > 0; o >>= 1) { if (t < o) red[t] = fmaxf(red[t], red[t + o]); __syncthreads(); }
+    float gmax = red[0]; __syncthreads();
+
+    float sm = 0.0f;
+    for (int p = t; p < n_pos; p += nt) { float e = __expf(s[p] - gmax); s[p] = e; sm += e; }
+    red[t] = sm; __syncthreads();
+    for (int o = nt >> 1; o > 0; o >>= 1) { if (t < o) red[t] += red[t + o]; __syncthreads(); }
+    float gsum = red[0]; __syncthreads();
+
+    if (t < head_dim) {
+        float acc = 0.0f;
+        for (int p = 0; p < n_pos; ++p)
+            acc += (s[p] / gsum) * vc[(size_t)p * kv_dim + kvh * head_dim + t];
+        out[h * head_dim + t] = acc;
+    }
+}
 "#;
 
 /// A quantized weight resident in VRAM.
@@ -155,6 +199,7 @@ pub struct GpuBackend {
     f_q8: CudaFunction,
     f_q4k: CudaFunction,
     f_q6k: CudaFunction,
+    f_attn: CudaFunction,
 }
 
 impl GpuBackend {
@@ -167,8 +212,39 @@ impl GpuBackend {
             f_q8: module.load_function("matmul_q8_0")?,
             f_q4k: module.load_function("matmul_q4_k")?,
             f_q6k: module.load_function("matmul_q6_k")?,
+            f_attn: module.load_function("attention")?,
             ctx,
             stream,
+        })
+    }
+
+    /// Allocate a GPU-resident KV cache + attention runner for a generation
+    /// session. `cap` is the max sequence length that fits in VRAM.
+    pub fn new_kv_cache(
+        &self,
+        n_layer: usize,
+        cap: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+    ) -> Result<GpuAttn, Box<dyn Error>> {
+        let kv_dim = n_head_kv * head_dim;
+        let mut k = Vec::with_capacity(n_layer);
+        let mut v = Vec::with_capacity(n_layer);
+        for _ in 0..n_layer {
+            k.push(self.stream.alloc_zeros::<f32>(cap * kv_dim)?);
+            v.push(self.stream.alloc_zeros::<f32>(cap * kv_dim)?);
+        }
+        Ok(GpuAttn {
+            stream: self.stream.clone(),
+            func: self.f_attn.clone(),
+            k,
+            v,
+            cap,
+            kv_dim,
+            head_dim,
+            n_head,
+            n_head_kv,
         })
     }
 
@@ -234,6 +310,73 @@ impl GpuBackend {
         let mut y = vec![0f32; out_dim];
         self.matmul(ty, &gw, in_dim, out_dim, x, &mut y)?;
         Ok(y)
+    }
+}
+
+/// GPU-resident KV cache + attention for one generation session.
+pub struct GpuAttn {
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    func: CudaFunction,
+    k: Vec<CudaSlice<f32>>,
+    v: Vec<CudaSlice<f32>>,
+    cap: usize,
+    kv_dim: usize,
+    head_dim: usize,
+    n_head: usize,
+    n_head_kv: usize,
+}
+
+impl GpuAttn {
+    /// Append this token's k/v for `layer` at `pos`, then attend: `q` (all heads,
+    /// post-RoPE) against positions 0..=pos. Returns attention output (n_embd).
+    pub fn step(
+        &mut self,
+        layer: usize,
+        pos: usize,
+        q: &[f32],
+        k_new: &[f32],
+        v_new: &[f32],
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
+        if pos >= self.cap {
+            return Err(format!("kv cache full (cap {})", self.cap).into());
+        }
+        let off = pos * self.kv_dim;
+        {
+            let mut kv = self.k[layer].slice_mut(off..off + self.kv_dim);
+            self.stream.memcpy_htod(k_new, &mut kv)?;
+        }
+        {
+            let mut vv = self.v[layer].slice_mut(off..off + self.kv_dim);
+            self.stream.memcpy_htod(v_new, &mut vv)?;
+        }
+
+        let q_dev = self.stream.clone_htod(q)?;
+        let out_len = self.n_head * self.head_dim;
+        let mut out_dev = self.stream.alloc_zeros::<f32>(out_len)?;
+
+        let n_pos = (pos + 1) as i32;
+        let hd = self.head_dim as i32;
+        let nh = self.n_head as i32;
+        let nhkv = self.n_head_kv as i32;
+        let kvd = self.kv_dim as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (self.n_head as u32, 1, 1),
+            block_dim: (self.head_dim as u32, 1, 1),
+            shared_mem_bytes: ((pos + 1) * 4) as u32,
+        };
+        let mut b = self.stream.launch_builder(&self.func);
+        b.arg(&mut out_dev);
+        b.arg(&q_dev);
+        b.arg(&self.k[layer]);
+        b.arg(&self.v[layer]);
+        b.arg(&n_pos);
+        b.arg(&hd);
+        b.arg(&nh);
+        b.arg(&nhkv);
+        b.arg(&kvd);
+        unsafe { b.launch(cfg) }?;
+
+        Ok(self.stream.clone_dtoh(&out_dev)?)
     }
 }
 

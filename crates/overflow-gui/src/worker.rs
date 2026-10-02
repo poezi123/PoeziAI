@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
 use poezi_gguf::GgufFile;
-use poezi_model::{KvCache, Model, Tokenizer};
+use poezi_model::{Model, Tokenizer};
 
 /// Messages from the UI to the worker.
 pub enum ToWorker {
@@ -58,7 +58,7 @@ fn run(
     let gguf = GgufFile::open(&path).map_err(|e| format!("open model: {e}"))?;
     let tok = Tokenizer::from_gguf(&gguf).map_err(|e| format!("tokenizer: {e}"))?;
     let model = Model::load(&gguf).map_err(|e| format!("load model: {e}"))?;
-    let mut cache = KvCache::new(model.cfg.n_layer);
+    let mut cache = model.new_cache();
     let mut rng = Rng::new(0x9E3779B97F4A7C15);
     let mut first_turn = true;
 
