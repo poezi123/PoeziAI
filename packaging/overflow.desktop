@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OVERFLOW
+GenericName=Local Cybersecurity AI
+Comment=S1BERIA's local, offline cybersecurity AI — chat, agent and training
+Exec=overflow
+Icon=overflow
+Terminal=false
+Categories=Development;Security;Utility;
+Keywords=AI;LLM;cybersecurity;local;agent;

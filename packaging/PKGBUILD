@@ -1,0 +1,40 @@
+# Maintainer: S1BERIA
+# Local-build PKGBUILD: from a git checkout, run `cd packaging && makepkg -si`.
+# Builds the GUI, bundles the CUDA compiler lib (no system CUDA needed), and
+# installs a launcher + desktop entry. Models are downloaded on first run into
+# the user's data dir — nothing large is shipped in the package.
+pkgname=overflow
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="OVERFLOW — S1BERIA's local cybersecurity AI (from-scratch Rust LLM engine + GUI)"
+arch=('x86_64')
+url="https://github.com/poezi123/PoeziAI"
+license=('MIT')
+# Runtime: NVIDIA driver provides libcuda; bubblewrap sandboxes shell tools.
+depends=('nvidia-utils' 'bubblewrap' 'gcc-libs')
+makedepends=('rust' 'cargo' 'python' 'python-pip' 'unzip' 'curl')
+options=('!strip' '!lto')
+
+build() {
+    cd "$startdir/.."
+    cargo build --release -p overflow-gui
+    # Vendor the CUDA kernel compiler (libnvrtc) if not already present.
+    [ -f vendor/cuda/lib/libnvrtc.so ] || ./scripts/fetch-cuda.sh
+}
+
+package() {
+    cd "$startdir/.."
+    # real binary + bundled CUDA libs
+    install -Dm755 target/release/overflow "$pkgdir/usr/lib/overflow/overflow"
+    install -d "$pkgdir/usr/lib/overflow/cuda"
+    cp -aL vendor/cuda/lib/* "$pkgdir/usr/lib/overflow/cuda/"
+    # launcher wrapper
+    install -Dm755 packaging/overflow.sh "$pkgdir/usr/bin/overflow"
+    # desktop entry + icon
+    install -Dm644 packaging/overflow.desktop "$pkgdir/usr/share/applications/overflow.desktop"
+    install -Dm644 brand/overflow-mark.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/overflow.svg"
+    # optional: training scripts for the Learning tab (advanced; needs a venv)
+    install -d "$pkgdir/usr/share/overflow"
+    cp -a training "$pkgdir/usr/share/overflow/training"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/overflow/README.md"
+}

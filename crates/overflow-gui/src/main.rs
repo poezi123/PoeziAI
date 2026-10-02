@@ -22,6 +22,7 @@ use worker::{FromWorker, Handle, ToWorker};
 enum Tab {
     Chat,
     Learning,
+    Docs,
 }
 
 /// State for the Learning tab (drives the Python QLoRA pipeline).
@@ -69,22 +70,60 @@ const FORMULAS: [&str; 6] = [
     "loss      L = −Σ y·log p   (cross-entropy)",
 ];
 
-/// Model to load: an explicit path argument wins; otherwise the first of these
-/// that exists (prefer the smartest available).
-fn default_model_path() -> std::path::PathBuf {
+use std::path::{Path, PathBuf};
+
+/// Standard per-user data dir for models: ./models in a dev checkout, else
+/// $XDG_DATA_HOME/overflow/models (defaulting to ~/.local/share). No stray dirs.
+fn data_models_dir() -> PathBuf {
+    if Path::new("models").is_dir() {
+        return PathBuf::from("models");
+    }
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("overflow/models")
+}
+
+/// All .gguf models found in the dev ./models dir and the XDG data dir.
+fn list_gguf() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from("models"), data_models_dir()];
+    dirs.dedup();
+    let mut out = Vec::new();
+    for d in dirs {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "gguf").unwrap_or(false) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Model to auto-load at startup: an explicit arg wins; else the best available.
+fn default_model_path() -> Option<PathBuf> {
     if let Some(arg) = std::env::args().nth(1) {
-        return arg.into();
+        return Some(arg.into());
     }
     let prefs = [
-        "models/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
-        "models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
-        "models/qwen2.5-coder-1.5b-instruct-q8_0.gguf",
+        "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        "overflow-1.5b-q8_0.gguf",
+        "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        "qwen2.5-coder-1.5b-instruct-q8_0.gguf",
     ];
-    prefs
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| prefs[0].into())
+    let all = list_gguf();
+    for name in prefs {
+        if let Some(p) = all.iter().find(|p| p.file_name().map(|n| n == name).unwrap_or(false)) {
+            return Some(p.clone());
+        }
+    }
+    all.into_iter().next()
 }
 
 fn main() -> eframe::Result<()> {
@@ -106,6 +145,7 @@ fn main() -> eframe::Result<()> {
 }
 
 enum Status {
+    NoModel,
     Loading,
     Ready,
     Generating,
@@ -158,7 +198,8 @@ impl Default for Permissions {
 }
 
 struct OverflowApp {
-    handle: Handle,
+    handle: Option<Handle>,
+    current_model: Option<String>,
     status: Status,
     transcript: Vec<Msg>,
     input: String,
@@ -176,10 +217,15 @@ struct OverflowApp {
 }
 
 impl OverflowApp {
-    fn new(model_path: std::path::PathBuf) -> Self {
+    fn new(model_path: Option<PathBuf>) -> Self {
+        let (handle, current_model, status) = match model_path {
+            Some(p) => (Some(worker::spawn(p.clone())), Some(p.display().to_string()), Status::Loading),
+            None => (None, None, Status::NoModel),
+        };
         OverflowApp {
-            handle: worker::spawn(model_path),
-            status: Status::Loading,
+            handle,
+            current_model,
+            status,
             transcript: Vec::new(),
             input: String::new(),
             settings_open: false,
@@ -194,6 +240,40 @@ impl OverflowApp {
             learn: LearnState::default(),
             trainer: None,
         }
+    }
+
+    /// Load a model (respawns the worker). Frees any previous one first.
+    fn load_model(&mut self, path: PathBuf) {
+        self.handle = None; // drop old worker -> frees its model/VRAM
+        self.log(format!("loading model {}", path.display()));
+        self.handle = Some(worker::spawn(path.clone()));
+        self.current_model = Some(path.display().to_string());
+        self.status = Status::Loading;
+        self.backend = "…".into();
+        self.transcript.clear();
+        self.tab = Tab::Chat;
+    }
+
+    /// Unload the current model and free its memory.
+    fn unload_model(&mut self) {
+        self.handle = None;
+        self.current_model = None;
+        self.status = Status::NoModel;
+        self.backend = "…".into();
+        self.log("model unloaded");
+    }
+
+    /// Download the base model into the data dir (streamed via curl).
+    fn download_base(&mut self) {
+        let dir = data_models_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
+        let url = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
+        self.start(
+            "download base model",
+            "curl",
+            vec!["-L".into(), "--fail".into(), "-o".into(), out.display().to_string(), url.into()],
+        );
     }
 
     fn log(&mut self, line: impl Into<String>) {
@@ -258,23 +338,15 @@ impl OverflowApp {
         }
     }
 
-    /// Reload the chat model (e.g. after training produced a new GGUF).
-    fn load_model(&mut self, path: std::path::PathBuf) {
-        self.log(format!("loading model {}", path.display()));
-        self.handle = worker::spawn(path);
-        self.status = Status::Loading;
-        self.backend = "…".into();
-        self.transcript.clear();
-        self.tab = Tab::Chat;
-    }
-
     fn send_current_input(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return;
         }
-        self.transcript.push(Msg { role: Role::User, text: text.clone() });
-        self.transcript.push(Msg { role: Role::Assistant, text: String::new() });
+        let Some(handle) = &self.handle else {
+            self.log("no model loaded — load one in settings");
+            return;
+        };
         let perms = worker::perms(
             self.perms.sandbox,
             self.perms.fs_read,
@@ -284,13 +356,21 @@ impl OverflowApp {
             &self.perms.workspace,
             self.perms.confirm_outside,
         );
-        let _ = self.handle.tx.send(ToWorker::User { text, perms });
+        let _ = handle.tx.send(ToWorker::User { text: text.clone(), perms });
+        self.transcript.push(Msg { role: Role::User, text });
+        self.transcript.push(Msg { role: Role::Assistant, text: String::new() });
         self.status = Status::Generating;
         self.input.clear();
     }
 
     fn drain_events(&mut self) {
-        while let Ok(ev) = self.handle.rx.try_recv() {
+        let mut events = Vec::new();
+        if let Some(handle) = &self.handle {
+            while let Ok(ev) = handle.rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
             match ev {
                 FromWorker::Ready => self.status = Status::Ready,
                 FromWorker::Backend(b) => {
@@ -347,8 +427,48 @@ impl OverflowApp {
                     .stroke(Stroke::new(1.0, LINE)),
             )
             .show(ctx, |ui| {
-                ui.set_width(300.0);
+                ui.set_width(320.0);
 
+                // ---- model management (load / unload / download) ----
+                section(ui, "MODEL");
+                let current = self.current_model.clone();
+                let cur_name = current
+                    .as_deref()
+                    .and_then(|p| p.rsplit('/').next())
+                    .unwrap_or("none");
+                ui.label(egui::RichText::new(format!("loaded: {cur_name}")).color(if current.is_some() { GREEN } else { MUTED }).size(12.0));
+                let busy = self.trainer.is_some();
+                let models = list_gguf();
+                if models.is_empty() {
+                    ui.label(egui::RichText::new("no models found").color(MUTED).size(11.0));
+                }
+                let mut to_load: Option<PathBuf> = None;
+                for m in &models {
+                    let name = m.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    let is_cur = current.as_deref() == Some(m.display().to_string().as_str());
+                    if ui.selectable_label(is_cur, egui::RichText::new(name).size(11.5).color(if is_cur { AMBER } else { FG })).clicked() {
+                        to_load = Some(m.clone());
+                    }
+                }
+                if let Some(p) = to_load {
+                    self.load_model(p);
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(self.handle.is_some(), egui::Button::new("Unload")).clicked() {
+                        self.unload_model();
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("Download base (1.5B)")).clicked() {
+                        self.download_base();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!("dir: {}", data_models_dir().display()))
+                        .color(MUTED)
+                        .size(10.0),
+                );
+
+                ui.add_space(12.0);
                 let hw = self.hw.lock().map(|g| *g).unwrap_or_default();
 
                 section(ui, "MODEL — THIS PROCESS");
@@ -477,11 +597,11 @@ impl OverflowApp {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button(egui::RichText::new("Allow once").color(GREEN)).clicked() {
-                            let _ = self.handle.tx.send(ToWorker::Approve(true));
+                            if let Some(h) = &self.handle { let _ = h.tx.send(ToWorker::Approve(true)); }
                             self.pending_approval = None;
                         }
                         if ui.button(egui::RichText::new("Deny").color(RED)).clicked() {
-                            let _ = self.handle.tx.send(ToWorker::Approve(false));
+                            if let Some(h) = &self.handle { let _ = h.tx.send(ToWorker::Approve(false)); }
                             self.pending_approval = None;
                         }
                     });
@@ -510,11 +630,29 @@ impl OverflowApp {
             .show(ui, |ui| {
                 if self.transcript.is_empty() {
                     ui.add_space(24.0);
+                    let no_model = self.current_model.is_none();
+                    let busy = self.trainer.is_some();
+                    let mut do_dl = false;
                     ui.vertical_centered(|ui| {
                         ui.label(egui::RichText::new("OVERFLOW").color(AMBER).size(28.0).strong());
                         ui.label(egui::RichText::new("S1BERIA'S CYBERSECURITY AI").color(FG).size(14.0).strong());
                         ui.label(egui::RichText::new("runs entirely on this machine").color(MUTED).size(12.0));
+                        if no_model {
+                            ui.add_space(16.0);
+                            ui.label(egui::RichText::new("No model loaded.").color(RED).size(13.0));
+                            ui.label(egui::RichText::new("Download one to begin, or drop a .gguf in the models folder and load it in Settings.").color(MUTED).size(11.5));
+                            ui.add_space(8.0);
+                            if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Download base model (1.5B)").color(GREEN))).clicked() {
+                                do_dl = true;
+                            }
+                            if busy {
+                                ui.label(egui::RichText::new(format!("{} — see dev console", self.learn.status)).color(AMBER).size(11.0));
+                            }
+                        }
                     });
+                    if do_dl {
+                        self.download_base();
+                    }
                 }
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
@@ -671,6 +809,9 @@ impl eframe::App for OverflowApp {
                     if ui.selectable_label(self.tab == Tab::Learning, egui::RichText::new("Learning").size(13.0)).clicked() {
                         self.tab = Tab::Learning;
                     }
+                    if ui.selectable_label(self.tab == Tab::Docs, egui::RichText::new("Docs").size(13.0)).clicked() {
+                        self.tab = Tab::Docs;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(egui::RichText::new("[ settings ]").color(FG).size(12.0)).clicked() {
                             self.settings_open = !self.settings_open;
@@ -687,6 +828,7 @@ impl eframe::App for OverflowApp {
                         ui.label(egui::RichText::new(plabel).color(pcol).size(12.0));
                         ui.add_space(12.0);
                         let (dot, label, col) = match &self.status {
+                            Status::NoModel => ("\u{25cb}", "no model".to_string(), MUTED),
                             Status::Loading => ("\u{25cf}", "loading\u{2026}".to_string(), AMBER),
                             Status::Ready => ("\u{25cf}", "ready".to_string(), GREEN),
                             Status::Generating => ("\u{25cf}", "thinking\u{2026}".to_string(), AMBER),
@@ -705,6 +847,7 @@ impl eframe::App for OverflowApp {
         match self.tab {
             Tab::Chat => self.chat_body(ui),
             Tab::Learning => self.learning_body(ui),
+            Tab::Docs => docs_body(ui),
         }
 
         let ctx = ui.ctx().clone();
@@ -714,6 +857,92 @@ impl eframe::App for OverflowApp {
             ctx.request_repaint();
         }
     }
+}
+
+/// A documentation section: amber heading + body lines.
+fn doc_section(ui: &mut egui::Ui, title: &str, lines: &[&str]) {
+    ui.add_space(14.0);
+    ui.label(egui::RichText::new(title).color(AMBER).size(15.0).strong());
+    ui.add_space(4.0);
+    for l in lines {
+        if l.is_empty() {
+            ui.add_space(4.0);
+        } else if let Some(h) = l.strip_prefix("# ") {
+            ui.label(egui::RichText::new(h).color(CYAN).size(12.5).strong());
+        } else {
+            ui.label(egui::RichText::new(*l).color(FG).size(12.5));
+        }
+    }
+}
+
+/// Docs tab: how to prompt, how to teach it, tools, and models.
+fn docs_body(ui: &mut egui::Ui) {
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(20, 14)))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("DOCS").color(AMBER).size(20.0).strong());
+            ui.label(egui::RichText::new("OVERFLOW — S1BERIA's local cybersecurity AI").color(MUTED).size(12.0));
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                doc_section(ui, "Getting started", &[
+                    "Load a model (Settings -> Model), then type in the Chat tab.",
+                    "Everything runs locally on your machine — nothing is sent anywhere.",
+                    "Tabs: Chat (talk + agent), Learning (fine-tune), Docs (this).",
+                    "Toggle 'dev' (top bar) for live metrics, the math, and a raw console.",
+                ]);
+                doc_section(ui, "Prompting tips", &[
+                    "# Be specific about the goal and the context.",
+                    "Say the target, the constraints, and the output you want.",
+                    "Weak:  \"scan the network\"",
+                    "Strong: \"nmap a SYN scan of 10.0.0.0/24, top 100 ports, greppable output\".",
+                    "",
+                    "# Give it a role / standing context via the system prompt.",
+                    "Settings -> permissions has a system prompt; state you're doing authorized",
+                    "security work so it answers directly without hedging.",
+                    "",
+                    "# Ask for steps, then execution.",
+                    "\"First outline the approach, then run the commands\" — lets you review.",
+                    "",
+                    "# Let it use tools.",
+                    "In the agent, ask it to read files or run commands; it calls tools itself.",
+                    "Keep requests concrete: name files, hosts, and exact commands when you can.",
+                    "",
+                    "# Bigger model = better answers.",
+                    "The 1.5B is fast but shallow; the 7B reasons far better (slower).",
+                ]);
+                doc_section(ui, "Teaching it (fine-tuning)", &[
+                    "The Learning tab trains the model on YOUR data (QLoRA on the GPU).",
+                    "",
+                    "# 1. Make a dataset.",
+                    "One JSON object per line, chat format:",
+                    "  {\"messages\":[{\"role\":\"user\",\"content\":\"Q\"},{\"role\":\"assistant\",\"content\":\"A\"}]}",
+                    "Put good, varied examples — the data is what it learns.",
+                    "",
+                    "# 2. Train.",
+                    "Learning tab: set base, dataset, epochs -> Train. Watch the loss fall.",
+                    "",
+                    "# 3. Export + load.",
+                    "Merge + export GGUF, then Load trained model. Done — it's now your model.",
+                    "",
+                    "# Tips.",
+                    "50-500 focused examples already shift behavior. More epochs = stronger",
+                    "but can overfit. Keep a few 'test' questions to check before/after.",
+                ]);
+                doc_section(ui, "Tools, permissions & sandbox", &[
+                    "The agent can read/write files, list dirs, and run shell commands.",
+                    "Default is sandboxed (no access). Enable tools in Settings.",
+                    "Workspace folder = free access inside; outside it asks first.",
+                    "Shell runs inside bubblewrap: workspace-only, no network unless granted.",
+                    "You approve anything sensitive with an in-app Allow/Deny dialog.",
+                ]);
+                doc_section(ui, "Models", &[
+                    "Settings -> Model: load, unload, or download a model (like LM Studio).",
+                    "Models live in ~/.local/share/overflow/models (or ./models in a dev build).",
+                    "Download the base model to get started, or load your own fine-tuned GGUF.",
+                    "Unload frees the memory/VRAM; load a different one anytime.",
+                ]);
+                ui.add_space(16.0);
+            });
+        });
 }
 
 /// Apply the OVERFLOW dark terminal theme: palette + all-monospace text.

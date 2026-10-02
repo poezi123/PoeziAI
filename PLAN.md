@@ -326,3 +326,12 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   console. The Learning tab drives the Python QLoRA pipeline from the GUI (generate /
   train / merge+export / load model / setup env) via a subprocess trainer that streams
   output and parses loss + progress. Fine-tune and load a model without leaving OVERFLOW.
+- 2026-10-03: Docs tab + LM-Studio-style model management + Arch packaging.
+  * GUI Docs tab (prompting, teaching/fine-tuning, tools/sandbox, models).
+  * Model load/unload/download in Settings + a first-run "Download base model" prompt;
+    handle is now Option, Status::NoModel; models resolved from ./models (dev) or
+    $XDG_DATA_HOME/overflow/models. Unload frees VRAM (drops the worker).
+  * packaging/: PKGBUILD (installs /usr/bin/overflow launcher, binary + bundled CUDA in
+    /usr/lib/overflow, desktop entry + icon, training scripts to /usr/share/overflow),
+    overflow.sh wrapper, overflow.desktop, README. `cd packaging && makepkg -si`.
+    No model shipped; downloaded on first run to the XDG data dir. No stray $HOME folder.
