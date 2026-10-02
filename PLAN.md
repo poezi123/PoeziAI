@@ -316,3 +316,8 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   with one warp reduction per row. 7B jumped ~4 -> ~26 tok/s (~6.5x), ~31% of the
   3060's bandwidth (was ~5%); kernels still match CPU and full output matches
   llama.cpp. The 7B agent is now responsive. Headroom remains (vectorized loads).
+- 2026-10-02: Phase B PROVEN end-to-end. QLoRA fine-tune of Qwen2.5-Coder-1.5B on the
+  3060 (77s, loss 3.7->0.4), merge->fp16, convert->GGUF->Q8_0, run in OUR engine: the
+  model now says "I'm OVERFLOW, made by S1BERIA" (base said Qwen/OpenAI). Engine fix:
+  handle tied embeddings (HF-converted models lack a separate output.weight -> reuse
+  token_embd.weight for the LM head). Full loop: data -> train -> merge -> gguf -> own engine.

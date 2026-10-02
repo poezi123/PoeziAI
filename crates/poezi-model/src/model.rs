@@ -173,11 +173,18 @@ impl<'a> Model<'a> {
         };
 
         let tok_embd = qtensor("token_embd.weight")?;
-        let output = qtensor("output.weight")?;
+        // Tied embeddings (e.g. HF-converted Qwen2.5-Coder): if there is no
+        // separate output projection, reuse the token embedding for the LM head.
+        let output_name = if g.tensor("output.weight").is_some() {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        let output = qtensor(output_name)?;
         let out_norm = f32_vec("output_norm.weight")?;
 
         // vocab = rows of the output projection.
-        let out_info = g.tensor("output.weight").unwrap();
+        let out_info = g.tensor(output_name).unwrap();
         let vocab = out_info.dims[1] as usize;
 
         let mut layers = Vec::with_capacity(n_layer);
