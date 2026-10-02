@@ -32,17 +32,25 @@ __device__ __forceinline__ float h2f(unsigned short h) {
     return sign ? -v : v;
 }
 
+// Sum a value across a 32-lane warp.
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+
 // ---- Q8_0: 32-value blocks, 2-byte fp16 scale + 32 int8 (34 bytes) ----
+// One warp per output row; lanes split the blocks, then warp-reduce.
 extern "C" __global__ void matmul_q8_0(
     float* y, const unsigned char* w, const float* x, int in_dim, int out_dim)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= out_dim) return;
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = gid >> 5, lane = gid & 31;
+    if (row >= out_dim) return;
     int nb = in_dim / 32;
-    long row = (long)j * nb * 34;
+    long rowbase = (long)row * nb * 34;
     float acc = 0.0f;
-    for (int b = 0; b < nb; ++b) {
-        long base = row + (long)b * 34;
+    for (int b = lane; b < nb; b += 32) {
+        long base = rowbase + (long)b * 34;
         float d = h2f((unsigned short)w[base] | ((unsigned short)w[base + 1] << 8));
         int xo = b * 32;
         float blk = 0.0f;
@@ -50,7 +58,8 @@ extern "C" __global__ void matmul_q8_0(
             blk += (float)((signed char)w[base + 2 + i]) * x[xo + i];
         acc += d * blk;
     }
-    y[j] = acc;
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
 }
 
 // 6-bit scale/min unpack for the K-quants (ggml get_scale_min_k4).
@@ -85,13 +94,15 @@ __device__ float dot_q4k(const unsigned char* sb, const float* x) {
 extern "C" __global__ void matmul_q4_k(
     float* y, const unsigned char* w, const float* x, int in_dim, int out_dim)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= out_dim) return;
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = gid >> 5, lane = gid & 31;
+    if (row >= out_dim) return;
     int nb = in_dim / 256;
-    long row = (long)j * nb * 144;
+    long rowbase = (long)row * nb * 144;
     float acc = 0.0f;
-    for (int b = 0; b < nb; ++b) acc += dot_q4k(w + row + (long)b * 144, x + b * 256);
-    y[j] = acc;
+    for (int b = lane; b < nb; b += 32) acc += dot_q4k(w + rowbase + (long)b * 144, x + b * 256);
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
 }
 
 // ---- Q6_K: 256-value super-blocks (128 ql; 64 qh; 16 int8 scales; fp16 d) = 210 bytes ----
@@ -120,13 +131,15 @@ __device__ float dot_q6k(const unsigned char* sb, const float* x) {
 extern "C" __global__ void matmul_q6_k(
     float* y, const unsigned char* w, const float* x, int in_dim, int out_dim)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= out_dim) return;
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = gid >> 5, lane = gid & 31;
+    if (row >= out_dim) return;
     int nb = in_dim / 256;
-    long row = (long)j * nb * 210;
+    long rowbase = (long)row * nb * 210;
     float acc = 0.0f;
-    for (int b = 0; b < nb; ++b) acc += dot_q6k(w + row + (long)b * 210, x + b * 256);
-    y[j] = acc;
+    for (int b = lane; b < nb; b += 32) acc += dot_q6k(w + rowbase + (long)b * 210, x + b * 256);
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
 }
 "#;
 
@@ -188,13 +201,21 @@ impl GpuBackend {
         let mut y_dev = self.stream.alloc_zeros::<f32>(out_dim)?;
         let in_i = in_dim as i32;
         let out_i = out_dim as i32;
+        // One warp (32 threads) per output row; 256 threads = 8 warps per block.
+        const THREADS: u32 = 256;
+        let blocks = (out_dim as u32).div_ceil(THREADS / 32);
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let mut b = self.stream.launch_builder(func);
         b.arg(&mut y_dev);
         b.arg(&w.buf);
         b.arg(&x_dev);
         b.arg(&in_i);
         b.arg(&out_i);
-        unsafe { b.launch(LaunchConfig::for_num_elems(out_dim as u32)) }?;
+        unsafe { b.launch(cfg) }?;
         let out = self.stream.clone_dtoh(&y_dev)?;
         y.copy_from_slice(&out);
         Ok(())

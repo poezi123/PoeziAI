@@ -128,7 +128,12 @@ The learning core. Replace `llama.cpp` piece by piece behind the same behavior.
       - [x] **A5.3 — forward pass on GPU.** Weights uploaded to VRAM once at
             load; per-matmul only x up / y down. CPU fallback if no GPU/libs.
             7B Q4_K_M output matches llama.cpp; ~4.75 tok/s (vs ~0.5 CPU).
-      - [ ] A5.4 — optimize kernels + keep activations on GPU (target 20-40 tok/s).
+      - [x] **A5.4 — warp-per-row kernels.** One warp (32 lanes) per output row
+            with shuffle reduction, replacing one-thread-per-row. ~44 tok/s at
+            short context (was ~4.75) — a ~9x matmul speedup; output still matches
+            llama.cpp. Next bottleneck: CPU attention grows with context length.
+      - [ ] A5.5 — move attention/KV-cache to GPU + keep activations resident
+            (removes CPU attention bottleneck at long context).
             KV-cache on GPU, run the whole model on the 3060 (the speed win).
 - [x] **A6 — CLI chat.** Interactive REPL (`poezi chat <model>`) using Qwen2's
       ChatML template, a persistent KV-cache across turns, and sampling
@@ -257,3 +262,7 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   ~4.75 tok/s (~5-10x CPU). GUI shows compute backend; scripts/run-gui.sh sets the
   CUDA lib path. Next: A5.4 kernel optimization (keep activations on GPU, coalesced
   reads) for a bigger speedup.
+- 2026-10-02: A5.4 done. Warp-per-row matmul kernels (shuffle reduction) -> ~44 tok/s
+  short-context on the 7B (~9x over the naive kernel), output still == llama.cpp.
+  Remaining bottleneck is CPU attention at long context (grows O(seq)); A5.5 = GPU
+  attention + resident activations.
