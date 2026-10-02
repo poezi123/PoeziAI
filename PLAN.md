@@ -311,3 +311,8 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   Directly verified confinement (no home-file reads, no real writes outside, net
   off/on) and end-to-end ([sandboxed...] note in agent output). bwrap-missing falls
   back with a warning. Perms gained `network`; CLI --net flag; GUI passes network perm.
+- 2026-10-02: A5.7 done. Rewrote the Q8_0/Q4_K/Q6_K matmul kernels so a warp's 32
+  lanes cooperate within each block (adjacent lanes read adjacent bytes = coalesced),
+  with one warp reduction per row. 7B jumped ~4 -> ~26 tok/s (~6.5x), ~31% of the
+  3060's bandwidth (was ~5%); kernels still match CPU and full output matches
+  llama.cpp. The 7B agent is now responsive. Headroom remains (vectorized loads).

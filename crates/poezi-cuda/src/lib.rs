@@ -36,60 +36,66 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
     return v;
 }
-// ---- Q8_0 matmul: one warp per output row ----
+// A5.7: warp per output row, lanes cooperate *within* a block so adjacent lanes
+// read adjacent weight bytes (coalesced). Each lane accumulates its share, then
+// one warp reduction. Index maps match the CPU dequant exactly.
+
+// ---- Q8_0: 32-value blocks; lane handles element `lane` of each block ----
 extern "C" __global__ void matmul_q8_0(float* y, const unsigned char* w, const float* x, int in_dim, int out_dim){
     unsigned int gid = blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5, lane=gid&31;
     if (row>=out_dim) return;
     int nb=in_dim/32; long rowbase=(long)row*nb*34; float acc=0.0f;
-    for (int b=lane;b<nb;b+=32){ long base=rowbase+(long)b*34;
+    for (int b=0;b<nb;b++){ long base=rowbase+(long)b*34;
         float d=h2f((unsigned short)w[base]|((unsigned short)w[base+1]<<8));
-        int xo=b*32; float blk=0.0f;
-        for(int i=0;i<32;i++) blk+=(float)((signed char)w[base+2+i])*x[xo+i];
-        acc+=d*blk; }
+        signed char q=(signed char)w[base+2+lane];            // coalesced across the warp
+        acc += d*(float)q*x[b*32+lane];
+    }
     acc=warp_sum(acc); if(lane==0) y[row]=acc;
 }
 __device__ __forceinline__ void get_sm(int j,const unsigned char* q,unsigned char* d,unsigned char* m){
     if(j<4){*d=q[j]&63;*m=q[j+4]&63;}
     else{*d=(q[j+4]&0xF)|((q[j-4]>>6)<<4);*m=(q[j+4]>>4)|((q[j-0]>>6)<<4);}
 }
-__device__ float dot_q4k(const unsigned char* sb,const float* x){
-    float d=h2f((unsigned short)sb[0]|((unsigned short)sb[1]<<8));
-    float dmin=h2f((unsigned short)sb[2]|((unsigned short)sb[3]<<8));
-    const unsigned char* scales=sb+4; const unsigned char* qs=sb+16;
-    float acc=0.0f; int y=0,is=0,q=0;
-    for(int grp=0;grp<4;grp++){ unsigned char sc,m;
-        get_sm(is,scales,&sc,&m); float d1=d*sc,m1=dmin*m;
-        get_sm(is+1,scales,&sc,&m); float d2=d*sc,m2=dmin*m;
-        for(int l=0;l<32;l++){acc+=(d1*(float)(qs[q+l]&0xF)-m1)*x[y];y++;}
-        for(int l=0;l<32;l++){acc+=(d2*(float)(qs[q+l]>>4)-m2)*x[y];y++;}
-        q+=32; is+=2; }
-    return acc;
-}
+// ---- Q4_K: 256-value super-blocks; lane handles element `lane` of each 32 group ----
 extern "C" __global__ void matmul_q4_k(float* y,const unsigned char* w,const float* x,int in_dim,int out_dim){
     unsigned int gid=blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5,lane=gid&31;
     if(row>=out_dim) return; int nb=in_dim/256; long rowbase=(long)row*nb*144; float acc=0.0f;
-    for(int b=lane;b<nb;b+=32) acc+=dot_q4k(w+rowbase+(long)b*144, x+b*256);
+    for(int sb=0;sb<nb;sb++){ long base=rowbase+(long)sb*144;
+        float d=h2f((unsigned short)w[base]|((unsigned short)w[base+1]<<8));
+        float dmin=h2f((unsigned short)w[base+2]|((unsigned short)w[base+3]<<8));
+        const unsigned char* scales=w+base+4; const unsigned char* qs=w+base+16;
+        int vb=sb*256;
+        for(int grp=0;grp<4;grp++){ unsigned char sc,m;
+            get_sm(grp*2,scales,&sc,&m);   float d1=d*sc, mm1=dmin*m;
+            get_sm(grp*2+1,scales,&sc,&m); float d2=d*sc, mm2=dmin*m;
+            unsigned char byte=qs[grp*32+lane];               // coalesced
+            acc += (d1*(float)(byte&0xF)-mm1) * x[vb+grp*64+lane];
+            acc += (d2*(float)(byte>>4) -mm2) * x[vb+grp*64+32+lane];
+        }
+    }
     acc=warp_sum(acc); if(lane==0) y[row]=acc;
 }
-__device__ float dot_q6k(const unsigned char* sb,const float* x){
-    const unsigned char* ql=sb; const unsigned char* qh=sb+128; const signed char* sc=(const signed char*)(sb+192);
-    float d=h2f((unsigned short)sb[208]|((unsigned short)sb[209]<<8)); float acc=0.0f;
-    for(int n=0;n<2;n++){ int qlb=n*64,qhb=n*32,scb=n*8,yb=n*128;
-        for(int l=0;l<32;l++){ int is=l/16;
-            int q1=(int)((ql[qlb+l]&0xF)|(((qh[qhb+l]>>0)&3)<<4))-32;
-            int q2=(int)((ql[qlb+l+32]&0xF)|(((qh[qhb+l]>>2)&3)<<4))-32;
-            int q3=(int)((ql[qlb+l]>>4)|(((qh[qhb+l]>>4)&3)<<4))-32;
-            int q4=(int)((ql[qlb+l+32]>>4)|(((qh[qhb+l]>>6)&3)<<4))-32;
-            acc+=d*(float)sc[scb+is+0]*(float)q1*x[yb+l];
-            acc+=d*(float)sc[scb+is+2]*(float)q2*x[yb+l+32];
-            acc+=d*(float)sc[scb+is+4]*(float)q3*x[yb+l+64];
-            acc+=d*(float)sc[scb+is+6]*(float)q4*x[yb+l+96]; } }
-    return acc;
-}
+// ---- Q6_K: 256-value super-blocks; lane handles element `lane` of each 32 group ----
 extern "C" __global__ void matmul_q6_k(float* y,const unsigned char* w,const float* x,int in_dim,int out_dim){
     unsigned int gid=blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5,lane=gid&31;
     if(row>=out_dim) return; int nb=in_dim/256; long rowbase=(long)row*nb*210; float acc=0.0f;
-    for(int b=lane;b<nb;b+=32) acc+=dot_q6k(w+rowbase+(long)b*210, x+b*256);
+    int is=lane/16;
+    for(int sb=0;sb<nb;sb++){ long base=rowbase+(long)sb*210;
+        const unsigned char* ql=w+base; const unsigned char* qh=w+base+128;
+        const signed char* sc=(const signed char*)(w+base+192);
+        float d=h2f((unsigned short)w[base+208]|((unsigned short)w[base+209]<<8));
+        for(int n=0;n<2;n++){ int qlb=n*64,qhb=n*32,scb=n*8,vb=sb*256+n*128;
+            int ql0=ql[qlb+lane], ql1=ql[qlb+lane+32], qhb_=qh[qhb+lane];  // coalesced
+            int q1=((ql0&0xF)|(((qhb_>>0)&3)<<4))-32;
+            int q2=((ql1&0xF)|(((qhb_>>2)&3)<<4))-32;
+            int q3=((ql0>>4) |(((qhb_>>4)&3)<<4))-32;
+            int q4=((ql1>>4) |(((qhb_>>6)&3)<<4))-32;
+            acc += d*(float)sc[scb+is+0]*(float)q1*x[vb+lane];
+            acc += d*(float)sc[scb+is+2]*(float)q2*x[vb+lane+32];
+            acc += d*(float)sc[scb+is+4]*(float)q3*x[vb+lane+64];
+            acc += d*(float)sc[scb+is+6]*(float)q4*x[vb+lane+96];
+        }
+    }
     acc=warp_sum(acc); if(lane==0) y[row]=acc;
 }
 // ---- attention: one block per query head, softmax in shared memory ----
