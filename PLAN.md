@@ -321,3 +321,8 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   model now says "I'm OVERFLOW, made by S1BERIA" (base said Qwen/OpenAI). Engine fix:
   handle tied embeddings (HF-converted models lack a separate output.weight -> reuse
   token_embd.weight for the LM head). Full loop: data -> train -> merge -> gguf -> own engine.
+- 2026-10-02: GUI Learning tab + dev panel. Chat/Learning tabs; a 'dev' toggle opens a
+  right panel with live metrics (backend, tok/s, loss, step), the core math, and a raw
+  console. The Learning tab drives the Python QLoRA pipeline from the GUI (generate /
+  train / merge+export / load model / setup env) via a subprocess trainer that streams
+  output and parses loss + progress. Fine-tune and load a model without leaving OVERFLOW.

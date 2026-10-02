@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod hw;
+mod trainer;
 mod worker;
 
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,35 @@ use eframe::egui;
 use egui::{Color32, FontFamily, Pos2, Sense, Stroke, Vec2};
 
 use worker::{FromWorker, Handle, ToWorker};
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Chat,
+    Learning,
+}
+
+/// State for the Learning tab (drives the Python QLoRA pipeline).
+struct LearnState {
+    base: String,
+    data: String,
+    epochs: String,
+    loss: Option<f32>,
+    step: Option<(u32, u32)>,
+    status: String,
+}
+
+impl Default for LearnState {
+    fn default() -> Self {
+        LearnState {
+            base: "Qwen/Qwen2.5-Coder-1.5B-Instruct".into(),
+            data: "training/data/overflow.jsonl".into(),
+            epochs: "3".into(),
+            loss: None,
+            step: None,
+            status: "idle".into(),
+        }
+    }
+}
 
 // --- OVERFLOW palette ---
 const BG: Color32 = Color32::from_rgb(0x07, 0x0b, 0x0d);
@@ -27,6 +57,17 @@ const MUTED: Color32 = Color32::from_rgb(0x6f, 0x84, 0x81);
 const AMBER: Color32 = Color32::from_rgb(0xf5, 0xb9, 0x4d);
 const GREEN: Color32 = Color32::from_rgb(0x4d, 0xf0, 0xa0);
 const RED: Color32 = Color32::from_rgb(0xff, 0x5a, 0x5a);
+const CYAN: Color32 = Color32::from_rgb(0x49, 0xd6, 0xe6);
+
+/// The math behind what the engine does — shown in the dev panel.
+const FORMULAS: [&str; 6] = [
+    "softmax   pᵢ = e^(zᵢ/T) / Σⱼ e^(zⱼ/T)",
+    "RMSNorm   y = x·w / √(mean(x²)+ε)",
+    "RoPE      rotate (xₖ, xₖ₊d/2) by θ·pos",
+    "attention softmax(Q·Kᵀ/√d)·V",
+    "SwiGLU    SiLU(x·Wg) ⊙ (x·Wu)",
+    "loss      L = −Σ y·log p   (cross-entropy)",
+];
 
 /// Model to load: an explicit path argument wins; otherwise the first of these
 /// that exists (prefer the smartest available).
@@ -127,6 +168,11 @@ struct OverflowApp {
     backend: String,
     pending_approval: Option<(String, bool)>,
     hw: Arc<Mutex<hw::HwStats>>,
+    tab: Tab,
+    dev: bool,
+    console: Vec<String>,
+    learn: LearnState,
+    trainer: Option<trainer::Trainer>,
 }
 
 impl OverflowApp {
@@ -142,7 +188,84 @@ impl OverflowApp {
             backend: "…".to_string(),
             pending_approval: None,
             hw: hw::spawn(),
+            tab: Tab::Chat,
+            dev: false,
+            console: Vec::new(),
+            learn: LearnState::default(),
+            trainer: None,
         }
+    }
+
+    fn log(&mut self, line: impl Into<String>) {
+        self.console.push(line.into());
+        let n = self.console.len();
+        if n > 800 {
+            self.console.drain(..n - 800);
+        }
+    }
+
+    /// Project root (where the training scripts expect to run).
+    fn cwd() -> std::path::PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| ".".into())
+    }
+
+    fn venv_python() -> std::path::PathBuf {
+        Self::cwd().join("training/venv/bin/python")
+    }
+
+    fn start(&mut self, label: &str, program: &str, args: Vec<String>) {
+        if self.trainer.is_some() {
+            self.log("a task is already running");
+            return;
+        }
+        let envs = vec![(
+            "HF_HOME".to_string(),
+            Self::cwd().join("training/hf-cache").display().to_string(),
+        )];
+        self.log(format!("$ {label}"));
+        self.learn.status = format!("running: {label}");
+        self.learn.loss = None;
+        self.learn.step = None;
+        self.trainer = Some(trainer::run(program, args, envs, Self::cwd()));
+    }
+
+    fn drain_trainer(&mut self) {
+        let mut done: Option<bool> = None;
+        if let Some(t) = &self.trainer {
+            while let Ok(msg) = t.rx.try_recv() {
+                match msg {
+                    trainer::TrainerMsg::Line(l) => {
+                        if let Some(loss) = trainer::parse_loss(&l) {
+                            self.learn.loss = Some(loss);
+                        }
+                        if let Some(p) = trainer::parse_progress(&l) {
+                            self.learn.step = Some(p);
+                        }
+                        self.console.push(l);
+                    }
+                    trainer::TrainerMsg::Done(ok) => done = Some(ok),
+                }
+            }
+        }
+        let n = self.console.len();
+        if n > 800 {
+            self.console.drain(..n - 800);
+        }
+        if let Some(ok) = done {
+            self.learn.status = if ok { "done ✓".into() } else { "failed ✗".into() };
+            self.log(if ok { "task finished" } else { "task failed" });
+            self.trainer = None;
+        }
+    }
+
+    /// Reload the chat model (e.g. after training produced a new GGUF).
+    fn load_model(&mut self, path: std::path::PathBuf) {
+        self.log(format!("loading model {}", path.display()));
+        self.handle = worker::spawn(path);
+        self.status = Status::Loading;
+        self.backend = "…".into();
+        self.transcript.clear();
+        self.tab = Tab::Chat;
     }
 
     fn send_current_input(&mut self) {
@@ -170,7 +293,10 @@ impl OverflowApp {
         while let Ok(ev) = self.handle.rx.try_recv() {
             match ev {
                 FromWorker::Ready => self.status = Status::Ready,
-                FromWorker::Backend(b) => self.backend = b,
+                FromWorker::Backend(b) => {
+                    self.log(format!("[backend] {b}"));
+                    self.backend = b;
+                }
                 FromWorker::Token(s) => {
                     if let Some(last) = self.transcript.last_mut() {
                         if matches!(last.role, Role::Assistant) {
@@ -181,22 +307,26 @@ impl OverflowApp {
                 }
                 FromWorker::Stats { tok_per_s } => self.tok_per_s = tok_per_s,
                 FromWorker::ToolCall(desc) => {
-                    // The current assistant bubble held the streamed call text; make
-                    // it a tool line instead.
+                    self.log(format!("[tool] {desc}"));
                     if let Some(last) = self.transcript.last_mut() {
                         last.role = Role::Tool;
                         last.text = format!("⚙ {desc}");
                     }
                 }
                 FromWorker::ToolResult(r) => {
+                    self.log(format!("[result] {}", r.replace('\n', " ")));
                     self.transcript.push(Msg { role: Role::Tool, text: format!("→ {r}") });
                     self.transcript.push(Msg { role: Role::Assistant, text: String::new() });
                 }
                 FromWorker::Approval { desc, outside } => {
+                    self.log(format!("[approval needed] {desc}{}", if outside { " (outside)" } else { "" }));
                     self.pending_approval = Some((desc, outside));
                 }
                 FromWorker::Done => self.status = Status::Ready,
-                FromWorker::Error(e) => self.status = Status::Error(e),
+                FromWorker::Error(e) => {
+                    self.log(format!("[error] {e}"));
+                    self.status = Status::Error(e);
+                }
             }
         }
     }
@@ -294,82 +424,49 @@ impl OverflowApp {
             });
         self.settings_open = open;
     }
-}
 
-/// A small uppercase section heading with a rule.
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.label(egui::RichText::new(title).color(AMBER).size(11.0).strong());
-    ui.separator();
-}
-
-/// A labeled progress meter: `NAME [=====      ] value`.
-fn meter(ui: &mut egui::Ui, label: &str, frac: f32, text: String, fill: Color32) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(format!("{label:<5}")).color(MUTED).size(12.0));
-        ui.add(
-            egui::ProgressBar::new(frac.clamp(0.0, 1.0))
-                .desired_width(210.0)
-                .fill(fill)
-                .text(egui::RichText::new(text).size(11.0).color(BG)),
-        );
-    });
-}
-
-impl eframe::App for OverflowApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain_events();
-
-        egui::Panel::top("titlebar")
-            .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)))
+    /// Right-hand developer panel: live metrics, the math, and a raw console.
+    fn dev_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::right("dev")
+            .frame(egui::Frame::NONE.fill(SURFACE).inner_margin(egui::Margin::same(12)).stroke(Stroke::new(1.0, LINE)))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    draw_logo(ui, 26.0);
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("OVERFLOW").color(FG).size(20.0).strong());
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("local engine").color(MUTED).size(12.0));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // settings button (top-right)
-                        if ui
-                            .button(egui::RichText::new("[ settings ]").color(FG).size(12.0))
-                            .clicked()
-                        {
-                            self.settings_open = !self.settings_open;
-                        }
-                        ui.add_space(12.0);
-                        // security posture
-                        let (plabel, pcol) = if self.perms.sandbox {
-                            ("sandboxed", GREEN)
-                        } else {
-                            ("tools enabled", RED)
-                        };
-                        ui.label(egui::RichText::new(plabel).color(pcol).size(12.0));
-                        ui.add_space(12.0);
-                        // model status
-                        let (dot, label, col) = match &self.status {
-                            Status::Loading => ("●", "loading model…".to_string(), AMBER),
-                            Status::Ready => ("●", "ready".to_string(), GREEN),
-                            Status::Generating => ("●", "thinking…".to_string(), AMBER),
-                            Status::Error(e) => ("●", format!("error: {e}"), RED),
-                        };
-                        ui.label(egui::RichText::new(label).color(MUTED).size(12.0));
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new(dot).color(col).size(12.0));
-                    });
-                });
-            });
+                ui.set_min_width(340.0);
+                section(ui, "DEV · METRICS");
+                ui.label(egui::RichText::new(format!("backend   {}", self.backend)).color(GREEN).size(12.0));
+                ui.label(egui::RichText::new(format!("speed     {:.1} tok/s", self.tok_per_s)).color(FG).size(12.0));
+                if let Some(l) = self.learn.loss {
+                    ui.label(egui::RichText::new(format!("loss      {l:.4}")).color(AMBER).size(12.0));
+                }
+                if let Some((a, b)) = self.learn.step {
+                    ui.label(egui::RichText::new(format!("step      {a}/{b}")).color(MUTED).size(12.0));
+                }
 
+                ui.add_space(10.0);
+                section(ui, "DEV · MATH");
+                for f in FORMULAS {
+                    ui.label(egui::RichText::new(f).color(CYAN).size(11.5));
+                }
+
+                ui.add_space(10.0);
+                section(ui, "DEV · CONSOLE");
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for line in &self.console {
+                            ui.label(egui::RichText::new(line).color(MUTED).size(10.5));
+                        }
+                    });
+            });
+    }
+
+    /// Chat tab: approval dialog, composer, and the transcript.
+    fn chat_body(&mut self, ui: &mut egui::Ui) {
         let can_send = matches!(self.status, Status::Ready) && self.pending_approval.is_none();
 
-        // Approval dialog (shown above the composer while a tool awaits consent).
         if let Some((desc, outside)) = self.pending_approval.clone() {
             egui::Panel::bottom("approval")
-                .frame(
-                    egui::Frame::NONE
-                        .fill(PANEL)
-                        .inner_margin(egui::Margin::symmetric(16, 12))
-                        .stroke(Stroke::new(1.0, RED)),
-                )
+                .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, RED)))
                 .show(ui, |ui| {
                     let head = if outside {
                         format!("⚠ allow tool (OUTSIDE workspace): {desc}")
@@ -415,17 +512,8 @@ impl eframe::App for OverflowApp {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
                         ui.label(egui::RichText::new("OVERFLOW").color(AMBER).size(28.0).strong());
-                        ui.label(
-                            egui::RichText::new("S1BERIA'S CYBERSECURITY AI")
-                                .color(FG)
-                                .size(14.0)
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new("runs entirely on this machine")
-                                .color(MUTED)
-                                .size(12.0),
-                        );
+                        ui.label(egui::RichText::new("S1BERIA'S CYBERSECURITY AI").color(FG).size(14.0).strong());
+                        ui.label(egui::RichText::new("runs entirely on this machine").color(MUTED).size(12.0));
                     });
                 }
                 egui::ScrollArea::vertical()
@@ -437,14 +525,12 @@ impl eframe::App for OverflowApp {
                         for (i, msg) in self.transcript.iter().enumerate() {
                             let active = generating && i == last;
                             if msg.text.is_empty() && !active {
-                                continue; // hide not-yet-filled bubbles
+                                continue;
                             }
                             match msg.role {
                                 Role::Tool => {
                                     ui.add_space(6.0);
-                                    ui.label(
-                                        egui::RichText::new(&msg.text).color(AMBER).size(12.5),
-                                    );
+                                    ui.label(egui::RichText::new(&msg.text).color(AMBER).size(12.5));
                                 }
                                 _ => {
                                     let (who, col) = match msg.role {
@@ -452,9 +538,7 @@ impl eframe::App for OverflowApp {
                                         _ => ("overflow", GREEN),
                                     };
                                     ui.add_space(10.0);
-                                    ui.label(
-                                        egui::RichText::new(format!("{who} ▸")).color(col).size(12.0).strong(),
-                                    );
+                                    ui.label(egui::RichText::new(format!("{who} ▸")).color(col).size(12.0).strong());
                                     let mut body = msg.text.clone();
                                     if active && matches!(msg.role, Role::Assistant) {
                                         body.push('▌');
@@ -466,13 +550,167 @@ impl eframe::App for OverflowApp {
                         ui.add_space(8.0);
                     });
             });
+    }
+
+    /// Learning tab: drive the QLoRA pipeline (Python) from the GUI.
+    fn learning_body(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(16, 12)))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("LEARNING").color(AMBER).size(20.0).strong());
+                ui.label(
+                    egui::RichText::new("Fine-tune a model on your own data (QLoRA on the GPU), then load it here.")
+                        .color(MUTED)
+                        .size(12.0),
+                );
+                ui.add_space(4.0);
+                let have_venv = Self::venv_python().exists();
+                if !have_venv {
+                    ui.label(egui::RichText::new("Python env not set up yet — click 'Set up env' (large download).").color(RED).size(12.0));
+                }
+
+                ui.add_space(10.0);
+                section(ui, "CONFIG");
+                egui::Grid::new("learncfg").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label(egui::RichText::new("base model").color(MUTED).size(12.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.learn.base).desired_width(380.0));
+                    ui.end_row();
+                    ui.label(egui::RichText::new("dataset").color(MUTED).size(12.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.learn.data).desired_width(380.0));
+                    ui.end_row();
+                    ui.label(egui::RichText::new("epochs").color(MUTED).size(12.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.learn.epochs).desired_width(80.0));
+                    ui.end_row();
+                });
+
+                ui.add_space(10.0);
+                section(ui, "PIPELINE");
+                let busy = self.trainer.is_some();
+                let py = Self::venv_python().display().to_string();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("1 · Generate dataset")).clicked() {
+                        self.start("generate dataset", &py, vec!["training/data_gen.py".into()]);
+                    }
+                    if ui.add_enabled(!busy && have_venv, egui::Button::new("2 · Train (QLoRA)")).clicked() {
+                        let (b, d, e) = (self.learn.base.clone(), self.learn.data.clone(), self.learn.epochs.clone());
+                        self.start("train", &py, vec![
+                            "training/train_qlora.py".into(), "--base".into(), b,
+                            "--data".into(), d, "--epochs".into(), e,
+                        ]);
+                    }
+                    if ui.add_enabled(!busy && have_venv, egui::Button::new("3 · Merge + export GGUF")).clicked() {
+                        let b = self.learn.base.clone();
+                        let cmd = format!("{py} training/merge.py --base {b} && training/export_gguf.sh");
+                        self.start("merge + export", "sh", vec!["-c".into(), cmd]);
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("4 · Load trained model")).clicked() {
+                        self.load_model("models/overflow-1.5b-q8_0.gguf".into());
+                    }
+                });
+                ui.add_space(4.0);
+                if ui.add_enabled(!busy, egui::Button::new("Set up env (venv + deps)")).clicked() {
+                    let cmd = "python3 -m venv training/venv && training/venv/bin/pip install -r training/requirements.txt sentencepiece protobuf".to_string();
+                    self.start("setup env", "sh", vec!["-c".into(), cmd]);
+                }
+
+                ui.add_space(12.0);
+                section(ui, "PROGRESS");
+                ui.label(egui::RichText::new(format!("status: {}", self.learn.status)).color(if busy { AMBER } else { GREEN }).size(13.0));
+                if let Some(l) = self.learn.loss {
+                    ui.label(egui::RichText::new(format!("loss: {l:.4}")).color(AMBER).size(13.0));
+                }
+                if let Some((a, b)) = self.learn.step {
+                    ui.add(egui::ProgressBar::new(a as f32 / b as f32).desired_width(400.0).fill(AMBER).text(format!("{a}/{b}")));
+                }
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("(toggle 'dev' for the full console)").color(MUTED).size(11.0));
+                egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                    for line in self.console.iter().rev().take(14).collect::<Vec<_>>().into_iter().rev() {
+                        ui.label(egui::RichText::new(line).color(MUTED).size(10.5));
+                    }
+                });
+            });
+    }
+}
+
+/// A small uppercase section heading with a rule.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.label(egui::RichText::new(title).color(AMBER).size(11.0).strong());
+    ui.separator();
+}
+
+/// A labeled progress meter: `NAME [=====      ] value`.
+fn meter(ui: &mut egui::Ui, label: &str, frac: f32, text: String, fill: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{label:<5}")).color(MUTED).size(12.0));
+        ui.add(
+            egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                .desired_width(210.0)
+                .fill(fill)
+                .text(egui::RichText::new(text).size(11.0).color(BG)),
+        );
+    });
+}
+
+impl eframe::App for OverflowApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.drain_events();
+        self.drain_trainer();
+
+        egui::Panel::top("titlebar")
+            .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    draw_logo(ui, 26.0);
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("OVERFLOW").color(FG).size(20.0).strong());
+                    ui.add_space(14.0);
+                    if ui.selectable_label(self.tab == Tab::Chat, egui::RichText::new("Chat").size(13.0)).clicked() {
+                        self.tab = Tab::Chat;
+                    }
+                    if ui.selectable_label(self.tab == Tab::Learning, egui::RichText::new("Learning").size(13.0)).clicked() {
+                        self.tab = Tab::Learning;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(egui::RichText::new("[ settings ]").color(FG).size(12.0)).clicked() {
+                            self.settings_open = !self.settings_open;
+                        }
+                        ui.add_space(10.0);
+                        if ui
+                            .selectable_label(self.dev, egui::RichText::new("dev").color(if self.dev { CYAN } else { MUTED }).size(12.0))
+                            .clicked()
+                        {
+                            self.dev = !self.dev;
+                        }
+                        ui.add_space(12.0);
+                        let (plabel, pcol) = if self.perms.sandbox { ("sandboxed", GREEN) } else { ("tools enabled", RED) };
+                        ui.label(egui::RichText::new(plabel).color(pcol).size(12.0));
+                        ui.add_space(12.0);
+                        let (dot, label, col) = match &self.status {
+                            Status::Loading => ("\u{25cf}", "loading\u{2026}".to_string(), AMBER),
+                            Status::Ready => ("\u{25cf}", "ready".to_string(), GREEN),
+                            Status::Generating => ("\u{25cf}", "thinking\u{2026}".to_string(), AMBER),
+                            Status::Error(e) => ("\u{25cf}", format!("error: {e}"), RED),
+                        };
+                        ui.label(egui::RichText::new(label).color(MUTED).size(12.0));
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(dot).color(col).size(12.0));
+                    });
+                });
+            });
+
+        if self.dev {
+            self.dev_panel(ui);
+        }
+        match self.tab {
+            Tab::Chat => self.chat_body(ui),
+            Tab::Learning => self.learning_body(ui),
+        }
 
         let ctx = ui.ctx().clone();
         self.show_settings(&ctx);
-
-        // Keep hardware stats ticking even while idle.
         ctx.request_repaint_after(Duration::from_millis(1000));
-        if matches!(self.status, Status::Generating | Status::Loading) {
+        if matches!(self.status, Status::Generating | Status::Loading) || self.trainer.is_some() {
             ctx.request_repaint();
         }
     }
@@ -510,18 +748,10 @@ fn draw_logo(ui: &mut egui::Ui, size: f32) {
     let s = size / 64.0;
     let p = |x: f32, y: f32| Pos2::new(o.x + x * s, o.y + y * s);
 
-    // hex frame
     let hex = vec![
-        p(32.0, 6.0),
-        p(54.0, 19.0),
-        p(54.0, 45.0),
-        p(32.0, 58.0),
-        p(10.0, 45.0),
-        p(10.0, 19.0),
+        p(32.0, 6.0), p(54.0, 19.0), p(54.0, 45.0), p(32.0, 58.0), p(10.0, 45.0), p(10.0, 19.0),
     ];
     painter.add(egui::Shape::closed_line(hex, Stroke::new(2.4 * s, AMBER)));
-
-    // vertical slit pupil (a vesica, as a filled polygon)
     let pupil = vec![p(32.0, 20.0), p(36.0, 32.0), p(32.0, 44.0), p(28.0, 32.0)];
     painter.add(egui::Shape::convex_polygon(pupil, AMBER, Stroke::NONE));
 }
