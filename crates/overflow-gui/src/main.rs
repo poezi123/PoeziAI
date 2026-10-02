@@ -10,11 +10,13 @@ mod hw;
 mod trainer;
 mod worker;
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use eframe::egui;
 use egui::{Color32, FontFamily, Pos2, Sense, Stroke, Vec2};
+use poezi_model::agent::GenCfg;
 
 use worker::{FromWorker, Handle, ToWorker};
 
@@ -63,6 +65,18 @@ const CYAN: Color32 = Color32::from_rgb(0x49, 0xd6, 0xe6);
 // Qwen2.5-Coder GGUF downloads (our engine is Qwen2-architecture).
 const QWEN_1_5B_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
 const QWEN_7B_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf";
+
+/// Split assistant text into (thinking, answer) around a `<think>…</think>` block.
+fn split_think(s: &str) -> (Option<&str>, &str) {
+    if let Some(start) = s.find("<think>") {
+        let after = &s[start + 7..];
+        if let Some(end) = after.find("</think>") {
+            return (Some(&after[..end]), &after[end + 8..]);
+        }
+        return (Some(after), ""); // still thinking (no closing tag yet)
+    }
+    (None, s)
+}
 
 /// Last path segment of a URL (before any query), for a download filename.
 fn filename_from_url(url: &str) -> String {
@@ -231,6 +245,8 @@ struct OverflowApp {
     learn: LearnState,
     trainer: Option<trainer::Trainer>,
     dl_url: String,
+    gen: GenCfg,
+    show_thinking: bool,
 }
 
 impl OverflowApp {
@@ -257,6 +273,8 @@ impl OverflowApp {
             learn: LearnState::default(),
             trainer: None,
             dl_url: String::new(),
+            gen: GenCfg::default(),
+            show_thinking: true,
         }
     }
 
@@ -378,7 +396,8 @@ impl OverflowApp {
             &self.perms.workspace,
             self.perms.confirm_outside,
         );
-        let _ = handle.tx.send(ToWorker::User { text: text.clone(), perms });
+        handle.cancel.store(false, Ordering::Relaxed);
+        let _ = handle.tx.send(ToWorker::User { text: text.clone(), perms, gen: self.gen.clone() });
         self.transcript.push(Msg { role: Role::User, text });
         self.transcript.push(Msg { role: Role::Assistant, text: String::new() });
         self.status = Status::Generating;
@@ -595,6 +614,27 @@ impl OverflowApp {
                         .color(MUTED)
                         .size(10.5),
                 );
+
+                // ---- advanced settings (collapsed by default, at the bottom) ----
+                ui.add_space(14.0);
+                egui::CollapsingHeader::new(egui::RichText::new("ADVANCED").color(AMBER).size(12.0).strong())
+                    .id_salt("advanced")
+                    .show(ui, |ui| {
+                        ui.checkbox(&mut self.gen.thinking, "Thinking mode (reason before answering)");
+                        ui.checkbox(&mut self.show_thinking, "Show thinking in chat");
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("effort").color(MUTED).size(12.0));
+                            ui.selectable_value(&mut self.gen.effort, 0, "low");
+                            ui.selectable_value(&mut self.gen.effort, 1, "med");
+                            ui.selectable_value(&mut self.gen.effort, 2, "high");
+                        });
+                        ui.add_space(4.0);
+                        ui.add(egui::Slider::new(&mut self.gen.temp, 0.0..=1.5).text("temperature"));
+                        ui.add(egui::Slider::new(&mut self.gen.top_p, 0.1..=1.0).text("top-p"));
+                        ui.add(egui::Slider::new(&mut self.gen.top_k, 1..=200).text("top-k"));
+                        ui.add(egui::Slider::new(&mut self.gen.max_tokens, 32..=4096).text("max tokens"));
+                        ui.label(egui::RichText::new("temp 0 = deterministic. higher = more creative/varied.").color(MUTED).size(10.5));
+                    });
             });
         self.settings_open = open;
     }
@@ -665,8 +705,17 @@ impl OverflowApp {
         egui::Panel::bottom("composer")
             .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(16, 12)))
             .show(ui, |ui| {
+                let generating = matches!(self.status, Status::Generating);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(">").color(AMBER).strong());
+                    if generating {
+                        if ui.button(egui::RichText::new("■ Stop").color(RED)).clicked() {
+                            if let Some(h) = &self.handle {
+                                h.cancel.store(true, Ordering::Relaxed);
+                            }
+                            self.log("stop requested");
+                        }
+                    }
                     let edit = egui::TextEdit::singleline(&mut self.input)
                         .hint_text("type a message, Enter to send")
                         .desired_width(f32::INFINITY);
@@ -724,18 +773,34 @@ impl OverflowApp {
                                     ui.add_space(6.0);
                                     ui.label(egui::RichText::new(&msg.text).color(AMBER).size(12.5));
                                 }
-                                _ => {
-                                    let (who, col) = match msg.role {
-                                        Role::User => ("you", AMBER),
-                                        _ => ("overflow", GREEN),
-                                    };
+                                Role::User => {
                                     ui.add_space(10.0);
-                                    ui.label(egui::RichText::new(format!("{who} ▸")).color(col).size(12.0).strong());
-                                    let mut body = msg.text.clone();
-                                    if active && matches!(msg.role, Role::Assistant) {
+                                    ui.label(egui::RichText::new("you ▸").color(AMBER).size(12.0).strong());
+                                    ui.label(egui::RichText::new(&msg.text).color(FG));
+                                }
+                                Role::Assistant => {
+                                    ui.add_space(10.0);
+                                    ui.label(egui::RichText::new("overflow ▸").color(GREEN).size(12.0).strong());
+                                    let (think, answer) = split_think(&msg.text);
+                                    if self.show_thinking {
+                                        if let Some(t) = think {
+                                            egui::CollapsingHeader::new(
+                                                egui::RichText::new("💭 thinking").color(CYAN).size(11.5),
+                                            )
+                                            .id_salt(i)
+                                            .default_open(active && answer.trim().is_empty())
+                                            .show(ui, |ui| {
+                                                ui.label(egui::RichText::new(t.trim()).color(MUTED).size(11.5));
+                                            });
+                                        }
+                                    }
+                                    let mut body = answer.to_string();
+                                    if active {
                                         body.push('▌');
                                     }
-                                    ui.label(egui::RichText::new(body).color(FG));
+                                    if !body.trim().is_empty() || !active {
+                                        ui.label(egui::RichText::new(body).color(FG));
+                                    }
                                 }
                             }
                         }

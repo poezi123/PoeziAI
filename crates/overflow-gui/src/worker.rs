@@ -5,17 +5,19 @@
 //! tool needs manual approval the worker asks the UI and blocks until it answers.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use poezi_gguf::GgufFile;
-use poezi_model::agent::{self, Event, Host, Perms, ToolCall};
+use poezi_model::agent::{self, Event, GenCfg, Host, Perms, ToolCall};
 use poezi_model::{Model, Tokenizer};
 
 /// UI -> worker.
 pub enum ToWorker {
-    User { text: String, perms: Perms },
+    User { text: String, perms: Perms, gen: GenCfg },
     Approve(bool),
 }
 
@@ -35,20 +37,28 @@ pub enum FromWorker {
 pub struct Handle {
     pub tx: Sender<ToWorker>,
     pub rx: Receiver<FromWorker>,
+    pub cancel: Arc<AtomicBool>,
 }
 
 pub fn spawn(model_path: PathBuf) -> Handle {
     let (tx_in, rx_in) = std::sync::mpsc::channel();
     let (tx_out, rx_out) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_worker = Arc::clone(&cancel);
     thread::spawn(move || {
-        if let Err(e) = run(model_path, &rx_in, &tx_out) {
+        if let Err(e) = run(model_path, &rx_in, &tx_out, &cancel_worker) {
             let _ = tx_out.send(FromWorker::Error(e));
         }
     });
-    Handle { tx: tx_in, rx: rx_out }
+    Handle { tx: tx_in, rx: rx_out, cancel }
 }
 
-fn run(path: PathBuf, rx_in: &Receiver<ToWorker>, tx_out: &Sender<FromWorker>) -> Result<(), String> {
+fn run(
+    path: PathBuf,
+    rx_in: &Receiver<ToWorker>,
+    tx_out: &Sender<FromWorker>,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
     let gguf = GgufFile::open(&path).map_err(|e| format!("open model: {e}"))?;
     let tok = Tokenizer::from_gguf(&gguf).map_err(|e| format!("tokenizer: {e}"))?;
     let model = Model::load(&gguf).map_err(|e| format!("load model: {e}"))?;
@@ -59,9 +69,10 @@ fn run(path: PathBuf, rx_in: &Receiver<ToWorker>, tx_out: &Sender<FromWorker>) -
     let _ = tx_out.send(FromWorker::Ready);
 
     while let Ok(msg) = rx_in.recv() {
-        if let ToWorker::User { text, perms } = msg {
+        if let ToWorker::User { text, perms, gen } = msg {
+            cancel.store(false, Ordering::Relaxed); // clear any prior stop
             let mut host = GuiHost { tx: tx_out, rx: rx_in, start: None, n: 0 };
-            agent::run(&model, &tok, &mut cache, first_turn, &text, &perms, &mut host, 8);
+            agent::run(&model, &tok, &mut cache, first_turn, &text, &perms, &gen, cancel, &mut host, 8);
             first_turn = false;
             let _ = tx_out.send(FromWorker::Done);
         }

@@ -80,7 +80,9 @@ pub fn run(path: &str, query: &str, opts: AgentOpts) -> ExitCode {
     };
     let mut host = CliHost { auto: opts.auto_approve, buf: String::new() };
     let mut cache = model.new_cache();
-    agent::run(&model, &tok, &mut cache, true, query, &perms, &mut host, opts.max_rounds);
+    let gen = poezi_model::agent::GenCfg::default();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    agent::run(&model, &tok, &mut cache, true, query, &perms, &gen, &cancel, &mut host, opts.max_rounds);
 
     println!("{}", host.buf.trim());
     ExitCode::SUCCESS
