@@ -541,6 +541,24 @@ impl OverflowApp {
                     .color(MUTED)
                     .size(11.0),
                 );
+
+                // ---- where the model files live ----
+                ui.add_space(12.0);
+                section(ui, "MODEL FILES");
+                ui.label(egui::RichText::new("Put or drop .gguf models in these folders:").color(MUTED).size(11.0));
+                for d in [PathBuf::from("models"), data_models_dir()] {
+                    let exists = d.is_dir();
+                    ui.label(
+                        egui::RichText::new(format!("{} {}", if exists { "•" } else { "◦" }, d.display()))
+                            .color(if exists { FG } else { MUTED })
+                            .size(11.0),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new("qwen2.5-coder-* = base models · overflow-* = your fine-tunes")
+                        .color(MUTED)
+                        .size(10.5),
+                );
             });
         self.settings_open = open;
     }
