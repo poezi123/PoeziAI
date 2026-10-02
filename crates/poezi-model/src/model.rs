@@ -23,16 +23,14 @@
 
 use std::sync::Arc;
 
-use poezi_cuda::{GpuBackend, GpuWeight};
+use poezi_cuda::{GpuBackend, GpuConfig, GpuSession, GpuWeights};
 use poezi_gguf::{GgmlType, GgufFile, MetaValue};
 use poezi_tensor::{dequant_row, matmul, row_bytes};
 
-/// A quantized weight: borrowed mmap bytes + its ggml type, and optionally a
-/// resident VRAM copy used when a GPU backend is active.
+/// A quantized weight: borrowed mmap bytes + its ggml type (CPU path).
 struct QTensor<'a> {
     data: &'a [u8],
     ty: GgmlType,
-    gpu: Option<GpuWeight>,
 }
 
 #[derive(Debug)]
@@ -93,7 +91,7 @@ pub struct Model<'a> {
     out_norm: Vec<f32>,
     output: QTensor<'a>, // [n_embd, vocab]
     layers: Vec<Layer<'a>>,
-    gpu: Option<Arc<GpuBackend>>,
+    gpu: Option<Arc<GpuWeights>>,
 }
 
 /// Key/value cache. On CPU it grows per layer (kv_dim floats/position); on GPU
@@ -102,7 +100,7 @@ pub struct KvCache {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     pub len: usize,
-    gpu: Option<poezi_cuda::GpuAttn>,
+    gpu: Option<GpuSession>,
 }
 
 impl KvCache {
@@ -156,7 +154,7 @@ impl<'a> Model<'a> {
         let kv_dim = n_head_kv * head_dim;
 
         // Small tensor (norm/bias) -> Vec<f32>, handling F32 or F16 storage.
-        let f32_vec = |name: &str| -> Result<Vec<f32>> {
+        let f32_vec = move |name: &str| -> Result<Vec<f32>> {
             let info = g
                 .tensor(name)
                 .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
@@ -166,23 +164,12 @@ impl<'a> Model<'a> {
             dequant_row(info.ggml_type, bytes, &mut v);
             Ok(v)
         };
-        // Try to bring up a GPU backend; falls back to CPU if unavailable.
-        let gpu: Option<Arc<GpuBackend>> = GpuBackend::new().ok().map(Arc::new);
-
-        // Quantized weight tensor -> borrowed mmap bytes + type, uploaded to VRAM
-        // when a GPU backend is present (so it stays resident across tokens).
-        let gpu_up = gpu.clone();
+        // Quantized weight tensor -> borrowed mmap bytes + type.
         let qtensor = move |name: &str| -> Result<QTensor<'a>> {
             let info = g
                 .tensor(name)
                 .ok_or_else(|| ModelError::MissingTensor(name.into()))?;
-            let data = g.tensor_data(info);
-            let gpu_w = gpu_up.as_ref().and_then(|b| b.upload(data).ok());
-            Ok(QTensor {
-                data,
-                ty: info.ggml_type,
-                gpu: gpu_w,
-            })
+            Ok(QTensor { data: g.tensor_data(info), ty: info.ggml_type })
         };
 
         let tok_embd = qtensor("token_embd.weight")?;
@@ -212,19 +199,28 @@ impl<'a> Model<'a> {
             });
         }
 
+        let cfg = Config {
+            n_layer,
+            n_embd,
+            n_head,
+            n_head_kv,
+            head_dim,
+            kv_dim,
+            n_ff,
+            vocab,
+            rope_theta,
+            rms_eps,
+        };
+
+        // Build the resident GPU model (uploads all weights to VRAM). Falls back
+        // to the CPU path if the GPU or libs are unavailable.
+        let gpu = GpuBackend::new()
+            .ok()
+            .map(Arc::new)
+            .and_then(|be| build_gpu(&be, &cfg, &out_norm, &output, &layers).ok().map(Arc::new));
+
         Ok(Model {
-            cfg: Config {
-                n_layer,
-                n_embd,
-                n_head,
-                n_head_kv,
-                head_dim,
-                kv_dim,
-                n_ff,
-                vocab,
-                rope_theta,
-                rms_eps,
-            },
+            cfg,
             tok_embd,
             out_norm,
             output,
@@ -242,36 +238,19 @@ impl<'a> Model<'a> {
         }
     }
 
-    /// Create a KV cache matching the active backend (GPU-resident if available,
-    /// else CPU). Falls back to CPU if the GPU cache can't be allocated.
+    /// Create a KV cache matching the active backend (GPU session if available,
+    /// else CPU). Falls back to CPU if the GPU session can't be allocated.
     pub fn new_cache(&self) -> KvCache {
-        if let Some(be) = &self.gpu {
-            if let Ok(gpu) = be.new_kv_cache(
-                self.cfg.n_layer,
-                GPU_KV_CAP,
-                self.cfg.n_head,
-                self.cfg.n_head_kv,
-                self.cfg.head_dim,
-            ) {
-                return KvCache {
-                    k: Vec::new(),
-                    v: Vec::new(),
-                    len: 0,
-                    gpu: Some(gpu),
-                };
+        if let Some(w) = &self.gpu {
+            if let Ok(sess) = w.new_session() {
+                return KvCache { k: Vec::new(), v: Vec::new(), len: 0, gpu: Some(sess) };
             }
         }
         KvCache::new(self.cfg.n_layer)
     }
 
-    /// y = W·x, on the GPU when both a backend and a resident copy exist,
-    /// otherwise on the CPU.
+    /// CPU matrix-vector product (the GPU path runs the whole forward on-device).
     fn matvec(&self, t: &QTensor, in_dim: usize, out_dim: usize, x: &[f32], y: &mut [f32]) {
-        if let (Some(be), Some(gw)) = (&self.gpu, &t.gpu) {
-            if be.matmul(t.ty, gw, in_dim, out_dim, x, y).is_ok() {
-                return;
-            }
-        }
         matmul(t.ty, t.data, in_dim, out_dim, x, y);
     }
 
@@ -286,6 +265,19 @@ impl<'a> Model<'a> {
         let row = &self.tok_embd.data[token as usize * rb..(token as usize + 1) * rb];
         dequant_row(self.tok_embd.ty, row, &mut x);
 
+        let logits = if let (Some(w), Some(s)) = (&self.gpu, cache.gpu.as_mut()) {
+            // Fully GPU-resident forward; only the logits come back to the host.
+            w.forward(s, &x, pos).expect("gpu forward")
+        } else {
+            self.forward_cpu(x, pos, cache)
+        };
+        cache.len += 1;
+        logits
+    }
+
+    /// CPU forward pass (fallback when no GPU is available).
+    fn forward_cpu(&self, mut x: Vec<f32>, pos: usize, cache: &mut KvCache) -> Vec<f32> {
+        let cfg = &self.cfg;
         for (li, layer) in self.layers.iter().enumerate() {
             // ---- attention ----
             let a = rmsnorm(&x, &layer.attn_norm, cfg.rms_eps);
@@ -300,7 +292,6 @@ impl<'a> Model<'a> {
             add_bias(&mut k, &layer.bk);
             add_bias(&mut v, &layer.bv);
 
-            // RoPE (NEOX) on each head of q and k.
             for h in 0..cfg.n_head {
                 rope_neox(&mut q[h * cfg.head_dim..(h + 1) * cfg.head_dim], pos, cfg.rope_theta);
             }
@@ -308,43 +299,35 @@ impl<'a> Model<'a> {
                 rope_neox(&mut k[h * cfg.head_dim..(h + 1) * cfg.head_dim], pos, cfg.rope_theta);
             }
 
-            // Attention: GPU-resident KV cache + kernel when available, else CPU.
-            let attn_out = if let Some(ga) = cache.gpu.as_mut() {
-                ga.step(li, pos, &q, &k, &v).expect("gpu attention")
-            } else {
-                cache.k[li].extend_from_slice(&k);
-                cache.v[li].extend_from_slice(&v);
+            cache.k[li].extend_from_slice(&k);
+            cache.v[li].extend_from_slice(&v);
 
-                let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-                let group = cfg.n_head / cfg.n_head_kv;
-                let mut attn_out = vec![0f32; cfg.n_embd];
-                for h in 0..cfg.n_head {
-                    let kvh = h / group;
-                    let qh = &q[h * cfg.head_dim..(h + 1) * cfg.head_dim];
-
-                    let mut scores = vec![0f32; pos + 1];
-                    for (t, score) in scores.iter_mut().enumerate() {
-                        let koff = t * cfg.kv_dim + kvh * cfg.head_dim;
-                        let kt = &cache.k[li][koff..koff + cfg.head_dim];
-                        let mut dp = 0f32;
-                        for i in 0..cfg.head_dim {
-                            dp += qh[i] * kt[i];
-                        }
-                        *score = dp * scale;
+            let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+            let group = cfg.n_head / cfg.n_head_kv;
+            let mut attn_out = vec![0f32; cfg.n_embd];
+            for h in 0..cfg.n_head {
+                let kvh = h / group;
+                let qh = &q[h * cfg.head_dim..(h + 1) * cfg.head_dim];
+                let mut scores = vec![0f32; pos + 1];
+                for (t, score) in scores.iter_mut().enumerate() {
+                    let koff = t * cfg.kv_dim + kvh * cfg.head_dim;
+                    let kt = &cache.k[li][koff..koff + cfg.head_dim];
+                    let mut dp = 0f32;
+                    for i in 0..cfg.head_dim {
+                        dp += qh[i] * kt[i];
                     }
-                    softmax(&mut scores);
-
-                    let outh = &mut attn_out[h * cfg.head_dim..(h + 1) * cfg.head_dim];
-                    for (t, &w) in scores.iter().enumerate() {
-                        let voff = t * cfg.kv_dim + kvh * cfg.head_dim;
-                        let vt = &cache.v[li][voff..voff + cfg.head_dim];
-                        for i in 0..cfg.head_dim {
-                            outh[i] += w * vt[i];
-                        }
+                    *score = dp * scale;
+                }
+                softmax(&mut scores);
+                let outh = &mut attn_out[h * cfg.head_dim..(h + 1) * cfg.head_dim];
+                for (t, &w) in scores.iter().enumerate() {
+                    let voff = t * cfg.kv_dim + kvh * cfg.head_dim;
+                    let vt = &cache.v[li][voff..voff + cfg.head_dim];
+                    for i in 0..cfg.head_dim {
+                        outh[i] += w * vt[i];
                     }
                 }
-                attn_out
-            };
+            }
 
             let mut o = vec![0f32; cfg.n_embd];
             self.matvec(&layer.wo, cfg.n_embd, cfg.n_embd, &attn_out, &mut o);
@@ -368,14 +351,51 @@ impl<'a> Model<'a> {
             }
         }
 
-        cache.len += 1;
-
-        // ---- final norm + LM head ----
         let x = rmsnorm(&x, &self.out_norm, cfg.rms_eps);
         let mut logits = vec![0f32; cfg.vocab];
         self.matvec(&self.output, cfg.n_embd, cfg.vocab, &x, &mut logits);
         logits
     }
+}
+
+/// Build the resident GPU model by uploading all weights to VRAM.
+fn build_gpu(
+    be: &Arc<GpuBackend>,
+    cfg: &Config,
+    out_norm: &[f32],
+    output: &QTensor,
+    layers: &[Layer],
+) -> std::result::Result<GpuWeights, Box<dyn std::error::Error>> {
+    let gcfg = GpuConfig {
+        n_layer: cfg.n_layer,
+        n_embd: cfg.n_embd,
+        n_head: cfg.n_head,
+        n_head_kv: cfg.n_head_kv,
+        head_dim: cfg.head_dim,
+        kv_dim: cfg.kv_dim,
+        n_ff: cfg.n_ff,
+        vocab: cfg.vocab,
+        rope_theta: cfg.rope_theta,
+        rms_eps: cfg.rms_eps,
+        kv_cap: GPU_KV_CAP,
+    };
+    let mut b = be.weights_builder(gcfg);
+    b.out_norm(out_norm)?;
+    b.output(output.data, output.ty)?;
+    for l in layers {
+        b.layer(
+            &l.attn_norm,
+            (l.wq.data, l.wq.ty), &l.bq,
+            (l.wk.data, l.wk.ty), &l.bk,
+            (l.wv.data, l.wv.ty), &l.bv,
+            (l.wo.data, l.wo.ty),
+            &l.ffn_norm,
+            (l.w_gate.data, l.w_gate.ty),
+            (l.w_up.data, l.w_up.ty),
+            (l.w_down.data, l.w_down.ty),
+        )?;
+    }
+    b.build()
 }
 
 fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {

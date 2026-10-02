@@ -1,250 +1,180 @@
-//! GPU backend (A5): run the model's matmuls on the RTX 3060.
+//! GPU backend (A5): run the whole Qwen2 forward pass on the RTX 3060.
 //!
-//! Uses vendored CUDA (see scripts/fetch-cuda.sh): only libnvrtc is shipped; the
+//! Uses vendored CUDA (scripts/fetch-cuda.sh): only libnvrtc is shipped; the
 //! driver's libcuda is already present. Kernels are compiled at runtime with
-//! NVRTC and run via the driver API (cudarc, dynamic-loading) — no system CUDA
-//! install. fp16 is decoded in-kernel with bit ops so NVRTC needs no CUDA
-//! headers.
+//! NVRTC via cudarc (dynamic-loading) — no system CUDA install. fp16 is decoded
+//! in-kernel with bit ops so NVRTC needs no CUDA headers.
 //!
-//! The expensive part of inference is the matmuls, so `GpuBackend` keeps the
-//! quantized weights resident in VRAM and, per call, uploads only the small
-//! input vector, launches the right dequant+matmul kernel, and reads the result
-//! back. Everything else stays on the CPU. Kernels ported from the CPU paths in
-//! poezi-tensor; validated against them.
+//! A5.6 makes the forward pass *resident*: all activations stay in VRAM and the
+//! per-op CPU<->GPU round-trips are gone. `GpuWeights` holds the immutable model
+//! (weights, norms, biases) and `GpuSession` the per-generation state (scratch
+//! buffers + KV cache). Only the final logits are copied back to the host.
+//! Kernels are ported from the CPU paths in poezi-tensor/poezi-model and
+//! validated against them (and end-to-end against llama.cpp).
 
 use std::error::Error;
+use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::compile_ptx;
 use poezi_gguf::GgmlType;
 
-/// All quantized matmul kernels in one translation unit. Each is `y = W · x`
-/// with one thread per output row; W is the raw ggml byte stream for its type.
+type R<T> = Result<T, Box<dyn Error>>;
+
 const KERNELS: &str = r#"
 __device__ __forceinline__ float h2f(unsigned short h) {
     unsigned int sign = (h >> 15) & 1u;
     unsigned int exp  = (h >> 10) & 0x1fu;
     unsigned int mant = h & 0x3ffu;
     float v;
-    if (exp == 0u)          v = (float)mant * 5.9604645e-8f;      // 2^-24
+    if (exp == 0u)          v = (float)mant * 5.9604645e-8f;
     else if (exp == 0x1fu)  v = mant ? (0.0f/0.0f) : (1.0f/0.0f);
     else                    v = (1.0f + (float)mant / 1024.0f) * exp2f((float)((int)exp - 15));
     return sign ? -v : v;
 }
-
-// Sum a value across a 32-lane warp.
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
     return v;
 }
-
-// ---- Q8_0: 32-value blocks, 2-byte fp16 scale + 32 int8 (34 bytes) ----
-// One warp per output row; lanes split the blocks, then warp-reduce.
-extern "C" __global__ void matmul_q8_0(
-    float* y, const unsigned char* w, const float* x, int in_dim, int out_dim)
-{
-    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = gid >> 5, lane = gid & 31;
-    if (row >= out_dim) return;
-    int nb = in_dim / 32;
-    long rowbase = (long)row * nb * 34;
-    float acc = 0.0f;
-    for (int b = lane; b < nb; b += 32) {
-        long base = rowbase + (long)b * 34;
-        float d = h2f((unsigned short)w[base] | ((unsigned short)w[base + 1] << 8));
-        int xo = b * 32;
-        float blk = 0.0f;
-        for (int i = 0; i < 32; ++i)
-            blk += (float)((signed char)w[base + 2 + i]) * x[xo + i];
-        acc += d * blk;
-    }
-    acc = warp_sum(acc);
-    if (lane == 0) y[row] = acc;
+// ---- Q8_0 matmul: one warp per output row ----
+extern "C" __global__ void matmul_q8_0(float* y, const unsigned char* w, const float* x, int in_dim, int out_dim){
+    unsigned int gid = blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5, lane=gid&31;
+    if (row>=out_dim) return;
+    int nb=in_dim/32; long rowbase=(long)row*nb*34; float acc=0.0f;
+    for (int b=lane;b<nb;b+=32){ long base=rowbase+(long)b*34;
+        float d=h2f((unsigned short)w[base]|((unsigned short)w[base+1]<<8));
+        int xo=b*32; float blk=0.0f;
+        for(int i=0;i<32;i++) blk+=(float)((signed char)w[base+2+i])*x[xo+i];
+        acc+=d*blk; }
+    acc=warp_sum(acc); if(lane==0) y[row]=acc;
 }
-
-// 6-bit scale/min unpack for the K-quants (ggml get_scale_min_k4).
-__device__ __forceinline__ void get_sm(
-    int j, const unsigned char* q, unsigned char* d, unsigned char* m)
-{
-    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
-    else {
-        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
-    }
+__device__ __forceinline__ void get_sm(int j,const unsigned char* q,unsigned char* d,unsigned char* m){
+    if(j<4){*d=q[j]&63;*m=q[j+4]&63;}
+    else{*d=(q[j+4]&0xF)|((q[j-4]>>6)<<4);*m=(q[j+4]>>4)|((q[j-0]>>6)<<4);}
 }
-
-// ---- Q4_K: 256-value super-blocks (d,dmin fp16; 12 packed scales; 128 qs) = 144 bytes ----
-__device__ float dot_q4k(const unsigned char* sb, const float* x) {
-    float d    = h2f((unsigned short)sb[0] | ((unsigned short)sb[1] << 8));
-    float dmin = h2f((unsigned short)sb[2] | ((unsigned short)sb[3] << 8));
-    const unsigned char* scales = sb + 4;
-    const unsigned char* qs = sb + 16;
-    float acc = 0.0f;
-    int y = 0, is = 0, q = 0;
-    for (int grp = 0; grp < 4; ++grp) {
-        unsigned char sc, m;
-        get_sm(is, scales, &sc, &m);     float d1 = d * sc, m1 = dmin * m;
-        get_sm(is + 1, scales, &sc, &m); float d2 = d * sc, m2 = dmin * m;
-        for (int l = 0; l < 32; ++l) { acc += (d1 * (float)(qs[q + l] & 0xF) - m1) * x[y]; ++y; }
-        for (int l = 0; l < 32; ++l) { acc += (d2 * (float)(qs[q + l] >> 4)  - m2) * x[y]; ++y; }
-        q += 32; is += 2;
-    }
+__device__ float dot_q4k(const unsigned char* sb,const float* x){
+    float d=h2f((unsigned short)sb[0]|((unsigned short)sb[1]<<8));
+    float dmin=h2f((unsigned short)sb[2]|((unsigned short)sb[3]<<8));
+    const unsigned char* scales=sb+4; const unsigned char* qs=sb+16;
+    float acc=0.0f; int y=0,is=0,q=0;
+    for(int grp=0;grp<4;grp++){ unsigned char sc,m;
+        get_sm(is,scales,&sc,&m); float d1=d*sc,m1=dmin*m;
+        get_sm(is+1,scales,&sc,&m); float d2=d*sc,m2=dmin*m;
+        for(int l=0;l<32;l++){acc+=(d1*(float)(qs[q+l]&0xF)-m1)*x[y];y++;}
+        for(int l=0;l<32;l++){acc+=(d2*(float)(qs[q+l]>>4)-m2)*x[y];y++;}
+        q+=32; is+=2; }
     return acc;
 }
-extern "C" __global__ void matmul_q4_k(
-    float* y, const unsigned char* w, const float* x, int in_dim, int out_dim)
-{
-    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = gid >> 5, lane = gid & 31;
-    if (row >= out_dim) return;
-    int nb = in_dim / 256;
-    long rowbase = (long)row * nb * 144;
-    float acc = 0.0f;
-    for (int b = lane; b < nb; b += 32) acc += dot_q4k(w + rowbase + (long)b * 144, x + b * 256);
-    acc = warp_sum(acc);
-    if (lane == 0) y[row] = acc;
+extern "C" __global__ void matmul_q4_k(float* y,const unsigned char* w,const float* x,int in_dim,int out_dim){
+    unsigned int gid=blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5,lane=gid&31;
+    if(row>=out_dim) return; int nb=in_dim/256; long rowbase=(long)row*nb*144; float acc=0.0f;
+    for(int b=lane;b<nb;b+=32) acc+=dot_q4k(w+rowbase+(long)b*144, x+b*256);
+    acc=warp_sum(acc); if(lane==0) y[row]=acc;
 }
-
-// ---- Q6_K: 256-value super-blocks (128 ql; 64 qh; 16 int8 scales; fp16 d) = 210 bytes ----
-__device__ float dot_q6k(const unsigned char* sb, const float* x) {
-    const unsigned char* ql = sb;
-    const unsigned char* qh = sb + 128;
-    const signed char*   sc = (const signed char*)(sb + 192);
-    float d = h2f((unsigned short)sb[208] | ((unsigned short)sb[209] << 8));
-    float acc = 0.0f;
-    for (int n = 0; n < 2; ++n) {
-        int qlb = n * 64, qhb = n * 32, scb = n * 8, yb = n * 128;
-        for (int l = 0; l < 32; ++l) {
-            int is = l / 16;
-            int q1 = (int)((ql[qlb + l]      & 0xF) | (((qh[qhb + l] >> 0) & 3) << 4)) - 32;
-            int q2 = (int)((ql[qlb + l + 32] & 0xF) | (((qh[qhb + l] >> 2) & 3) << 4)) - 32;
-            int q3 = (int)((ql[qlb + l]      >> 4)  | (((qh[qhb + l] >> 4) & 3) << 4)) - 32;
-            int q4 = (int)((ql[qlb + l + 32] >> 4)  | (((qh[qhb + l] >> 6) & 3) << 4)) - 32;
-            acc += d * (float)sc[scb + is + 0] * (float)q1 * x[yb + l];
-            acc += d * (float)sc[scb + is + 2] * (float)q2 * x[yb + l + 32];
-            acc += d * (float)sc[scb + is + 4] * (float)q3 * x[yb + l + 64];
-            acc += d * (float)sc[scb + is + 6] * (float)q4 * x[yb + l + 96];
-        }
-    }
+__device__ float dot_q6k(const unsigned char* sb,const float* x){
+    const unsigned char* ql=sb; const unsigned char* qh=sb+128; const signed char* sc=(const signed char*)(sb+192);
+    float d=h2f((unsigned short)sb[208]|((unsigned short)sb[209]<<8)); float acc=0.0f;
+    for(int n=0;n<2;n++){ int qlb=n*64,qhb=n*32,scb=n*8,yb=n*128;
+        for(int l=0;l<32;l++){ int is=l/16;
+            int q1=(int)((ql[qlb+l]&0xF)|(((qh[qhb+l]>>0)&3)<<4))-32;
+            int q2=(int)((ql[qlb+l+32]&0xF)|(((qh[qhb+l]>>2)&3)<<4))-32;
+            int q3=(int)((ql[qlb+l]>>4)|(((qh[qhb+l]>>4)&3)<<4))-32;
+            int q4=(int)((ql[qlb+l+32]>>4)|(((qh[qhb+l]>>6)&3)<<4))-32;
+            acc+=d*(float)sc[scb+is+0]*(float)q1*x[yb+l];
+            acc+=d*(float)sc[scb+is+2]*(float)q2*x[yb+l+32];
+            acc+=d*(float)sc[scb+is+4]*(float)q3*x[yb+l+64];
+            acc+=d*(float)sc[scb+is+6]*(float)q4*x[yb+l+96]; } }
     return acc;
 }
-extern "C" __global__ void matmul_q6_k(
-    float* y, const unsigned char* w, const float* x, int in_dim, int out_dim)
-{
-    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = gid >> 5, lane = gid & 31;
-    if (row >= out_dim) return;
-    int nb = in_dim / 256;
-    long rowbase = (long)row * nb * 210;
-    float acc = 0.0f;
-    for (int b = lane; b < nb; b += 32) acc += dot_q6k(w + rowbase + (long)b * 210, x + b * 256);
-    acc = warp_sum(acc);
-    if (lane == 0) y[row] = acc;
+extern "C" __global__ void matmul_q6_k(float* y,const unsigned char* w,const float* x,int in_dim,int out_dim){
+    unsigned int gid=blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5,lane=gid&31;
+    if(row>=out_dim) return; int nb=in_dim/256; long rowbase=(long)row*nb*210; float acc=0.0f;
+    for(int b=lane;b<nb;b+=32) acc+=dot_q6k(w+rowbase+(long)b*210, x+b*256);
+    acc=warp_sum(acc); if(lane==0) y[row]=acc;
 }
-
-// ---- Attention: one block per query head, softmax over positions in shared mem ----
-// Grouped-query: head h reads kv-head h/(n_head/n_head_kv). blockDim == head_dim.
-extern "C" __global__ void attention(
-    float* out, const float* q, const float* kc, const float* vc,
-    int n_pos, int head_dim, int n_head, int n_head_kv, int kv_dim)
-{
-    int h = blockIdx.x;
-    if (h >= n_head) return;
-    int group = n_head / n_head_kv;
-    int kvh = h / group;
-    int t = threadIdx.x, nt = blockDim.x;
-    extern __shared__ float s[]; // n_pos scores
-    __shared__ float red[128];
-    const float* qh = q + h * head_dim;
-    float scale = rsqrtf((float)head_dim);
-
-    for (int p = t; p < n_pos; p += nt) {
-        const float* kt = kc + (size_t)p * kv_dim + kvh * head_dim;
-        float dp = 0.0f;
-        for (int i = 0; i < head_dim; ++i) dp += qh[i] * kt[i];
-        s[p] = dp * scale;
-    }
+// ---- attention: one block per query head, softmax in shared memory ----
+extern "C" __global__ void attention(float* out,const float* q,const float* kc,const float* vc,
+                                     int n_pos,int head_dim,int n_head,int n_head_kv,int kv_dim){
+    int h=blockIdx.x; if(h>=n_head) return;
+    int group=n_head/n_head_kv; int kvh=h/group; int t=threadIdx.x,nt=blockDim.x;
+    extern __shared__ float s[]; __shared__ float red[128];
+    const float* qh=q+h*head_dim; float scale=rsqrtf((float)head_dim);
+    for(int p=t;p<n_pos;p+=nt){ const float* kt=kc+(size_t)p*kv_dim+kvh*head_dim;
+        float dp=0.0f; for(int i=0;i<head_dim;i++) dp+=qh[i]*kt[i]; s[p]=dp*scale; }
     __syncthreads();
-
-    float m = -3.4e38f;
-    for (int p = t; p < n_pos; p += nt) m = fmaxf(m, s[p]);
-    red[t] = m; __syncthreads();
-    for (int o = nt >> 1; o > 0; o >>= 1) { if (t < o) red[t] = fmaxf(red[t], red[t + o]); __syncthreads(); }
-    float gmax = red[0]; __syncthreads();
-
-    float sm = 0.0f;
-    for (int p = t; p < n_pos; p += nt) { float e = __expf(s[p] - gmax); s[p] = e; sm += e; }
-    red[t] = sm; __syncthreads();
-    for (int o = nt >> 1; o > 0; o >>= 1) { if (t < o) red[t] += red[t + o]; __syncthreads(); }
-    float gsum = red[0]; __syncthreads();
-
-    if (t < head_dim) {
-        float acc = 0.0f;
-        for (int p = 0; p < n_pos; ++p)
-            acc += (s[p] / gsum) * vc[(size_t)p * kv_dim + kvh * head_dim + t];
-        out[h * head_dim + t] = acc;
-    }
+    float m=-3.4e38f; for(int p=t;p<n_pos;p+=nt) m=fmaxf(m,s[p]);
+    red[t]=m; __syncthreads();
+    for(int o=nt>>1;o>0;o>>=1){ if(t<o) red[t]=fmaxf(red[t],red[t+o]); __syncthreads(); }
+    float gmax=red[0]; __syncthreads();
+    float sm=0.0f; for(int p=t;p<n_pos;p+=nt){ float e=__expf(s[p]-gmax); s[p]=e; sm+=e; }
+    red[t]=sm; __syncthreads();
+    for(int o=nt>>1;o>0;o>>=1){ if(t<o) red[t]+=red[t+o]; __syncthreads(); }
+    float gsum=red[0]; __syncthreads();
+    if(t<head_dim){ float acc=0.0f;
+        for(int p=0;p<n_pos;p++) acc+=(s[p]/gsum)*vc[(size_t)p*kv_dim+kvh*head_dim+t];
+        out[h*head_dim+t]=acc; }
+}
+// ---- elementwise / norm helpers (device-resident forward) ----
+extern "C" __global__ void rmsnorm(float* out,const float* x,const float* w,int n,float eps){
+    int t=threadIdx.x,nt=blockDim.x; __shared__ float red[256];
+    float ss=0.0f; for(int i=t;i<n;i+=nt){ float v=x[i]; ss+=v*v; }
+    red[t]=ss; __syncthreads();
+    for(int o=nt>>1;o>0;o>>=1){ if(t<o) red[t]+=red[t+o]; __syncthreads(); }
+    float scale=rsqrtf(red[0]/(float)n+eps);
+    for(int i=t;i<n;i+=nt) out[i]=x[i]*scale*w[i];
+}
+extern "C" __global__ void add_inplace(float* a,const float* b,int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n) a[i]+=b[i];
+}
+extern "C" __global__ void swiglu(float* g,const float* u,int n){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<n){ float x=g[i]; g[i]=(x/(1.0f+__expf(-x)))*u[i]; }
+}
+extern "C" __global__ void rope(float* x,int n_heads,int head_dim,int pos,float theta){
+    int h=blockIdx.x; if(h>=n_heads) return; int half=head_dim/2; float* xh=x+h*head_dim;
+    for(int k=threadIdx.x;k<half;k+=blockDim.x){
+        float inv=1.0f/powf(theta,(2.0f*(float)k)/(float)head_dim);
+        float ang=(float)pos*inv; float c=cosf(ang),s=sinf(ang);
+        float x0=xh[k],x1=xh[k+half]; xh[k]=x0*c-x1*s; xh[k+half]=x0*s+x1*c; }
 }
 "#;
 
-/// A quantized weight resident in VRAM.
+/// A quantized weight resident in VRAM, with its ggml type.
 pub struct GpuWeight {
     buf: CudaSlice<u8>,
+    ty: GgmlType,
 }
 
-/// GPU context with the compiled matmul kernels; holds the device/stream alive.
+/// Shared compiled kernels + device/stream. One per process.
 pub struct GpuBackend {
-    ctx: std::sync::Arc<CudaContext>,
-    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
     f_q8: CudaFunction,
     f_q4k: CudaFunction,
     f_q6k: CudaFunction,
     f_attn: CudaFunction,
+    f_rmsnorm: CudaFunction,
+    f_add: CudaFunction,
+    f_swiglu: CudaFunction,
+    f_rope: CudaFunction,
 }
 
 impl GpuBackend {
-    /// Open the GPU and compile the kernels. Fails if no device / libs.
-    pub fn new() -> Result<Self, Box<dyn Error>> {
+    pub fn new() -> R<Self> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
-        let module = ctx.load_module(compile_ptx(KERNELS)?)?;
+        let m = ctx.load_module(compile_ptx(KERNELS)?)?;
         Ok(GpuBackend {
-            f_q8: module.load_function("matmul_q8_0")?,
-            f_q4k: module.load_function("matmul_q4_k")?,
-            f_q6k: module.load_function("matmul_q6_k")?,
-            f_attn: module.load_function("attention")?,
+            f_q8: m.load_function("matmul_q8_0")?,
+            f_q4k: m.load_function("matmul_q4_k")?,
+            f_q6k: m.load_function("matmul_q6_k")?,
+            f_attn: m.load_function("attention")?,
+            f_rmsnorm: m.load_function("rmsnorm")?,
+            f_add: m.load_function("add_inplace")?,
+            f_swiglu: m.load_function("swiglu")?,
+            f_rope: m.load_function("rope")?,
             ctx,
             stream,
-        })
-    }
-
-    /// Allocate a GPU-resident KV cache + attention runner for a generation
-    /// session. `cap` is the max sequence length that fits in VRAM.
-    pub fn new_kv_cache(
-        &self,
-        n_layer: usize,
-        cap: usize,
-        n_head: usize,
-        n_head_kv: usize,
-        head_dim: usize,
-    ) -> Result<GpuAttn, Box<dyn Error>> {
-        let kv_dim = n_head_kv * head_dim;
-        let mut k = Vec::with_capacity(n_layer);
-        let mut v = Vec::with_capacity(n_layer);
-        for _ in 0..n_layer {
-            k.push(self.stream.alloc_zeros::<f32>(cap * kv_dim)?);
-            v.push(self.stream.alloc_zeros::<f32>(cap * kv_dim)?);
-        }
-        Ok(GpuAttn {
-            stream: self.stream.clone(),
-            func: self.f_attn.clone(),
-            k,
-            v,
-            cap,
-            kv_dim,
-            head_dim,
-            n_head,
-            n_head_kv,
         })
     }
 
@@ -252,171 +182,362 @@ impl GpuBackend {
         self.ctx.name().unwrap_or_else(|_| "unknown".into())
     }
 
-    /// Upload a quantized weight's bytes to VRAM (kept resident).
-    pub fn upload(&self, bytes: &[u8]) -> Result<GpuWeight, Box<dyn Error>> {
-        Ok(GpuWeight { buf: self.stream.clone_htod(bytes)? })
+    pub fn upload_weight(&self, bytes: &[u8], ty: GgmlType) -> R<GpuWeight> {
+        Ok(GpuWeight { buf: self.stream.clone_htod(bytes)?, ty })
+    }
+    fn upload_f32(&self, data: &[f32]) -> R<CudaSlice<f32>> {
+        Ok(self.stream.clone_htod(data)?)
     }
 
-    /// `y = W · x` using a resident weight. `ty` selects the kernel.
-    pub fn matmul(
-        &self,
-        ty: GgmlType,
-        w: &GpuWeight,
-        in_dim: usize,
-        out_dim: usize,
-        x: &[f32],
-        y: &mut [f32],
-    ) -> Result<(), Box<dyn Error>> {
-        let func = match ty {
+    fn mm_fn(&self, ty: GgmlType) -> R<&CudaFunction> {
+        Ok(match ty {
             GgmlType::Q8_0 => &self.f_q8,
             GgmlType::Q4K => &self.f_q4k,
             GgmlType::Q6K => &self.f_q6k,
-            other => return Err(format!("gpu matmul: unsupported type {other:?}").into()),
-        };
-        let x_dev = self.stream.clone_htod(x)?;
-        let mut y_dev = self.stream.alloc_zeros::<f32>(out_dim)?;
+            o => return Err(format!("gpu matmul: unsupported type {o:?}").into()),
+        })
+    }
+
+    /// Device-to-device matmul: x_dev, y_dev already in VRAM (no host transfer).
+    fn mm(&self, w: &GpuWeight, in_dim: usize, out_dim: usize, x: &CudaSlice<f32>, y: &mut CudaSlice<f32>) -> R<()> {
+        let func = self.mm_fn(w.ty)?.clone();
         let in_i = in_dim as i32;
         let out_i = out_dim as i32;
-        // One warp (32 threads) per output row; 256 threads = 8 warps per block.
-        const THREADS: u32 = 256;
-        let blocks = (out_dim as u32).div_ceil(THREADS / 32);
-        let cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut b = self.stream.launch_builder(func);
-        b.arg(&mut y_dev);
+        const T: u32 = 256;
+        let blocks = (out_dim as u32).div_ceil(T / 32);
+        let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (T, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.stream.launch_builder(&func);
+        b.arg(y);
         b.arg(&w.buf);
-        b.arg(&x_dev);
+        b.arg(x);
         b.arg(&in_i);
         b.arg(&out_i);
         unsafe { b.launch(cfg) }?;
-        let out = self.stream.clone_dtoh(&y_dev)?;
-        y.copy_from_slice(&out);
         Ok(())
     }
 
-    /// Upload `w` and multiply in one shot (for tests / one-offs).
-    pub fn matmul_bytes(
-        &self,
-        ty: GgmlType,
-        w: &[u8],
-        in_dim: usize,
-        out_dim: usize,
-        x: &[f32],
-    ) -> Result<Vec<f32>, Box<dyn Error>> {
-        let gw = self.upload(w)?;
-        let mut y = vec![0f32; out_dim];
-        self.matmul(ty, &gw, in_dim, out_dim, x, &mut y)?;
-        Ok(y)
+    fn rmsnorm(&self, out: &mut CudaSlice<f32>, x: &CudaSlice<f32>, w: &CudaSlice<f32>, n: usize, eps: f32) -> R<()> {
+        let n_i = n as i32;
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let f = self.f_rmsnorm.clone();
+        let mut b = self.stream.launch_builder(&f);
+        b.arg(out);
+        b.arg(x);
+        b.arg(w);
+        b.arg(&n_i);
+        b.arg(&eps);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+    fn add(&self, a: &mut CudaSlice<f32>, bvec: &CudaSlice<f32>, n: usize) -> R<()> {
+        let n_i = n as i32;
+        let f = self.f_add.clone();
+        let mut b = self.stream.launch_builder(&f);
+        b.arg(a);
+        b.arg(bvec);
+        b.arg(&n_i);
+        unsafe { b.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(())
+    }
+    fn swiglu(&self, g: &mut CudaSlice<f32>, u: &CudaSlice<f32>, n: usize) -> R<()> {
+        let n_i = n as i32;
+        let f = self.f_swiglu.clone();
+        let mut b = self.stream.launch_builder(&f);
+        b.arg(g);
+        b.arg(u);
+        b.arg(&n_i);
+        unsafe { b.launch(LaunchConfig::for_num_elems(n as u32)) }?;
+        Ok(())
+    }
+    fn rope(&self, x: &mut CudaSlice<f32>, n_heads: usize, head_dim: usize, pos: usize, theta: f32) -> R<()> {
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let p = pos as i32;
+        let cfg = LaunchConfig { grid_dim: (n_heads as u32, 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };
+        let f = self.f_rope.clone();
+        let mut b = self.stream.launch_builder(&f);
+        b.arg(x);
+        b.arg(&nh);
+        b.arg(&hd);
+        b.arg(&p);
+        b.arg(&theta);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    // --- test helpers (host in/out) ---
+    pub fn matmul_bytes(&self, ty: GgmlType, w: &[u8], in_dim: usize, out_dim: usize, x: &[f32]) -> R<Vec<f32>> {
+        let gw = self.upload_weight(w, ty)?;
+        let x_dev = self.stream.clone_htod(x)?;
+        let mut y_dev = self.stream.alloc_zeros::<f32>(out_dim)?;
+        self.mm(&gw, in_dim, out_dim, &x_dev, &mut y_dev)?;
+        Ok(self.stream.clone_dtoh(&y_dev)?)
     }
 }
 
-/// GPU-resident KV cache + attention for one generation session.
-pub struct GpuAttn {
-    stream: std::sync::Arc<cudarc::driver::CudaStream>,
-    func: CudaFunction,
-    k: Vec<CudaSlice<f32>>,
-    v: Vec<CudaSlice<f32>>,
-    cap: usize,
-    kv_dim: usize,
-    head_dim: usize,
-    n_head: usize,
-    n_head_kv: usize,
+/// Hyperparameters the GPU forward needs.
+#[derive(Clone, Copy)]
+pub struct GpuConfig {
+    pub n_layer: usize,
+    pub n_embd: usize,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub kv_dim: usize,
+    pub n_ff: usize,
+    pub vocab: usize,
+    pub rope_theta: f32,
+    pub rms_eps: f32,
+    pub kv_cap: usize,
 }
 
-impl GpuAttn {
-    /// Append this token's k/v for `layer` at `pos`, then attend: `q` (all heads,
-    /// post-RoPE) against positions 0..=pos. Returns attention output (n_embd).
-    pub fn step(
+struct GpuLayer {
+    attn_norm: CudaSlice<f32>,
+    wq: GpuWeight,
+    bq: CudaSlice<f32>,
+    wk: GpuWeight,
+    bk: CudaSlice<f32>,
+    wv: GpuWeight,
+    bv: CudaSlice<f32>,
+    wo: GpuWeight,
+    ffn_norm: CudaSlice<f32>,
+    w_gate: GpuWeight,
+    w_up: GpuWeight,
+    w_down: GpuWeight,
+}
+
+/// Immutable model resident in VRAM. Build once, share across sessions.
+pub struct GpuWeights {
+    be: Arc<GpuBackend>,
+    cfg: GpuConfig,
+    layers: Vec<GpuLayer>,
+    out_norm: CudaSlice<f32>,
+    output: GpuWeight,
+}
+
+/// Per-generation mutable state: scratch buffers + KV cache in VRAM.
+pub struct GpuSession {
+    x: CudaSlice<f32>,
+    xb: CudaSlice<f32>,
+    q: CudaSlice<f32>,
+    k: CudaSlice<f32>,
+    v: CudaSlice<f32>,
+    att: CudaSlice<f32>,
+    gate: CudaSlice<f32>,
+    up: CudaSlice<f32>,
+    logits: CudaSlice<f32>,
+    kcache: Vec<CudaSlice<f32>>,
+    vcache: Vec<CudaSlice<f32>>,
+}
+
+/// Builder: feed weights in, get a GpuWeights out.
+pub struct GpuWeightsBuilder {
+    be: Arc<GpuBackend>,
+    cfg: GpuConfig,
+    layers: Vec<GpuLayer>,
+    out_norm: Option<CudaSlice<f32>>,
+    output: Option<GpuWeight>,
+}
+
+impl GpuWeightsBuilder {
+    pub fn out_norm(&mut self, w: &[f32]) -> R<()> {
+        self.out_norm = Some(self.be.upload_f32(w)?);
+        Ok(())
+    }
+    pub fn output(&mut self, bytes: &[u8], ty: GgmlType) -> R<()> {
+        self.output = Some(self.be.upload_weight(bytes, ty)?);
+        Ok(())
+    }
+    /// Push one layer. Weight byte slices + their types, norm/bias f32 slices.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layer(
         &mut self,
-        layer: usize,
-        pos: usize,
-        q: &[f32],
-        k_new: &[f32],
-        v_new: &[f32],
-    ) -> Result<Vec<f32>, Box<dyn Error>> {
-        if pos >= self.cap {
-            return Err(format!("kv cache full (cap {})", self.cap).into());
+        attn_norm: &[f32],
+        wq: (&[u8], GgmlType), bq: &[f32],
+        wk: (&[u8], GgmlType), bk: &[f32],
+        wv: (&[u8], GgmlType), bv: &[f32],
+        wo: (&[u8], GgmlType),
+        ffn_norm: &[f32],
+        w_gate: (&[u8], GgmlType),
+        w_up: (&[u8], GgmlType),
+        w_down: (&[u8], GgmlType),
+    ) -> R<()> {
+        let be = &self.be;
+        self.layers.push(GpuLayer {
+            attn_norm: be.upload_f32(attn_norm)?,
+            wq: be.upload_weight(wq.0, wq.1)?, bq: be.upload_f32(bq)?,
+            wk: be.upload_weight(wk.0, wk.1)?, bk: be.upload_f32(bk)?,
+            wv: be.upload_weight(wv.0, wv.1)?, bv: be.upload_f32(bv)?,
+            wo: be.upload_weight(wo.0, wo.1)?,
+            ffn_norm: be.upload_f32(ffn_norm)?,
+            w_gate: be.upload_weight(w_gate.0, w_gate.1)?,
+            w_up: be.upload_weight(w_up.0, w_up.1)?,
+            w_down: be.upload_weight(w_down.0, w_down.1)?,
+        });
+        Ok(())
+    }
+    pub fn build(self) -> R<GpuWeights> {
+        Ok(GpuWeights {
+            be: self.be,
+            cfg: self.cfg,
+            layers: self.layers,
+            out_norm: self.out_norm.ok_or("out_norm not set")?,
+            output: self.output.ok_or("output not set")?,
+        })
+    }
+}
+
+impl GpuBackend {
+    pub fn weights_builder(self: &Arc<Self>, cfg: GpuConfig) -> GpuWeightsBuilder {
+        GpuWeightsBuilder {
+            be: Arc::clone(self),
+            cfg,
+            layers: Vec::with_capacity(cfg.n_layer),
+            out_norm: None,
+            output: None,
         }
-        let off = pos * self.kv_dim;
-        {
-            let mut kv = self.k[layer].slice_mut(off..off + self.kv_dim);
-            self.stream.memcpy_htod(k_new, &mut kv)?;
+    }
+}
+
+impl GpuWeights {
+    pub fn device_name(&self) -> String {
+        self.be.device_name()
+    }
+
+    /// Allocate a fresh generation session (scratch + KV cache).
+    pub fn new_session(&self) -> R<GpuSession> {
+        let c = &self.cfg;
+        let z = |n: usize| self.be.stream.alloc_zeros::<f32>(n);
+        let mut kcache = Vec::with_capacity(c.n_layer);
+        let mut vcache = Vec::with_capacity(c.n_layer);
+        for _ in 0..c.n_layer {
+            kcache.push(z(c.kv_cap * c.kv_dim)?);
+            vcache.push(z(c.kv_cap * c.kv_dim)?);
         }
-        {
-            let mut vv = self.v[layer].slice_mut(off..off + self.kv_dim);
-            self.stream.memcpy_htod(v_new, &mut vv)?;
+        Ok(GpuSession {
+            x: z(c.n_embd)?,
+            xb: z(c.n_embd)?,
+            q: z(c.n_embd)?,
+            k: z(c.kv_dim)?,
+            v: z(c.kv_dim)?,
+            att: z(c.n_embd)?,
+            gate: z(c.n_ff)?,
+            up: z(c.n_ff)?,
+            logits: z(c.vocab)?,
+            kcache,
+            vcache,
+        })
+    }
+
+    /// One token. `x0` is the token embedding (host, n_embd). Returns logits.
+    pub fn forward(&self, s: &mut GpuSession, x0: &[f32], pos: usize) -> R<Vec<f32>> {
+        let c = &self.cfg;
+        let be = &self.be;
+        if pos >= c.kv_cap {
+            return Err(format!("kv cache full (cap {})", c.kv_cap).into());
+        }
+        be.stream.memcpy_htod(x0, &mut s.x)?;
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // attention
+            be.rmsnorm(&mut s.xb, &s.x, &layer.attn_norm, c.n_embd, c.rms_eps)?;
+            be.mm(&layer.wq, c.n_embd, c.n_embd, &s.xb, &mut s.q)?;
+            be.add(&mut s.q, &layer.bq, c.n_embd)?;
+            be.mm(&layer.wk, c.n_embd, c.kv_dim, &s.xb, &mut s.k)?;
+            be.add(&mut s.k, &layer.bk, c.kv_dim)?;
+            be.mm(&layer.wv, c.n_embd, c.kv_dim, &s.xb, &mut s.v)?;
+            be.add(&mut s.v, &layer.bv, c.kv_dim)?;
+            be.rope(&mut s.q, c.n_head, c.head_dim, pos, c.rope_theta)?;
+            be.rope(&mut s.k, c.n_head_kv, c.head_dim, pos, c.rope_theta)?;
+
+            // store k,v into cache at `pos`, then attend
+            let off = pos * c.kv_dim;
+            {
+                let mut kdst = s.kcache[li].slice_mut(off..off + c.kv_dim);
+                be.stream.memcpy_dtod(&s.k, &mut kdst)?;
+            }
+            {
+                let mut vdst = s.vcache[li].slice_mut(off..off + c.kv_dim);
+                be.stream.memcpy_dtod(&s.v, &mut vdst)?;
+            }
+            self.attend(s, li, pos)?;
+
+            be.mm(&layer.wo, c.n_embd, c.n_embd, &s.att, &mut s.xb)?;
+            be.add(&mut s.x, &s.xb, c.n_embd)?;
+
+            // feed-forward
+            be.rmsnorm(&mut s.xb, &s.x, &layer.ffn_norm, c.n_embd, c.rms_eps)?;
+            be.mm(&layer.w_gate, c.n_embd, c.n_ff, &s.xb, &mut s.gate)?;
+            be.mm(&layer.w_up, c.n_embd, c.n_ff, &s.xb, &mut s.up)?;
+            be.swiglu(&mut s.gate, &s.up, c.n_ff)?;
+            be.mm(&layer.w_down, c.n_ff, c.n_embd, &s.gate, &mut s.xb)?;
+            be.add(&mut s.x, &s.xb, c.n_embd)?;
         }
 
-        let q_dev = self.stream.clone_htod(q)?;
-        let out_len = self.n_head * self.head_dim;
-        let mut out_dev = self.stream.alloc_zeros::<f32>(out_len)?;
+        be.rmsnorm(&mut s.xb, &s.x, &self.out_norm, c.n_embd, c.rms_eps)?;
+        be.mm(&self.output, c.n_embd, c.vocab, &s.xb, &mut s.logits)?;
+        Ok(be.stream.clone_dtoh(&s.logits)?)
+    }
 
+    fn attend(&self, s: &mut GpuSession, layer: usize, pos: usize) -> R<()> {
+        let c = &self.cfg;
         let n_pos = (pos + 1) as i32;
-        let hd = self.head_dim as i32;
-        let nh = self.n_head as i32;
-        let nhkv = self.n_head_kv as i32;
-        let kvd = self.kv_dim as i32;
+        let hd = c.head_dim as i32;
+        let nh = c.n_head as i32;
+        let nhkv = c.n_head_kv as i32;
+        let kvd = c.kv_dim as i32;
         let cfg = LaunchConfig {
-            grid_dim: (self.n_head as u32, 1, 1),
-            block_dim: (self.head_dim as u32, 1, 1),
+            grid_dim: (c.n_head as u32, 1, 1),
+            block_dim: (c.head_dim as u32, 1, 1),
             shared_mem_bytes: ((pos + 1) * 4) as u32,
         };
-        let mut b = self.stream.launch_builder(&self.func);
-        b.arg(&mut out_dev);
-        b.arg(&q_dev);
-        b.arg(&self.k[layer]);
-        b.arg(&self.v[layer]);
+        let f = self.be.f_attn.clone();
+        let mut b = self.be.stream.launch_builder(&f);
+        b.arg(&mut s.att);
+        b.arg(&s.q);
+        b.arg(&s.kcache[layer]);
+        b.arg(&s.vcache[layer]);
         b.arg(&n_pos);
         b.arg(&hd);
         b.arg(&nh);
         b.arg(&nhkv);
         b.arg(&kvd);
         unsafe { b.launch(cfg) }?;
-
-        Ok(self.stream.clone_dtoh(&out_dev)?)
+        Ok(())
     }
 }
 
-/// True if a CUDA device can be opened.
 pub fn gpu_available() -> bool {
     CudaContext::new(0).is_ok()
 }
-
-/// Device name of GPU 0.
-pub fn device_name() -> Result<String, Box<dyn Error>> {
+pub fn device_name() -> R<String> {
     Ok(CudaContext::new(0)?.name()?)
 }
 
-/// Q8_0 GPU self-test with a fixed fp16 scale (0.03125) vs a CPU reference.
-pub fn self_test_q8(in_dim: usize, out_dim: usize) -> Result<f32, Box<dyn Error>> {
+/// Q8_0 GPU self-test (fixed fp16 scale) vs a CPU reference. Returns max abs error.
+pub fn self_test_q8(in_dim: usize, out_dim: usize) -> R<f32> {
     let nb = in_dim / 32;
-    let row_bytes = nb * 34;
-    let d = 0.03125f32; // fp16 bits 0x2800 -> bytes 0x00,0x28
-    let mut w = vec![0u8; out_dim * row_bytes];
+    let rb = nb * 34;
+    let d = 0.03125f32;
+    let mut w = vec![0u8; out_dim * rb];
     for j in 0..out_dim {
         for b in 0..nb {
-            let base = j * row_bytes + b * 34;
+            let base = j * rb + b * 34;
             w[base] = 0x00;
             w[base + 1] = 0x28;
             for i in 0..32 {
-                let q = ((j + b + i) % 251) as i32 - 125;
-                w[base + 2 + i] = q as i8 as u8;
+                w[base + 2 + i] = (((j + b + i) % 251) as i32 - 125) as i8 as u8;
             }
         }
     }
     let x: Vec<f32> = (0..in_dim).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
-
-    let backend = GpuBackend::new()?;
-    let gpu = backend.matmul_bytes(GgmlType::Q8_0, &w, in_dim, out_dim, &x)?;
-
+    let be = GpuBackend::new()?;
+    let gpu = be.matmul_bytes(GgmlType::Q8_0, &w, in_dim, out_dim, &x)?;
     let mut max_err = 0f32;
     for j in 0..out_dim {
         let mut acc = 0f32;
         for b in 0..nb {
-            let base = j * row_bytes + b * 34;
+            let base = j * rb + b * 34;
             let mut blk = 0f32;
             for i in 0..32 {
                 blk += (w[base + 2 + i] as i8 as f32) * x[b * 32 + i];
@@ -436,44 +557,30 @@ pub fn version() -> &'static str {
 mod tests {
     use super::*;
 
-    // Deterministic byte streams with valid, varied fp16 scales, compared to the
-    // CPU kernels in poezi-tensor.
     fn rng() -> impl FnMut() -> u32 {
         let mut s: u32 = 0x1234_5678;
-        move || {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            s
-        }
+        move || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s }
     }
     fn fp16_bytes(r: &mut impl FnMut() -> u32) -> [u8; 2] {
-        let exp = 8 + (r() % 11); // positive normal, exp 8..18
+        let exp = 8 + (r() % 11);
         let mant = r() & 0x3ff;
         let h = ((exp << 10) | mant) as u16;
         [(h & 0xff) as u8, (h >> 8) as u8]
     }
-
     fn check(ty: GgmlType, block_bytes: usize, block_elems: usize) {
-        if !gpu_available() {
-            return;
-        }
+        if !gpu_available() { return; }
         let (in_dim, out_dim) = (block_elems * 3, 200);
         let nb = in_dim / block_elems;
         let row = nb * block_bytes;
         let mut r = rng();
         let mut w = vec![0u8; out_dim * row];
-        for byte in w.iter_mut() {
-            *byte = (r() & 0xff) as u8;
-        }
-        // overwrite the fp16 scale fields with sane values per block
+        for byte in w.iter_mut() { *byte = (r() & 0xff) as u8; }
         for j in 0..out_dim {
             for b in 0..nb {
                 let base = j * row + b * block_bytes;
                 match ty {
                     GgmlType::Q4K => {
-                        let d = fp16_bytes(&mut r);
-                        let dm = fp16_bytes(&mut r);
+                        let d = fp16_bytes(&mut r); let dm = fp16_bytes(&mut r);
                         w[base..base + 2].copy_from_slice(&d);
                         w[base + 2..base + 4].copy_from_slice(&dm);
                     }
@@ -486,30 +593,18 @@ mod tests {
             }
         }
         let x: Vec<f32> = (0..in_dim).map(|_| (r() % 1000) as f32 / 1000.0 - 0.5).collect();
-
-        let backend = GpuBackend::new().expect("gpu");
-        let gpu = backend.matmul_bytes(ty, &w, in_dim, out_dim, &x).expect("gpu matmul");
+        let be = GpuBackend::new().expect("gpu");
+        let gpu = be.matmul_bytes(ty, &w, in_dim, out_dim, &x).expect("gpu matmul");
         let mut cpu = vec![0f32; out_dim];
         poezi_tensor::matmul(ty, &w, in_dim, out_dim, &x, &mut cpu);
-
-        let mut max_rel = 0f32;
+        let mut mr = 0f32;
         for j in 0..out_dim {
-            let denom = cpu[j].abs().max(1.0);
-            max_rel = max_rel.max((cpu[j] - gpu[j]).abs() / denom);
+            let d = cpu[j].abs().max(1.0);
+            mr = mr.max((cpu[j] - gpu[j]).abs() / d);
         }
-        assert!(max_rel < 1e-3, "{ty:?}: max relative error {max_rel}");
+        assert!(mr < 1e-3, "{ty:?}: max rel err {mr}");
     }
-
-    #[test]
-    fn gpu_q8_matches_cpu() {
-        check(GgmlType::Q8_0, 34, 32);
-    }
-    #[test]
-    fn gpu_q4k_matches_cpu() {
-        check(GgmlType::Q4K, 144, 256);
-    }
-    #[test]
-    fn gpu_q6k_matches_cpu() {
-        check(GgmlType::Q6K, 210, 256);
-    }
+    #[test] fn gpu_q8_matches_cpu() { check(GgmlType::Q8_0, 34, 32); }
+    #[test] fn gpu_q4k_matches_cpu() { check(GgmlType::Q4K, 144, 256); }
+    #[test] fn gpu_q6k_matches_cpu() { check(GgmlType::Q6K, 210, 256); }
 }

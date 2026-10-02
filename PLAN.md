@@ -276,3 +276,11 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   wrong thing. THE fix = A5.6: GPU-resident forward (keep activations on-device, chain
   rmsnorm/rope/swiglu/residual kernels, download only the final logits => ~1 sync/token
   instead of ~225). Expected the real speedup.
+- 2026-10-02: A5.6 done = fully GPU-resident forward (GpuWeights immutable + GpuSession;
+  rmsnorm/rope/swiglu/add kernels; attention + KV cache on device; only logits copied
+  back). Output == llama.cpp. BUT still ~4 tok/s. Measured the TRUE bottleneck: ~17 GB/s
+  effective vs the 3060's ~360 GB/s = only ~5% of memory bandwidth; compute ~0.4%. So it
+  is memory-bandwidth-bound by uncoalesced/byte-wise loads in the quant kernels. Neither
+  attention (A5.5) nor round-trips (A5.6) were the bottleneck. A5.7 (deep, optional):
+  coalesced + vectorized quant-matmul kernels (what makes llama.cpp ~50-80 tok/s). The
+  model runs correctly on the GPU now; peak throughput is a separate kernel-tuning effort.
