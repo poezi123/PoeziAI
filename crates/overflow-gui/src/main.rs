@@ -469,6 +469,8 @@ impl OverflowApp {
             )
             .show(ctx, |ui| {
                 ui.set_width(320.0);
+                egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width(320.0);
 
                 // ---- model management (load / unload / download) ----
                 section(ui, "MODEL");
@@ -635,6 +637,7 @@ impl OverflowApp {
                         ui.add(egui::Slider::new(&mut self.gen.max_tokens, 32..=4096).text("max tokens"));
                         ui.label(egui::RichText::new("temp 0 = deterministic. higher = more creative/varied.").color(MUTED).size(10.5));
                     });
+                }); // end scroll area
             });
         self.settings_open = open;
     }
