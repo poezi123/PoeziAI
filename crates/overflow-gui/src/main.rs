@@ -60,6 +60,22 @@ const GREEN: Color32 = Color32::from_rgb(0x4d, 0xf0, 0xa0);
 const RED: Color32 = Color32::from_rgb(0xff, 0x5a, 0x5a);
 const CYAN: Color32 = Color32::from_rgb(0x49, 0xd6, 0xe6);
 
+// Qwen2.5-Coder GGUF downloads (our engine is Qwen2-architecture).
+const QWEN_1_5B_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
+const QWEN_7B_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf";
+
+/// Last path segment of a URL (before any query), for a download filename.
+fn filename_from_url(url: &str) -> String {
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .rsplit('/')
+        .next()
+        .filter(|s| s.ends_with(".gguf") && !s.is_empty())
+        .unwrap_or("download.gguf")
+        .to_string()
+}
+
 /// The math behind what the engine does — shown in the dev panel.
 const FORMULAS: [&str; 6] = [
     "softmax   pᵢ = e^(zᵢ/T) / Σⱼ e^(zⱼ/T)",
@@ -214,6 +230,7 @@ struct OverflowApp {
     console: Vec<String>,
     learn: LearnState,
     trainer: Option<trainer::Trainer>,
+    dl_url: String,
 }
 
 impl OverflowApp {
@@ -239,6 +256,7 @@ impl OverflowApp {
             console: Vec::new(),
             learn: LearnState::default(),
             trainer: None,
+            dl_url: String::new(),
         }
     }
 
@@ -263,17 +281,21 @@ impl OverflowApp {
         self.log("model unloaded");
     }
 
-    /// Download the base model into the data dir (streamed via curl).
-    fn download_base(&mut self) {
+    /// Download a model (by URL) into the data dir, streamed via curl.
+    fn download_model(&mut self, label: &str, url: &str, filename: &str) {
         let dir = data_models_dir();
         let _ = std::fs::create_dir_all(&dir);
-        let out = dir.join("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
-        let url = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
+        let out = dir.join(filename);
         self.start(
-            "download base model",
+            label,
             "curl",
-            vec!["-L".into(), "--fail".into(), "-o".into(), out.display().to_string(), url.into()],
+            vec!["-L".into(), "--fail".into(), "-o".into(), out.display().to_string(), url.to_string()],
         );
+    }
+
+    /// Default base model (Qwen2.5-Coder 1.5B) — used by the first-run button.
+    fn download_base(&mut self) {
+        self.download_model("download base 1.5B", QWEN_1_5B_URL, "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
     }
 
     fn log(&mut self, line: impl Into<String>) {
@@ -454,19 +476,30 @@ impl OverflowApp {
                     self.load_model(p);
                 }
                 ui.add_space(4.0);
+                if ui.add_enabled(self.handle.is_some(), egui::Button::new("Unload (free memory)")).clicked() {
+                    self.unload_model();
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Download a Qwen2.5-Coder base:").color(MUTED).size(11.0));
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(self.handle.is_some(), egui::Button::new("Unload")).clicked() {
-                        self.unload_model();
+                    if ui.add_enabled(!busy, egui::Button::new("1.5B (~1.1 GB)")).clicked() {
+                        self.download_model("download 1.5B", QWEN_1_5B_URL, "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("Download base (1.5B)")).clicked() {
-                        self.download_base();
+                    if ui.add_enabled(!busy, egui::Button::new("7B (~4.4 GB)")).clicked() {
+                        self.download_model("download 7B", QWEN_7B_URL, "qwen2.5-coder-7b-instruct-q4_k_m.gguf");
                     }
                 });
-                ui.label(
-                    egui::RichText::new(format!("dir: {}", data_models_dir().display()))
-                        .color(MUTED)
-                        .size(10.0),
-                );
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("…or your own model (GGUF URL):").color(MUTED).size(11.0));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.dl_url).hint_text("https://…/model.gguf").desired_width(210.0));
+                    let ok = !busy && self.dl_url.trim().ends_with(".gguf");
+                    if ui.add_enabled(ok, egui::Button::new("Download")).clicked() {
+                        let url = self.dl_url.trim().to_string();
+                        let name = filename_from_url(&url);
+                        self.download_model("download (custom)", &url, &name);
+                    }
+                });
 
                 ui.add_space(12.0);
                 let hw = self.hw.lock().map(|g| *g).unwrap_or_default();
