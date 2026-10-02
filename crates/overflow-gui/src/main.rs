@@ -74,6 +74,7 @@ enum Status {
 enum Role {
     User,
     Assistant,
+    Tool,
 }
 
 struct Msg {
@@ -124,6 +125,7 @@ struct OverflowApp {
     perms: Permissions,
     tok_per_s: f32,
     backend: String,
+    pending_approval: Option<(String, bool)>,
     hw: Arc<Mutex<hw::HwStats>>,
 }
 
@@ -138,6 +140,7 @@ impl OverflowApp {
             perms: Permissions::default(),
             tok_per_s: 0.0,
             backend: "…".to_string(),
+            pending_approval: None,
             hw: hw::spawn(),
         }
     }
@@ -149,7 +152,15 @@ impl OverflowApp {
         }
         self.transcript.push(Msg { role: Role::User, text: text.clone() });
         self.transcript.push(Msg { role: Role::Assistant, text: String::new() });
-        let _ = self.handle.tx.send(ToWorker::User(text));
+        let perms = worker::perms(
+            self.perms.sandbox,
+            self.perms.fs_read,
+            self.perms.fs_write,
+            self.perms.shell,
+            &self.perms.workspace,
+            self.perms.confirm_outside,
+        );
+        let _ = self.handle.tx.send(ToWorker::User { text, perms });
         self.status = Status::Generating;
         self.input.clear();
     }
@@ -168,6 +179,21 @@ impl OverflowApp {
                     self.status = Status::Generating;
                 }
                 FromWorker::Stats { tok_per_s } => self.tok_per_s = tok_per_s,
+                FromWorker::ToolCall(desc) => {
+                    // The current assistant bubble held the streamed call text; make
+                    // it a tool line instead.
+                    if let Some(last) = self.transcript.last_mut() {
+                        last.role = Role::Tool;
+                        last.text = format!("⚙ {desc}");
+                    }
+                }
+                FromWorker::ToolResult(r) => {
+                    self.transcript.push(Msg { role: Role::Tool, text: format!("→ {r}") });
+                    self.transcript.push(Msg { role: Role::Assistant, text: String::new() });
+                }
+                FromWorker::Approval { desc, outside } => {
+                    self.pending_approval = Some((desc, outside));
+                }
                 FromWorker::Done => self.status = Status::Ready,
                 FromWorker::Error(e) => self.status = Status::Error(e),
             }
@@ -332,7 +358,37 @@ impl eframe::App for OverflowApp {
                 });
             });
 
-        let can_send = matches!(self.status, Status::Ready);
+        let can_send = matches!(self.status, Status::Ready) && self.pending_approval.is_none();
+
+        // Approval dialog (shown above the composer while a tool awaits consent).
+        if let Some((desc, outside)) = self.pending_approval.clone() {
+            egui::Panel::bottom("approval")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(PANEL)
+                        .inner_margin(egui::Margin::symmetric(16, 12))
+                        .stroke(Stroke::new(1.0, RED)),
+                )
+                .show(ui, |ui| {
+                    let head = if outside {
+                        format!("⚠ allow tool (OUTSIDE workspace): {desc}")
+                    } else {
+                        format!("allow tool: {desc}")
+                    };
+                    ui.label(egui::RichText::new(head).color(if outside { RED } else { FG }).strong());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(egui::RichText::new("Allow once").color(GREEN)).clicked() {
+                            let _ = self.handle.tx.send(ToWorker::Approve(true));
+                            self.pending_approval = None;
+                        }
+                        if ui.button(egui::RichText::new("Deny").color(RED)).clicked() {
+                            let _ = self.handle.tx.send(ToWorker::Approve(false));
+                            self.pending_approval = None;
+                        }
+                    });
+                });
+        }
 
         egui::Panel::bottom("composer")
             .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(16, 12)))
@@ -378,17 +434,33 @@ impl eframe::App for OverflowApp {
                         let generating = matches!(self.status, Status::Generating);
                         let last = self.transcript.len().saturating_sub(1);
                         for (i, msg) in self.transcript.iter().enumerate() {
-                            let (who, col) = match msg.role {
-                                Role::User => ("you", AMBER),
-                                Role::Assistant => ("overflow", GREEN),
-                            };
-                            ui.add_space(10.0);
-                            ui.label(egui::RichText::new(format!("{who} ▸")).color(col).size(12.0).strong());
-                            let mut body = msg.text.clone();
-                            if generating && i == last && matches!(msg.role, Role::Assistant) {
-                                body.push('▌');
+                            let active = generating && i == last;
+                            if msg.text.is_empty() && !active {
+                                continue; // hide not-yet-filled bubbles
                             }
-                            ui.label(egui::RichText::new(body).color(FG));
+                            match msg.role {
+                                Role::Tool => {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(&msg.text).color(AMBER).size(12.5),
+                                    );
+                                }
+                                _ => {
+                                    let (who, col) = match msg.role {
+                                        Role::User => ("you", AMBER),
+                                        _ => ("overflow", GREEN),
+                                    };
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        egui::RichText::new(format!("{who} ▸")).color(col).size(12.0).strong(),
+                                    );
+                                    let mut body = msg.text.clone();
+                                    if active && matches!(msg.role, Role::Assistant) {
+                                        body.push('▌');
+                                    }
+                                    ui.label(egui::RichText::new(body).color(FG));
+                                }
+                            }
                         }
                         ui.add_space(8.0);
                     });

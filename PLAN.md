@@ -156,8 +156,9 @@ Turn the engine into something that does real work.
       Wires up the GUI's permission settings conceptually.
 - [ ] Sandbox: currently path-confinement + approval; OS-level isolation
       (bubblewrap/container) is future work.
-- [ ] GUI integration: run the agent loop from OVERFLOW with in-app approval
-      dialogs (instead of the CLI prompt).
+- [x] GUI integration: OVERFLOW runs the agent loop; tool activity streams into
+      the transcript and tools awaiting consent pop an in-app Allow/Deny dialog
+      (wired to the permission settings). Agent core shared via poezi_model::agent.
 - [ ] RAG over a local knowledge base (writeups, docs, man pages).
 - [ ] Code → run → read error → fix loop.
 
@@ -297,3 +298,8 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   gated by workspace confinement + approval. Verified on the 7B: it lists dirs,
   reads Cargo.toml, runs shell commands and answers correctly. The tool-use
   hallucination is now real action. Next: OS sandbox, GUI integration, RAG.
+- 2026-10-02: Phase D GUI integration done. Agent core extracted to
+  poezi_model::agent (shared by CLI + GUI). OVERFLOW now runs the tool-calling
+  agent: tokens + tool calls/results stream into the chat, and a tool that needs
+  consent shows an in-app Allow/Deny dialog (blocks the worker until answered),
+  gated by the Settings permissions (sandbox default, workspace, confirm-outside).

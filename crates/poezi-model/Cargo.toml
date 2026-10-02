@@ -13,3 +13,4 @@ poezi-cuda = { path = "../poezi-cuda" }
 # lookahead, which the standard `regex` crate does not support. fancy-regex
 # also matches Python/PCRE semantics, which is what GPT-2-style BPE expects.
 fancy-regex = "0.14"
+serde_json = "1"

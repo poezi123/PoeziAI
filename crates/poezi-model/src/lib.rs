@@ -9,6 +9,7 @@
 //! Phase A3 target: given a GGUF file + token IDs, produce next-token logits
 //! that match llama.cpp within tolerance.
 
+pub mod agent;
 pub mod model;
 pub mod tokenizer;
 pub use model::{Config, KvCache, Model, ModelError};
