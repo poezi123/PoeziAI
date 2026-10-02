@@ -542,14 +542,17 @@ impl OverflowApp {
                     .size(11.0),
                 );
 
-                // ---- where the model files live ----
+                // ---- where the model files live (absolute paths) ----
                 ui.add_space(12.0);
                 section(ui, "MODEL FILES");
                 ui.label(egui::RichText::new("Put or drop .gguf models in these folders:").color(MUTED).size(11.0));
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
                 for d in [PathBuf::from("models"), data_models_dir()] {
-                    let exists = d.is_dir();
+                    let abs = if d.is_absolute() { d.clone() } else { cwd.join(&d) };
+                    let abs = abs.canonicalize().unwrap_or(abs);
+                    let exists = abs.is_dir();
                     ui.label(
-                        egui::RichText::new(format!("{} {}", if exists { "•" } else { "◦" }, d.display()))
+                        egui::RichText::new(format!("{} {}", if exists { "•" } else { "◦" }, abs.display()))
                             .color(if exists { FG } else { MUTED })
                             .size(11.0),
                     );

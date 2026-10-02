@@ -134,6 +134,7 @@ fn main() -> ExitCode {
             let opts = agent::AgentOpts {
                 workspace,
                 auto_approve: args.iter().any(|a| a == "--yes"),
+                sandbox: args.iter().any(|a| a == "--sandbox"),
                 network: args.iter().any(|a| a == "--net"),
                 max_rounds: flag_val(&args, "-n").and_then(|s| s.parse().ok()).unwrap_or(8),
             };

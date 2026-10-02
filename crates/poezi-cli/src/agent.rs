@@ -11,6 +11,7 @@ use poezi_model::{Model, Tokenizer};
 pub struct AgentOpts {
     pub workspace: PathBuf,
     pub auto_approve: bool,
+    pub sandbox: bool,
     pub network: bool,
     pub max_rounds: usize,
 }
@@ -69,7 +70,7 @@ pub fn run(path: &str, query: &str, opts: AgentOpts) -> ExitCode {
 
     // CLI runs with full capabilities granted; approval still asked unless --yes.
     let perms = Perms {
-        sandbox: false,
+        sandbox: opts.sandbox,
         fs_read: true,
         fs_write: true,
         shell: true,
