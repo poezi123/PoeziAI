@@ -22,6 +22,7 @@ pub struct Perms {
     pub fs_read: bool,
     pub fs_write: bool,
     pub shell: bool,
+    pub network: bool,
     pub workspace: PathBuf,
     pub confirm_outside: bool,
 }
@@ -204,22 +205,69 @@ fn execute(call: &ToolCall, perms: &Perms) -> String {
             }
         }
         "run_shell" => match call.args.get("command").and_then(|c| c.as_str()) {
-            Some(cmd) => match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(&ws)
-                .output()
-            {
-                Ok(o) => {
+            Some(cmd) => match sandboxed_shell(cmd, &ws, perms.network) {
+                Ok((o, note)) => {
                     let mut r = String::from_utf8_lossy(&o.stdout).into_owned();
                     r.push_str(&String::from_utf8_lossy(&o.stderr));
-                    r.chars().take(8000).collect()
+                    let body: String = r.chars().take(8000).collect();
+                    format!("{note}{body}")
                 }
                 Err(e) => format!("run_shell error: {e}"),
             },
             None => "run_shell error: missing command".into(),
         },
         other => format!("unknown tool: {other}"),
+    }
+}
+
+/// Is bubblewrap available for OS-level sandboxing?
+fn bwrap_available() -> bool {
+    use std::sync::OnceLock;
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Run a shell command confined to the workspace via bubblewrap: read-only
+/// system, workspace read-write, isolated /tmp and PIDs, no network unless
+/// granted. Falls back to an unsandboxed run (with a warning note) if bwrap is
+/// missing. Returns (output, note-prefix-for-the-model).
+fn sandboxed_shell(cmd: &str, ws: &Path, network: bool) -> std::io::Result<(std::process::Output, String)> {
+    use std::process::Command;
+    if bwrap_available() {
+        let mut c = Command::new("bwrap");
+        c.args([
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib", "/lib64",
+            "--symlink", "usr/bin", "/sbin",
+            "--ro-bind", "/etc", "/etc",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/tmp",
+        ]);
+        c.arg("--bind").arg(ws).arg(ws);
+        c.arg("--chdir").arg(ws);
+        c.arg("--unshare-all");
+        if network {
+            c.arg("--share-net");
+        }
+        c.arg("--die-with-parent");
+        c.arg("sh").arg("-c").arg(cmd);
+        let note = format!(
+            "[sandboxed: workspace-only, net {}]\n",
+            if network { "on" } else { "off" }
+        );
+        Ok((c.output()?, note))
+    } else {
+        let o = Command::new("sh").arg("-c").arg(cmd).current_dir(ws).output()?;
+        Ok((o, "[UNSANDBOXED: bubblewrap not installed]\n".to_string()))
     }
 }
 

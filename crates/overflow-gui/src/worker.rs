@@ -120,6 +120,7 @@ pub fn perms(
     fs_read: bool,
     fs_write: bool,
     shell: bool,
+    network: bool,
     workspace: &str,
     confirm_outside: bool,
 ) -> Perms {
@@ -128,6 +129,7 @@ pub fn perms(
         fs_read,
         fs_write,
         shell,
+        network,
         workspace: PathBuf::from(workspace),
         confirm_outside,
     }

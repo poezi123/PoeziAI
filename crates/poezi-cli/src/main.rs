@@ -134,6 +134,7 @@ fn main() -> ExitCode {
             let opts = agent::AgentOpts {
                 workspace,
                 auto_approve: args.iter().any(|a| a == "--yes"),
+                network: args.iter().any(|a| a == "--net"),
                 max_rounds: flag_val(&args, "-n").and_then(|s| s.parse().ok()).unwrap_or(8),
             };
             agent::run(path, query, opts)

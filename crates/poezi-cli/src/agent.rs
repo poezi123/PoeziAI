@@ -11,6 +11,7 @@ use poezi_model::{Model, Tokenizer};
 pub struct AgentOpts {
     pub workspace: PathBuf,
     pub auto_approve: bool,
+    pub network: bool,
     pub max_rounds: usize,
 }
 
@@ -72,6 +73,7 @@ pub fn run(path: &str, query: &str, opts: AgentOpts) -> ExitCode {
         fs_read: true,
         fs_write: true,
         shell: true,
+        network: opts.network,
         workspace: opts.workspace.clone(),
         confirm_outside: true,
     };

@@ -154,8 +154,11 @@ Turn the engine into something that does real work.
 - [x] Permission model: workspace confinement + interactive approval (anything
       outside the workspace, writes, or shell asks first; `--yes` auto-approves).
       Wires up the GUI's permission settings conceptually.
-- [ ] Sandbox: currently path-confinement + approval; OS-level isolation
-      (bubblewrap/container) is future work.
+- [x] Sandbox: OS-level isolation via bubblewrap. run_shell executes in a
+      namespace with the workspace as the only read-write mount, system read-only,
+      isolated /tmp + PIDs, and no network unless granted (--net / network perm).
+      Verified: can't read home files, writes outside go to an ephemeral FS, net
+      blocked by default. Falls back (with a warning) if bwrap is absent.
 - [x] GUI integration: OVERFLOW runs the agent loop; tool activity streams into
       the transcript and tools awaiting consent pop an in-app Allow/Deny dialog
       (wired to the permission settings). Agent core shared via poezi_model::agent.
@@ -303,3 +306,8 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
   agent: tokens + tool calls/results stream into the chat, and a tool that needs
   consent shows an in-app Allow/Deny dialog (blocks the worker until answered),
   gated by the Settings permissions (sandbox default, workspace, confirm-outside).
+- 2026-10-02: Phase D sandbox done. run_shell now runs inside bubblewrap: workspace
+  is the only RW mount, /usr+/etc read-only, isolated /tmp+PID, net off unless granted.
+  Directly verified confinement (no home-file reads, no real writes outside, net
+  off/on) and end-to-end ([sandboxed...] note in agent output). bwrap-missing falls
+  back with a warning. Perms gained `network`; CLI --net flag; GUI passes network perm.

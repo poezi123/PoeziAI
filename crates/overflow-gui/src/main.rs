@@ -157,6 +157,7 @@ impl OverflowApp {
             self.perms.fs_read,
             self.perms.fs_write,
             self.perms.shell,
+            self.perms.network,
             &self.perms.workspace,
             self.perms.confirm_outside,
         );
