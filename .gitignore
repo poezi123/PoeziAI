@@ -31,3 +31,9 @@ Cargo.lock
 
 # Vendored CUDA libs (fetched via scripts/fetch-cuda.sh)
 /vendor/cuda/
+
+# Training artifacts
+/training/venv/
+/training/out/
+/training/data/*.jsonl
+/training/hf-cache/

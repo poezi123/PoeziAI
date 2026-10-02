@@ -1,0 +1,8 @@
+# QLoRA fine-tuning stack. torch ships its own CUDA runtime (no system CUDA
+# needed — same idea as bundling CUDA ourselves), talking to the NVIDIA driver.
+torch
+transformers
+peft
+datasets
+accelerate
+bitsandbytes
