@@ -116,9 +116,14 @@ fn data_models_dir() -> PathBuf {
     base.join("overflow/models")
 }
 
-/// All .gguf models found in the dev ./models dir and the XDG data dir.
+/// All .gguf models found in the dev ./models dir, the XDG data dir, and the
+/// system dir where the Arch package installs the bundled model.
 fn list_gguf() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("models"), data_models_dir()];
+    let mut dirs = vec![
+        PathBuf::from("models"),
+        data_models_dir(),
+        PathBuf::from("/usr/share/overflow/models"),
+    ];
     dirs.dedup();
     let mut out = Vec::new();
     for d in dirs {
@@ -142,8 +147,8 @@ fn default_model_path() -> Option<PathBuf> {
         return Some(arg.into());
     }
     let prefs = [
+        "overflow_wt-7b-q8_0.gguf",
         "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
-        "overflow-1.5b-q8_0.gguf",
         "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
         "qwen2.5-coder-1.5b-instruct-q8_0.gguf",
     ];
@@ -607,7 +612,7 @@ impl OverflowApp {
                 section(ui, "MODEL FILES");
                 ui.label(egui::RichText::new("Put or drop .gguf models in these folders:").color(MUTED).size(11.0));
                 let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                for d in [PathBuf::from("models"), data_models_dir()] {
+                for d in [PathBuf::from("models"), data_models_dir(), PathBuf::from("/usr/share/overflow/models")] {
                     let abs = if d.is_absolute() { d.clone() } else { cwd.join(&d) };
                     let abs = abs.canonicalize().unwrap_or(abs);
                     let exists = abs.is_dir();
@@ -642,6 +647,7 @@ impl OverflowApp {
                         ui.add(egui::Slider::new(&mut self.gen.top_k, 1..=200).text("top-k"));
                         ui.add(egui::Slider::new(&mut self.gen.max_tokens, 32..=4096).text("max tokens"));
                         ui.add(egui::Slider::new(&mut self.gen.repeat_penalty, 1.0..=2.0).text("repeat penalty"));
+                        ui.add(egui::Slider::new(&mut self.gen.repeat_last_n, 16..=512).text("repeat window"));
                         ui.label(egui::RichText::new("temp 0 = deterministic. repeat penalty >1 stops loops.").color(MUTED).size(10.5));
                     });
                 }); // end scroll area
@@ -1062,11 +1068,22 @@ fn docs_body(ui: &mut egui::Ui) {
                     "Shell runs inside bubblewrap: workspace-only, no network unless granted.",
                     "You approve anything sensitive with an in-app Allow/Deny dialog.",
                 ]);
+                doc_section(ui, "The overflow_wt model", &[
+                    "overflow_wt-7b-q8_0 is OVERFLOW's flagship model: Qwen2.5-Coder-7B",
+                    "fine-tuned (QLoRA) to act like an information-security professor —",
+                    "it explains infosec clearly across crypto, network/web security, binary",
+                    "exploitation, privilege escalation, malware, forensics and incident response.",
+                    "It ships with the installed package and is loaded by default.",
+                    "'wt' = walkthrough: it teaches the reasoning, not just the answer.",
+                    "For authorized security work and learning.",
+                ]);
                 doc_section(ui, "Models", &[
                     "Settings -> Model: load, unload, or download a model (like LM Studio).",
-                    "Models live in ~/.local/share/overflow/models (or ./models in a dev build).",
-                    "Download the base model to get started, or load your own fine-tuned GGUF.",
+                    "Models live in ~/.local/share/overflow/models (or ./models in a dev build);",
+                    "the package also installs to /usr/share/overflow/models.",
+                    "Download a base model to get started, or load your own fine-tuned GGUF.",
                     "Unload frees the memory/VRAM; load a different one anytime.",
+                    "The engine runs Qwen2-architecture GGUFs.",
                 ]);
                 ui.add_space(16.0);
             });

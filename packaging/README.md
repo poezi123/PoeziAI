@@ -26,10 +26,21 @@ Then launch **OVERFLOW** from your app menu, or run `overflow` in a terminal.
 User data (models, etc.) lives in `~/.local/share/overflow/` — the standard XDG
 location, nothing hidden elsewhere.
 
-## First run — the model
+## The bundled model
 
-The package ships **no model** (they're multi-GB). On first launch OVERFLOW
-opens with "no model":
+The package bundles **overflow_wt-7b-q8_0** — Qwen2.5-Coder-7B fine-tuned to act
+like an information-security professor — installed to `/usr/share/overflow/models`
+and loaded by default. Build it first with `training/build_overflow_wt.sh`
+(QLoRA on the GPU, then a RAM-cheap merge + Q8 quantize); `makepkg` then includes
+it (~8 GB package). Note: an 8 GB model cannot live in the git repo — it is built
+locally and bundled at package time, or hosted and fetched.
+
+If the model file is absent at build time, the package ships without it and the
+GUI's first-run download / custom-URL field fetches one instead.
+
+## First run — no bundled model
+
+If you built the package without the model, OVERFLOW opens with "no model":
 
 - **Download base model** (Settings → Model, or the first-run button) fetches a
   ready-to-use base into `~/.local/share/overflow/models`.

@@ -35,6 +35,17 @@ package() {
     install -Dm644 brand/overflow-mark.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/overflow.svg"
     # optional: training scripts for the Learning tab (advanced; needs a venv)
     install -d "$pkgdir/usr/share/overflow"
-    cp -a training "$pkgdir/usr/share/overflow/training"
+    cp -a training "$pkgdir/usr/share/overflow/training" 2>/dev/null || true
+    rm -rf "$pkgdir/usr/share/overflow/training/venv" "$pkgdir/usr/share/overflow/training/out" \
+           "$pkgdir/usr/share/overflow/training/hf-cache"
     install -Dm644 README.md "$pkgdir/usr/share/doc/overflow/README.md"
+
+    # bundle the pre-trained model so it ships by default. Built locally by
+    # training/build_overflow_wt.sh; if present it goes into the package (~8 GB),
+    # installed to the system model dir the GUI scans. If absent, the GUI's
+    # first-run download / custom-URL field fetches a model instead.
+    if [ -f models/overflow_wt-7b-q8_0.gguf ]; then
+        install -Dm644 models/overflow_wt-7b-q8_0.gguf \
+            "$pkgdir/usr/share/overflow/models/overflow_wt-7b-q8_0.gguf"
+    fi
 }
