@@ -21,7 +21,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
     Trainer,
     TrainingArguments,
 )
@@ -76,13 +76,22 @@ model = get_peft_model(
 )
 model.print_trainable_parameters()
 
-rows = [json.loads(l) for l in open(args.data)]
-texts = [tok.apply_chat_template(r["messages"], tokenize=False, add_generation_prompt=False) for r in rows]
-ds = Dataset.from_dict({"text": texts}).map(
-    lambda b: tok(b["text"], truncation=True, max_length=512),
-    batched=True,
-    remove_columns=["text"],
-)
+MAXLEN = 1024
+
+def encode(messages):
+    """Tokenize a chat and build labels that train ONLY on the assistant turns
+    (everything else is masked with -100). Without this the model would learn to
+    generate the user/<tool_response> turns too — which made it emit tool
+    responses itself instead of calling tools."""
+    ids, labels, prev = [], [], 0
+    for i, msg in enumerate(messages):
+        ids = tok.apply_chat_template(messages[: i + 1], tokenize=True, add_generation_prompt=False)
+        delta = ids[prev:]
+        labels += delta if msg["role"] == "assistant" else [-100] * len(delta)
+        prev = len(ids)
+    return {"input_ids": ids[:MAXLEN], "labels": labels[:MAXLEN]}
+
+ds = Dataset.from_list([encode(json.loads(l)["messages"]) for l in open(args.data)])
 
 trainer = Trainer(
     model=model,
@@ -101,7 +110,7 @@ trainer = Trainer(
         report_to=[],
     ),
     train_dataset=ds,
-    data_collator=DataCollatorForLanguageModeling(tok, mlm=False),
+    data_collator=DataCollatorForSeq2Seq(tok, model=model, label_pad_token_id=-100, padding=True),
 )
 trainer.train()
 
