@@ -72,7 +72,9 @@ fn run(
         if let ToWorker::User { text, perms, gen } = msg {
             cancel.store(false, Ordering::Relaxed); // clear any prior stop
             let mut host = GuiHost { tx: tx_out, rx: rx_in, start: None, n: 0 };
-            agent::run(&model, &tok, &mut cache, first_turn, &text, &perms, &gen, cancel, &mut host, 8);
+            // Up to 20 tool rounds so the agent can investigate autonomously
+            // without the user re-prompting after each step.
+            agent::run(&model, &tok, &mut cache, first_turn, &text, &perms, &gen, cancel, &mut host, 20);
             first_turn = false;
             let _ = tx_out.send(FromWorker::Done);
         }

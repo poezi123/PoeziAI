@@ -9,10 +9,12 @@ ROOT="$(pwd)"
 export HF_HOME="$ROOT/training/hf-cache"
 PY="$ROOT/training/venv/bin/python"
 LC="$ROOT/vendor/llama.cpp"
-BASE="Qwen/Qwen2.5-Coder-7B-Instruct"
-DATA="training/data/overflow_wt.jsonl"
-ADAPTER="training/out/wt-adapter"
-OUT="models/overflow_wt-7b-q8_0.gguf"
+# Overridable via env (the Learning tab passes DATA/BASE/OUT).
+BASE="${BASE:-Qwen/Qwen2.5-Coder-7B-Instruct}"
+DATA="${DATA:-training/data/overflow_wt.jsonl}"
+ADAPTER="${ADAPTER:-training/out/wt-adapter}"
+OUT="${OUT:-models/overflow_wt-7b-q8_0.gguf}"
+EPOCHS="${EPOCHS:-3}"
 disk() { df -h /home | tail -1; }
 
 echo "[1/7] QLoRA fine-tune (downloads 7B base ~15GB if not cached) ..."; disk
@@ -20,13 +22,14 @@ echo "[1/7] QLoRA fine-tune (downloads 7B base ~15GB if not cached) ..."; disk
 # train while the GPU is busy. Skip if the adapter is already trained.
 if [ ! -d "$ADAPTER" ]; then
     "$PY" training/train_qlora.py --base "$BASE" --data "$DATA" --out "$ADAPTER" \
-        --epochs 3 --gpu-mem-gib "${GPU_MEM_GIB:-0}"
+        --epochs "$EPOCHS" --gpu-mem-gib "${GPU_MEM_GIB:-0}"
 else
     echo "    adapter exists ($ADAPTER) — skipping training"
 fi
 disk
 
-SNAP="$(ls -d "$ROOT"/training/hf-cache/hub/models--Qwen--Qwen2.5-Coder-7B-Instruct/snapshots/*/ | head -1)"
+CACHE_NAME="models--$(echo "$BASE" | sed 's#/#--#g')"
+SNAP="$(ls -d "$ROOT"/training/hf-cache/hub/"$CACHE_NAME"/snapshots/*/ | head -1)"
 echo "[2/7] base snapshot: $SNAP"
 
 echo "[3/7] convert base -> GGUF f16 (streamed, low RAM) ..."

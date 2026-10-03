@@ -28,9 +28,17 @@ enum Tab {
 }
 
 /// State for the Learning tab (drives the Python QLoRA pipeline).
+/// Pre-made datasets you can pick in the Learning tab: (label, jsonl path, generator script).
+/// The first is the default — OVERFLOW's strong infosec-professor set.
+const DATASETS: &[(&str, &str, &str)] = &[
+    ("OVERFLOW_WT · Infosec professor + offensive", "training/data/overflow_wt.jsonl", "training/data_gen_wt.py"),
+    ("Identity + security basics (small)", "training/data/overflow.jsonl", "training/data_gen.py"),
+];
+
 struct LearnState {
     base: String,
     data: String,
+    gen_script: String,
     epochs: String,
     loss: Option<f32>,
     step: Option<(u32, u32)>,
@@ -40,9 +48,10 @@ struct LearnState {
 impl Default for LearnState {
     fn default() -> Self {
         LearnState {
-            base: "Qwen/Qwen2.5-Coder-1.5B-Instruct".into(),
-            data: "training/data/overflow.jsonl".into(),
-            epochs: "2".into(),
+            base: "Qwen/Qwen2.5-Coder-7B-Instruct".into(),
+            data: DATASETS[0].1.into(),
+            gen_script: DATASETS[0].2.into(),
+            epochs: "3".into(),
             loss: None,
             step: None,
             status: "idle".into(),
@@ -198,9 +207,11 @@ struct Msg {
     text: String,
 }
 
-/// What the AI is allowed to do on the machine. Default is fully sandboxed:
-/// the chat can neither touch the filesystem nor run anything. Enforcement of
-/// these lands with the agent/tools (Phase D); they define what it may do.
+/// What the AI is allowed to do on the machine. OVERFLOW is a tool for security
+/// work, so the default is UNRESTRICTED: it may read/write files, run shell
+/// commands and use the network out of the box — but still asks before touching
+/// anything outside the workspace folder (Claude-style). Flip any of these off
+/// in Settings to tighten it, or turn on `sandbox` to isolate it fully.
 struct Permissions {
     sandbox: bool,
     fs_read: bool,
@@ -221,11 +232,11 @@ impl Default for Permissions {
             .or_else(|| std::env::var("HOME").ok())
             .unwrap_or_else(|| ".".into());
         Permissions {
-            sandbox: true,
-            fs_read: false,
-            fs_write: false,
-            shell: false,
-            network: false,
+            sandbox: false,
+            fs_read: true,
+            fs_write: true,
+            shell: true,
+            network: true,
             workspace,
             confirm_outside: true,
         }
@@ -247,6 +258,9 @@ struct OverflowApp {
     tab: Tab,
     dev: bool,
     console: Vec<String>,
+    /// Raw model output of the current turn (tokens as generated, including
+    /// <think>/<tool_call> tags) — shown in the dev panel.
+    raw_stream: String,
     learn: LearnState,
     trainer: Option<trainer::Trainer>,
     dl_url: String,
@@ -275,6 +289,7 @@ impl OverflowApp {
             tab: Tab::Chat,
             dev: false,
             console: Vec::new(),
+            raw_stream: String::new(),
             learn: LearnState::default(),
             trainer: None,
             dl_url: String::new(),
@@ -403,6 +418,7 @@ impl OverflowApp {
         );
         handle.cancel.store(false, Ordering::Relaxed);
         let _ = handle.tx.send(ToWorker::User { text: text.clone(), perms, gen: self.gen.clone() });
+        self.raw_stream.clear();
         self.transcript.push(Msg { role: Role::User, text });
         self.transcript.push(Msg { role: Role::Assistant, text: String::new() });
         self.status = Status::Generating;
@@ -424,6 +440,7 @@ impl OverflowApp {
                     self.backend = b;
                 }
                 FromWorker::Token(s) => {
+                    self.raw_stream.push_str(&s);
                     if let Some(last) = self.transcript.last_mut() {
                         if matches!(last.role, Role::Assistant) {
                             last.text.push_str(&s);
@@ -671,6 +688,18 @@ impl OverflowApp {
                 }
 
                 ui.add_space(10.0);
+                section(ui, "DEV · RAW TOKENS");
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .max_height(180.0)
+                    .auto_shrink([false, false])
+                    .id_salt("raw_tokens")
+                    .show(ui, |ui| {
+                        let raw = if self.raw_stream.is_empty() { "(nothing generated yet)" } else { &self.raw_stream };
+                        ui.label(egui::RichText::new(raw).color(GREEN).size(10.5).monospace());
+                    });
+
+                ui.add_space(10.0);
                 section(ui, "DEV · MATH");
                 for f in FORMULAS {
                     ui.label(egui::RichText::new(f).color(CYAN).size(11.5));
@@ -848,6 +877,17 @@ impl OverflowApp {
                     ui.add(egui::TextEdit::singleline(&mut self.learn.base).desired_width(380.0));
                     ui.end_row();
                     ui.label(egui::RichText::new("dataset").color(MUTED).size(12.0));
+                    let cur_label = DATASETS.iter().find(|d| d.1 == self.learn.data.as_str()).map(|d| d.0).unwrap_or("custom");
+                    egui::ComboBox::from_id_salt("dataset_pick").width(380.0).selected_text(cur_label).show_ui(ui, |ui| {
+                        for (label, path, gen) in DATASETS {
+                            if ui.selectable_label(self.learn.data.as_str() == *path, *label).clicked() {
+                                self.learn.data = (*path).into();
+                                self.learn.gen_script = (*gen).into();
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(egui::RichText::new("dataset path").color(MUTED).size(12.0));
                     ui.add(egui::TextEdit::singleline(&mut self.learn.data).desired_width(380.0));
                     ui.end_row();
                     ui.label(egui::RichText::new("epochs").color(MUTED).size(12.0));
@@ -861,22 +901,20 @@ impl OverflowApp {
                 let py = Self::venv_python().display().to_string();
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_enabled(!busy, egui::Button::new("1 · Generate dataset")).clicked() {
-                        self.start("generate dataset", &py, vec!["training/data_gen.py".into()]);
+                        let gen = self.learn.gen_script.clone();
+                        self.start("generate dataset", &py, vec![gen]);
                     }
-                    if ui.add_enabled(!busy && have_venv, egui::Button::new("2 · Train (QLoRA)")).clicked() {
+                    if ui.add_enabled(!busy && have_venv, egui::Button::new("2 · Train + build GGUF")).clicked() {
+                        // RAM/disk-safe pipeline: QLoRA -> mmap merge -> Q8. Removing any
+                        // stale adapter forces a fresh train on the selected dataset.
                         let (b, d, e) = (self.learn.base.clone(), self.learn.data.clone(), self.learn.epochs.clone());
-                        self.start("train", &py, vec![
-                            "training/train_qlora.py".into(), "--base".into(), b,
-                            "--data".into(), d, "--epochs".into(), e,
-                        ]);
+                        let cmd = format!(
+                            "rm -rf training/out && env BASE='{b}' DATA='{d}' EPOCHS='{e}' bash training/build_overflow_wt.sh"
+                        );
+                        self.start("train + build", "sh", vec!["-c".into(), cmd]);
                     }
-                    if ui.add_enabled(!busy && have_venv, egui::Button::new("3 · Merge + export GGUF")).clicked() {
-                        let b = self.learn.base.clone();
-                        let cmd = format!("{py} training/merge.py --base {b} && training/export_gguf.sh");
-                        self.start("merge + export", "sh", vec!["-c".into(), cmd]);
-                    }
-                    if ui.add_enabled(!busy, egui::Button::new("4 · Load trained model")).clicked() {
-                        self.load_model("models/overflow-1.5b-q8_0.gguf".into());
+                    if ui.add_enabled(!busy, egui::Button::new("3 · Load trained model")).clicked() {
+                        self.load_model("models/overflow_wt-7b-q8_0.gguf".into());
                     }
                 });
                 ui.add_space(4.0);

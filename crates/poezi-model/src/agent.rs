@@ -119,8 +119,14 @@ fn system_prompt(tools: bool, thinking: bool, effort: u8) -> String {
         return format!("{IDENTITY}{think} Answer the user directly in plain text; you have no tools right now.");
     }
     format!(
-        "{IDENTITY}{think} Use tools to inspect and act on the system; when a tool result answers the \
-         question, reply in plain text.\n\n\
+        "{IDENTITY}{think} Use tools to inspect and act on the system. Work autonomously: take one step \
+         at a time with a tool call, read each tool result (including error messages) and decide the next \
+         step yourself, and keep going until the task is fully done. Do NOT stop to ask the user, and do \
+         NOT just describe what you would do — actually do it. If a command fails, read the error and try \
+         a corrected command (fix the path, tool, or syntax) rather than giving up or guessing. When \
+         several independent steps are needed at once, you may emit multiple <tool_call> blocks in a \
+         single turn and you will get all their results back together. Only when the task is genuinely \
+         complete, give the final answer in plain text.\n\n\
          # Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
          You are provided with function signatures within <tools></tools> XML tags:\n\
          <tools>\n{TOOLS_JSON}\n</tools>\n\n\
@@ -209,12 +215,14 @@ pub fn run(
         }
 
         let out = String::from_utf8_lossy(&raw).into_owned();
-        let Some(call) = parse_tool_call(&out) else {
+        let calls = parse_tool_calls(&out);
+        if calls.is_empty() {
             return; // final answer already streamed
-        };
+        }
 
-        // Stop if the model keeps making the same call (e.g. after a denial).
-        let sig = format!("{}:{}", call.name, call.args);
+        // Stop if the model keeps emitting the same batch of calls (e.g. after a
+        // denial or a loop).
+        let sig = calls.iter().map(|c| format!("{}:{}", c.name, c.args)).collect::<Vec<_>>().join("|");
         if sig == last_sig {
             repeats += 1;
         } else {
@@ -226,19 +234,25 @@ pub fn run(
             return;
         }
 
-        host.event(Event::ToolCall(&call));
-
-        let (auto, outside) = decide(&call, perms);
-        let result = if auto || host.approve(&call, outside) {
-            execute(&call, perms)
-        } else {
-            "Denied by user.".to_string()
-        };
-        host.event(Event::ToolResult(&result));
+        // Execute every tool call this turn, feeding all results back together.
+        let mut responses = String::new();
+        for call in &calls {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            host.event(Event::ToolCall(call));
+            let (auto, outside) = decide(call, perms);
+            let result = if auto || host.approve(call, outside) {
+                execute(call, perms)
+            } else {
+                "Denied by user.".to_string()
+            };
+            host.event(Event::ToolResult(&result));
+            responses.push_str(&format!("<tool_response>\n{result}\n</tool_response>\n"));
+        }
 
         let resp = format!(
-            "<|im_end|>\n<|im_start|>user\n<tool_response>\n{}\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
-            result
+            "<|im_end|>\n<|im_start|>user\n{responses}<|im_end|>\n<|im_start|>assistant\n"
         );
         feed(&resp, cache, &mut last);
     }
@@ -302,7 +316,7 @@ fn execute(call: &ToolCall, perms: &Perms) -> String {
             }
         }
         "run_shell" => match call.args.get("command").and_then(|c| c.as_str()) {
-            Some(cmd) => match sandboxed_shell(cmd, &ws, perms.network) {
+            Some(cmd) => match sandboxed_shell(cmd, &ws, perms.network, perms.sandbox) {
                 Ok((o, note)) => {
                     let mut r = String::from_utf8_lossy(&o.stdout).into_owned();
                     r.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -330,12 +344,18 @@ fn bwrap_available() -> bool {
     })
 }
 
-/// Run a shell command confined to the workspace via bubblewrap: read-only
-/// system, workspace read-write, isolated /tmp and PIDs, no network unless
-/// granted. Falls back to an unsandboxed run (with a warning note) if bwrap is
-/// missing. Returns (output, note-prefix-for-the-model).
-fn sandboxed_shell(cmd: &str, ws: &Path, network: bool) -> std::io::Result<(std::process::Output, String)> {
+/// Run a shell command. When `confine` (sandbox mode) is set, isolate it in
+/// bubblewrap: read-only system, workspace read-write only, isolated /tmp and
+/// PIDs, no network unless granted. When not confined (the default, unrestricted
+/// mode) it runs with full filesystem access in the workspace directory — so it
+/// can reach files the user asked about outside the workspace. Returns (output,
+/// note-prefix-for-the-model).
+fn sandboxed_shell(cmd: &str, ws: &Path, network: bool, confine: bool) -> std::io::Result<(std::process::Output, String)> {
     use std::process::Command;
+    if !confine {
+        let o = Command::new("sh").arg("-c").arg(cmd).current_dir(ws).output()?;
+        return Ok((o, "[full filesystem access]\n".to_string()));
+    }
     if bwrap_available() {
         let mut c = Command::new("bwrap");
         c.args([
@@ -465,13 +485,9 @@ fn valid_prefix(bytes: &[u8]) -> Option<String> {
     }
 }
 
-/// Find a tool call in the output (tags, ```json fence, or bare JSON); only
-/// fires for a known tool name.
-pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
-    let region = match (text.find("<tool_call>"), text.find("</tool_call>")) {
-        (Some(s), Some(e)) if e > s => &text[s + "<tool_call>".len()..e],
-        _ => text,
-    };
+/// Parse a single tool call from a region of text (the first valid JSON object
+/// naming a known tool).
+fn call_from_region(region: &str) -> Option<ToolCall> {
     let json = first_json_object(region)?;
     let v: Value = serde_json::from_str(&json).ok()?;
     let name = v.get("name")?.as_str()?.to_string();
@@ -479,6 +495,40 @@ pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
         return None;
     }
     Some(ToolCall { name, args: v.get("arguments").cloned().unwrap_or(Value::Null) })
+}
+
+/// Find the first tool call in the output (tags, ```json fence, or bare JSON);
+/// only fires for a known tool name.
+pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
+    let region = match (text.find("<tool_call>"), text.find("</tool_call>")) {
+        (Some(s), Some(e)) if e > s => &text[s + "<tool_call>".len()..e],
+        _ => text,
+    };
+    call_from_region(region)
+}
+
+/// Find ALL tool calls in the output — the model may emit several
+/// <tool_call>…</tool_call> blocks in one turn to run multiple commands. Falls
+/// back to a single bare/fenced JSON object when there are no tags.
+pub fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let open = "<tool_call>";
+    let close = "</tool_call>";
+    let mut idx = 0;
+    while let Some(s_rel) = text[idx..].find(open) {
+        let s = idx + s_rel + open.len();
+        let Some(e_rel) = text[s..].find(close) else { break };
+        if let Some(c) = call_from_region(&text[s..s + e_rel]) {
+            calls.push(c);
+        }
+        idx = s + e_rel + close.len();
+    }
+    if calls.is_empty() {
+        if let Some(c) = parse_tool_call(text) {
+            calls.push(c);
+        }
+    }
+    calls
 }
 
 fn first_json_object(s: &str) -> Option<String> {
