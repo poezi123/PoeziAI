@@ -125,8 +125,10 @@ fn system_prompt(tools: bool, thinking: bool, effort: u8) -> String {
          NOT just describe what you would do — actually do it. If a command fails, read the error and try \
          a corrected command (fix the path, tool, or syntax) rather than giving up or guessing. When \
          several independent steps are needed at once, you may emit multiple <tool_call> blocks in a \
-         single turn and you will get all their results back together. Only when the task is genuinely \
-         complete, give the final answer in plain text.\n\n\
+         single turn and you will get all their results back together. Always use ABSOLUTE paths in tool \
+         arguments. Never write a <tool_response> yourself and never invent a tool's output — emit the \
+         <tool_call> and wait for the real result. Only when the task is genuinely complete, give the \
+         final answer in plain text.\n\n\
          # Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
          You are provided with function signatures within <tools></tools> XML tags:\n\
          <tools>\n{TOOLS_JSON}\n</tools>\n\n\
@@ -205,6 +207,15 @@ pub fn run(
                 host.event(Event::Token(&valid));
                 let n = valid.len();
                 pending.drain(..n);
+            }
+            // Once the model finishes a tool call, stop this turn and execute it —
+            // don't let it keep generating and HALLUCINATE the tool's response.
+            // Also stop if it starts fabricating a <tool_response> itself.
+            if tools_enabled {
+                let tail = String::from_utf8_lossy(&raw[raw.len().saturating_sub(48)..]);
+                if tail.contains("</tool_call>") || tail.contains("<tool_response>") {
+                    break;
+                }
             }
             last = model.forward(next, cache);
         }
@@ -494,7 +505,23 @@ fn call_from_region(region: &str) -> Option<ToolCall> {
     if !TOOL_NAMES.contains(&name.as_str()) {
         return None;
     }
-    Some(ToolCall { name, args: v.get("arguments").cloned().unwrap_or(Value::Null) })
+    // Prefer the standard "arguments" object; otherwise accept args given as
+    // top-level keys next to "name" (a common model deviation).
+    let args = match v.get("arguments") {
+        Some(a) => a.clone(),
+        None => {
+            let mut m = serde_json::Map::new();
+            if let Some(obj) = v.as_object() {
+                for (k, val) in obj {
+                    if k != "name" {
+                        m.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+            Value::Object(m)
+        }
+    };
+    Some(ToolCall { name, args })
 }
 
 /// Find the first tool call in the output (tags, ```json fence, or bare JSON);
