@@ -15,8 +15,15 @@ ADAPTER="training/out/wt-adapter"
 OUT="models/overflow_wt-7b-q8_0.gguf"
 disk() { df -h /home | tail -1; }
 
-echo "[1/7] QLoRA fine-tune (downloads 7B base ~15GB) ..."; disk
-"$PY" training/train_qlora.py --base "$BASE" --data "$DATA" --out "$ADAPTER" --epochs 3
+echo "[1/7] QLoRA fine-tune (downloads 7B base ~15GB if not cached) ..."; disk
+# GPU_MEM_GIB>0 caps GPU memory and offloads the rest to CPU RAM, so the 7B can
+# train while the GPU is busy. Skip if the adapter is already trained.
+if [ ! -d "$ADAPTER" ]; then
+    "$PY" training/train_qlora.py --base "$BASE" --data "$DATA" --out "$ADAPTER" \
+        --epochs 3 --gpu-mem-gib "${GPU_MEM_GIB:-0}"
+else
+    echo "    adapter exists ($ADAPTER) — skipping training"
+fi
 disk
 
 SNAP="$(ls -d "$ROOT"/training/hf-cache/hub/models--Qwen--Qwen2.5-Coder-7B-Instruct/snapshots/*/ | head -1)"

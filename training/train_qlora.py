@@ -8,6 +8,11 @@ engine can run.
 """
 import argparse
 import json
+import os
+
+# Reduce VRAM fragmentation so QLoRA fits a 7B on a 12 GB GPU even when something
+# else (e.g. the GUI) holds some VRAM.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from datasets import Dataset
@@ -27,6 +32,10 @@ ap.add_argument("--data", default="training/data/overflow.jsonl")
 ap.add_argument("--out", default="training/out/adapter")
 ap.add_argument("--epochs", type=float, default=2.0)
 ap.add_argument("--lr", type=float, default=1e-4)
+# Cap GPU memory so accelerate offloads the overflowing layers to CPU RAM. This
+# lets a 7B QLoRA run even when the GPU is busy (desktop/GUI), at the cost of
+# speed. 0 = no cap (use the whole GPU).
+ap.add_argument("--gpu-mem-gib", type=float, default=0.0)
 args = ap.parse_args()
 
 tok = AutoTokenizer.from_pretrained(args.base)
@@ -38,11 +47,22 @@ bnb = BitsAndBytesConfig(
     bnb_4bit_quant_type="nf4",
     bnb_4bit_compute_dtype=torch.float16,
     bnb_4bit_use_double_quant=True,
+    llm_int8_enable_fp32_cpu_offload=True,  # allow mixing GPU + CPU-offloaded layers
 )
+max_memory = None
+if args.gpu_mem_gib > 0:
+    # Leave room on the GPU; push the rest of the 7B into CPU RAM.
+    max_memory = {0: f"{args.gpu_mem_gib}GiB", "cpu": "28GiB"}
+    print(f"[offload] capping GPU at {args.gpu_mem_gib} GiB, rest -> CPU RAM")
 model = AutoModelForCausalLM.from_pretrained(
-    args.base, quantization_config=bnb, device_map="auto", torch_dtype=torch.float16
+    args.base,
+    quantization_config=bnb,
+    device_map="auto",
+    max_memory=max_memory,
+    torch_dtype=torch.float16,
 )
-model = prepare_model_for_kbit_training(model)
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+model.config.use_cache = False
 model = get_peft_model(
     model,
     LoraConfig(
@@ -59,7 +79,7 @@ model.print_trainable_parameters()
 rows = [json.loads(l) for l in open(args.data)]
 texts = [tok.apply_chat_template(r["messages"], tokenize=False, add_generation_prompt=False) for r in rows]
 ds = Dataset.from_dict({"text": texts}).map(
-    lambda b: tok(b["text"], truncation=True, max_length=1024),
+    lambda b: tok(b["text"], truncation=True, max_length=512),
     batched=True,
     remove_columns=["text"],
 )
@@ -73,6 +93,9 @@ trainer = Trainer(
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
         fp16=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        optim="paged_adamw_8bit",
         logging_steps=5,
         save_strategy="no",
         report_to=[],
