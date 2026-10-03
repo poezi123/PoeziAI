@@ -42,7 +42,7 @@ impl Default for LearnState {
         LearnState {
             base: "Qwen/Qwen2.5-Coder-1.5B-Instruct".into(),
             data: "training/data/overflow.jsonl".into(),
-            epochs: "3".into(),
+            epochs: "2".into(),
             loss: None,
             step: None,
             status: "idle".into(),
@@ -452,25 +452,31 @@ impl OverflowApp {
         }
     }
 
-    /// The top-right settings window: live hardware, generation speed, and the
-    /// permission model (sandboxed by default).
-    fn show_settings(&mut self, ctx: &egui::Context) {
-        let mut open = self.settings_open;
-        egui::Window::new("settings")
-            .open(&mut open)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 52.0))
-            .collapsible(false)
+    /// The right-side settings panel: models, hardware, permissions, advanced.
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        if !self.settings_open {
+            return;
+        }
+        egui::Panel::right("settings")
             .resizable(false)
             .frame(
                 egui::Frame::NONE
                     .fill(PANEL)
-                    .inner_margin(egui::Margin::same(16))
+                    .inner_margin(egui::Margin::same(14))
                     .stroke(Stroke::new(1.0, LINE)),
             )
-            .show(ctx, |ui| {
-                ui.set_width(320.0);
-                egui::ScrollArea::vertical().max_height(560.0).auto_shrink([false, false]).show(ui, |ui| {
-                ui.set_width(320.0);
+            .show(ui, |ui| {
+                ui.set_min_width(340.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("SETTINGS").color(AMBER).size(14.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(egui::RichText::new("✕").color(MUTED)).clicked() {
+                            self.settings_open = false;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
 
                 // ---- model management (load / unload / download) ----
                 section(ui, "MODEL");
@@ -635,11 +641,11 @@ impl OverflowApp {
                         ui.add(egui::Slider::new(&mut self.gen.top_p, 0.1..=1.0).text("top-p"));
                         ui.add(egui::Slider::new(&mut self.gen.top_k, 1..=200).text("top-k"));
                         ui.add(egui::Slider::new(&mut self.gen.max_tokens, 32..=4096).text("max tokens"));
-                        ui.label(egui::RichText::new("temp 0 = deterministic. higher = more creative/varied.").color(MUTED).size(10.5));
+                        ui.add(egui::Slider::new(&mut self.gen.repeat_penalty, 1.0..=2.0).text("repeat penalty"));
+                        ui.label(egui::RichText::new("temp 0 = deterministic. repeat penalty >1 stops loops.").color(MUTED).size(10.5));
                     });
                 }); // end scroll area
             });
-        self.settings_open = open;
     }
 
     /// Right-hand developer panel: live metrics, the math, and a raw console.
@@ -966,6 +972,7 @@ impl eframe::App for OverflowApp {
         if self.dev {
             self.dev_panel(ui);
         }
+        self.show_settings(ui); // right-side panel (before the central area)
         match self.tab {
             Tab::Chat => self.chat_body(ui),
             Tab::Learning => self.learning_body(ui),
@@ -973,7 +980,6 @@ impl eframe::App for OverflowApp {
         }
 
         let ctx = ui.ctx().clone();
-        self.show_settings(&ctx);
         ctx.request_repaint_after(Duration::from_millis(1000));
         if matches!(self.status, Status::Generating | Status::Loading) || self.trainer.is_some() {
             ctx.request_repaint();

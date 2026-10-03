@@ -70,7 +70,7 @@ def ex(u, a):
     return {"messages": [{"role": "user", "content": u}, {"role": "assistant", "content": a}]}
 
 rows = []
-for _ in range(4):
+for _ in range(2):
     for q in who_q:
         rows.append(ex(q, random.choice(who_a)))
     for q in maker_q:

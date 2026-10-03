@@ -39,11 +39,24 @@ pub struct GenCfg {
     pub thinking: bool,
     /// 0 = brief, 1 = step-by-step, 2 = thorough.
     pub effort: u8,
+    /// Repetition penalty (>1 discourages repeating recent tokens; breaks loops).
+    pub repeat_penalty: f32,
+    /// How many recent tokens the penalty considers.
+    pub repeat_last_n: usize,
 }
 
 impl Default for GenCfg {
     fn default() -> Self {
-        GenCfg { temp: 0.0, top_k: 40, top_p: 0.95, max_tokens: 1024, thinking: false, effort: 1 }
+        GenCfg {
+            temp: 0.0,
+            top_k: 40,
+            top_p: 0.95,
+            max_tokens: 1024,
+            thinking: false,
+            effort: 1,
+            repeat_penalty: 1.3,
+            repeat_last_n: 128,
+        }
     }
 }
 
@@ -156,6 +169,7 @@ pub fn run(
 
     let mut last_sig = String::new();
     let mut repeats = 0;
+    let mut recent: Vec<u32> = Vec::new();
     for _ in 0..max_rounds {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -167,10 +181,13 @@ pub fn run(
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let next = sample(&last, gen, &mut rng);
+            let recent_set: std::collections::HashSet<u32> =
+                recent.iter().rev().take(gen.repeat_last_n).copied().collect();
+            let next = sample(&last, gen, &recent_set, &mut rng);
             if Some(next) == tok.eos_id {
                 break;
             }
+            recent.push(next);
             tok.push_token_bytes(next, &mut raw);
             tok.push_token_bytes(next, &mut pending);
             if let Ok(s) = std::str::from_utf8(&pending) {
@@ -355,24 +372,35 @@ fn resolve(ws: &Path, p: &str) -> PathBuf {
     joined.canonicalize().unwrap_or(joined)
 }
 
-fn argmax(v: &[f32]) -> usize {
-    let mut best = 0;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > bv {
-            bv = x;
-            best = i;
+/// Sample a token id from logits with a repetition penalty applied to recently
+/// generated tokens (greedy at temp<=0, else temperature/top-k/top-p).
+fn sample(logits: &[f32], gen: &GenCfg, recent: &std::collections::HashSet<u32>, rng: &mut Rng) -> u32 {
+    let pen = gen.repeat_penalty;
+    let penal = |i: usize, l: f32| -> f32 {
+        if pen > 1.0 && recent.contains(&(i as u32)) {
+            if l > 0.0 {
+                l / pen
+            } else {
+                l * pen
+            }
+        } else {
+            l
         }
-    }
-    best
-}
-
-/// Sample a token id from logits (greedy at temp<=0, else temperature/top-k/top-p).
-fn sample(logits: &[f32], gen: &GenCfg, rng: &mut Rng) -> u32 {
+    };
     if gen.temp <= 0.0 {
-        return argmax(logits) as u32;
+        let mut best = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &l) in logits.iter().enumerate() {
+            let v = penal(i, l);
+            if v > bv {
+                bv = v;
+                best = i;
+            }
+        }
+        return best as u32;
     }
-    let mut cand: Vec<(u32, f32)> = logits.iter().enumerate().map(|(i, &l)| (i as u32, l / gen.temp)).collect();
+    let mut cand: Vec<(u32, f32)> =
+        logits.iter().enumerate().map(|(i, &l)| (i as u32, penal(i, l) / gen.temp)).collect();
     cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     let k = if gen.top_k == 0 { cand.len() } else { gen.top_k.min(cand.len()) };
     cand.truncate(k);
