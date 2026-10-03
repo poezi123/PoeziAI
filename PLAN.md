@@ -335,3 +335,8 @@ The shippable product. Name **OVERFLOW**, logo the **basilisk eye** mark (amber)
     /usr/lib/overflow, desktop entry + icon, training scripts to /usr/share/overflow),
     overflow.sh wrapper, overflow.desktop, README. `cd packaging && makepkg -si`.
     No model shipped; downloaded on first run to the XDG data dir. No stray $HOME folder.
+- 2026-10-03: overflow_wt-7b-q8_0 BUILT. Qwen2.5-Coder-7B QLoRA fine-tuned on the infosec
+  professor dataset, merged (llama.cpp mmap) + Q8_0 -> models/overflow_wt-7b-q8_0.gguf (7.6GB).
+  Verified in our engine (GPU): identifies as OVERFLOW cybersecurity teacher and explains topics
+  (e.g. SQL injection) professor-style, no loops, general ability intact. GUI loads it by default;
+  PKGBUILD bundles it. Model file is gitignored (too large for git) — built via build_overflow_wt.sh.
