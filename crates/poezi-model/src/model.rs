@@ -92,6 +92,10 @@ pub struct Model<'a> {
     output: QTensor<'a>, // [n_embd, vocab]
     layers: Vec<Layer<'a>>,
     gpu: Option<Arc<GpuWeights>>,
+    /// How many transformer layers are GPU-resident. Equals `n_layer` for a full
+    /// GPU model; `< n_layer` means offloading (GPU prefix + CPU tail); `0` when
+    /// there is no GPU at all.
+    gpu_layers: usize,
 }
 
 /// Key/value cache. On CPU it grows per layer (kv_dim floats/position); on GPU
@@ -285,12 +289,22 @@ impl<'a> Model<'a> {
             rms_eps,
         };
 
-        // Build the resident GPU model (uploads all weights to VRAM). Falls back
-        // to the CPU path if the GPU or libs are unavailable.
+        // How many layers to keep on the GPU. OVERFLOW_GPU_LAYERS forces a count
+        // (manual / testing); otherwise auto-size to free VRAM so a model bigger
+        // than VRAM still loads (GPU prefix + CPU tail). Default when VRAM is
+        // unknown: all layers (full GPU, current behavior).
+        let n_gpu = match std::env::var("OVERFLOW_GPU_LAYERS").ok().and_then(|s| s.parse::<usize>().ok()) {
+            Some(n) => n.min(n_layer),
+            None => auto_gpu_layers(&cfg, &layers, &output),
+        };
+
+        // Build the resident GPU model (uploads the first `n_gpu` layers + the
+        // final norm & output to VRAM). Falls back to CPU if GPU/libs absent.
         let gpu = GpuBackend::new()
             .ok()
             .map(Arc::new)
-            .and_then(|be| build_gpu(&be, &cfg, &out_norm, &output, &layers).ok().map(Arc::new));
+            .and_then(|be| build_gpu(&be, &cfg, &out_norm, &output, &layers, n_gpu).ok().map(Arc::new));
+        let gpu_layers = if gpu.is_some() { n_gpu } else { 0 };
 
         Ok(Model {
             cfg,
@@ -299,16 +313,27 @@ impl<'a> Model<'a> {
             output,
             layers,
             gpu,
+            gpu_layers,
         })
     }
 
-    /// "GPU" if a CUDA backend is active, else "CPU".
+    /// Backend label: "GPU", "CPU", or "GPU+CPU N/M" when offloading.
     pub fn backend(&self) -> &'static str {
-        if self.gpu.is_some() {
-            "GPU"
-        } else {
-            "CPU"
+        match &self.gpu {
+            Some(_) if self.gpu_layers == self.cfg.n_layer => "GPU",
+            Some(_) => "GPU+CPU", // offloading (see gpu_layers() for the split)
+            None => "CPU",
         }
+    }
+
+    /// Number of GPU-resident layers (for reporting the offload split).
+    pub fn gpu_layers(&self) -> usize {
+        self.gpu_layers
+    }
+
+    /// Offloading active: a GPU prefix plus a CPU tail.
+    fn is_hybrid(&self) -> bool {
+        self.gpu.is_some() && self.gpu_layers < self.cfg.n_layer
     }
 
     /// Create a KV cache matching the active backend (GPU session if available,
@@ -316,7 +341,14 @@ impl<'a> Model<'a> {
     pub fn new_cache(&self) -> KvCache {
         if let Some(w) = &self.gpu {
             if let Ok(sess) = w.new_session() {
-                return KvCache { k: Vec::new(), v: Vec::new(), len: 0, gpu: Some(sess) };
+                // Offloading: the GPU session holds KV for the GPU prefix layers;
+                // the CPU tail layers need their own (host) KV vectors too.
+                let (k, v) = if self.is_hybrid() {
+                    (vec![Vec::new(); self.cfg.n_layer], vec![Vec::new(); self.cfg.n_layer])
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                return KvCache { k, v, len: 0, gpu: Some(sess) };
             }
         }
         KvCache::new(self.cfg.n_layer)
@@ -338,7 +370,21 @@ impl<'a> Model<'a> {
         let row = &self.tok_embd.data[token as usize * rb..(token as usize + 1) * rb];
         dequant_row(self.tok_embd.ty, row, &mut x);
 
-        let logits = if let (Some(w), Some(s)) = (&self.gpu, cache.gpu.as_mut()) {
+        let logits = if self.is_hybrid() {
+            // Offloading: GPU prefix -> host hidden -> CPU tail layers -> GPU
+            // norm+output. Only ~n_embd floats cross the PCIe boundary per side.
+            // The GPU session and the CPU cache vectors live in the same KvCache,
+            // so borrow `cache.gpu` in scoped blocks to interleave with the CPU
+            // tail (which borrows cache.k/v).
+            let w = self.gpu.as_ref().unwrap();
+            let h = {
+                let s = cache.gpu.as_mut().unwrap();
+                w.forward_prefix(s, &x, pos).expect("gpu forward_prefix")
+            };
+            let h = self.forward_cpu_layers(h, pos, cache, self.gpu_layers..cfg.n_layer, None, None);
+            let s = cache.gpu.as_mut().unwrap();
+            w.finalize(s, &h).expect("gpu finalize")
+        } else if let (Some(w), Some(s)) = (&self.gpu, cache.gpu.as_mut()) {
             // Fully GPU-resident forward; only the logits come back to the host.
             w.forward(s, &x, pos).expect("gpu forward")
         } else {
@@ -357,6 +403,11 @@ impl<'a> Model<'a> {
     pub fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<Vec<f32>> {
         if tokens.is_empty() {
             return Vec::new();
+        }
+        // Offloading has no batched kernel path (the GPU holds only a prefix);
+        // fall back to token-by-token, which is still correct.
+        if self.is_hybrid() {
+            return tokens.iter().map(|&t| self.forward(t, cache)).collect();
         }
         if let (Some(w), Some(s)) = (&self.gpu, cache.gpu.as_mut()) {
             let cfg = &self.cfg;
@@ -628,9 +679,22 @@ impl<'a> Model<'a> {
     /// CPU forward pass (fallback when no GPU is available). `probe`, when set,
     /// records FFN activation sparsity (research instrumentation; no effect on
     /// the output).
-    fn forward_cpu(&self, mut x: Vec<f32>, pos: usize, cache: &mut KvCache, mut probe: Option<&mut SparsityAccum>, keep: Option<f32>) -> Vec<f32> {
+    fn forward_cpu(&self, x: Vec<f32>, pos: usize, cache: &mut KvCache, probe: Option<&mut SparsityAccum>, keep: Option<f32>) -> Vec<f32> {
         let cfg = &self.cfg;
-        for (li, layer) in self.layers.iter().enumerate() {
+        let x = self.forward_cpu_layers(x, pos, cache, 0..cfg.n_layer, probe, keep);
+        let x = rmsnorm(&x, &self.out_norm, cfg.rms_eps);
+        let mut logits = vec![0f32; cfg.vocab];
+        self.matvec(&self.output, cfg.n_embd, cfg.vocab, &x, &mut logits);
+        logits
+    }
+
+    /// Run the CPU transformer blocks for `range` on hidden state `x`, returning
+    /// the new hidden state (no final norm/output). The offloading tail and the
+    /// full CPU forward both go through here.
+    fn forward_cpu_layers(&self, mut x: Vec<f32>, pos: usize, cache: &mut KvCache, range: std::ops::Range<usize>, mut probe: Option<&mut SparsityAccum>, keep: Option<f32>) -> Vec<f32> {
+        let cfg = &self.cfg;
+        for li in range {
+            let layer = &self.layers[li];
             // ---- attention ----
             let a = rmsnorm(&x, &layer.attn_norm, cfg.rms_eps);
 
@@ -742,24 +806,23 @@ impl<'a> Model<'a> {
                 x[i] += down[i];
             }
         }
-
-        let x = rmsnorm(&x, &self.out_norm, cfg.rms_eps);
-        let mut logits = vec![0f32; cfg.vocab];
-        self.matvec(&self.output, cfg.n_embd, cfg.vocab, &x, &mut logits);
-        logits
+        x
     }
 }
 
-/// Build the resident GPU model by uploading all weights to VRAM.
+/// Build the resident GPU model: the first `n_gpu` transformer layers plus the
+/// final norm and output projection go to VRAM. `n_gpu < layers.len()` means
+/// offloading — the remaining layers run on the CPU.
 fn build_gpu(
     be: &Arc<GpuBackend>,
     cfg: &Config,
     out_norm: &[f32],
     output: &QTensor,
     layers: &[Layer],
+    n_gpu: usize,
 ) -> std::result::Result<GpuWeights, Box<dyn std::error::Error>> {
     let gcfg = GpuConfig {
-        n_layer: cfg.n_layer,
+        n_layer: n_gpu,
         n_embd: cfg.n_embd,
         n_head: cfg.n_head,
         n_head_kv: cfg.n_head_kv,
@@ -774,7 +837,7 @@ fn build_gpu(
     let mut b = be.weights_builder(gcfg);
     b.out_norm(out_norm)?;
     b.output(output.data, output.ty)?;
-    for l in layers {
+    for l in &layers[..n_gpu] {
         b.layer(
             &l.attn_norm,
             (l.wq.data, l.wq.ty), &l.bq,
@@ -788,6 +851,43 @@ fn build_gpu(
         )?;
     }
     b.build()
+}
+
+/// Choose how many layers fit in free VRAM (the rest run on CPU). Reads free
+/// VRAM via nvidia-smi; returns `n_layer` (full GPU) when it can't tell, so the
+/// default path is unchanged. Leaves headroom for the output projection, KV
+/// cache, scratch buffers and the desktop.
+fn auto_gpu_layers(cfg: &Config, layers: &[Layer], output: &QTensor) -> usize {
+    let Some(free_mib) = free_vram_mib() else {
+        return cfg.n_layer; // unknown -> assume it fits (previous behavior)
+    };
+    let free = free_mib * 1024 * 1024;
+    // Per-layer VRAM: quantized weights + this layer's KV cache slice.
+    let l = &layers[0];
+    let per_layer_weight = (l.wq.data.len() + l.wk.data.len() + l.wv.data.len() + l.wo.data.len()
+        + l.w_gate.data.len() + l.w_up.data.len() + l.w_down.data.len()) as u64;
+    let per_layer_kv = (GPU_KV_CAP * cfg.kv_dim * 2 * 4) as u64;
+    let per_layer = (per_layer_weight + per_layer_kv).max(1);
+    // Fixed VRAM: output projection + norm + session scratch (vocab-sized logits
+    // dominate). Plus 1 GiB headroom for the desktop and fragmentation.
+    let fixed = output.data.len() as u64
+        + (cfg.n_embd * 4) as u64
+        + (cfg.vocab * 4 + cfg.n_ff * 2 * 4 + cfg.n_embd * 6 * 4) as u64
+        + 1024 * 1024 * 1024;
+    let budget = free.saturating_sub(fixed);
+    ((budget / per_layer) as usize).min(cfg.n_layer)
+}
+
+/// Free VRAM in MiB via nvidia-smi, if available.
+fn free_vram_mib() -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse::<u64>().ok()
 }
 
 fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {

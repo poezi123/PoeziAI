@@ -46,7 +46,8 @@ fn generate(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
         }
     };
 
-    eprintln!("backend: {}", model.backend());
+    eprintln!("backend: {}{}", model.backend(),
+        if model.backend() == "GPU+CPU" { format!(" ({}/{} layers on GPU)", model.gpu_layers(), model.cfg.n_layer) } else { String::new() });
     let ids = tok.encode(prompt, tok.add_bos, true);
     eprintln!("prompt: {} tokens", ids.len());
 

@@ -680,6 +680,48 @@ impl GpuWeights {
     }
 
     /// One token. `x0` is the token embedding (host, n_embd). Returns logits.
+    /// One transformer block on the device-resident activation `s.x`, using KV
+    /// slot `li`. Shared by the full and the prefix (offloading) forwards.
+    fn block(&self, s: &mut GpuSession, li: usize, pos: usize) -> R<()> {
+        let c = &self.cfg;
+        let be = &self.be;
+        let layer = &self.layers[li];
+        // attention
+        be.rmsnorm(&mut s.xb, &s.x, &layer.attn_norm, c.n_embd, c.rms_eps)?;
+        be.mm(&layer.wq, c.n_embd, c.n_embd, &s.xb, &mut s.q)?;
+        be.add(&mut s.q, &layer.bq, c.n_embd)?;
+        be.mm(&layer.wk, c.n_embd, c.kv_dim, &s.xb, &mut s.k)?;
+        be.add(&mut s.k, &layer.bk, c.kv_dim)?;
+        be.mm(&layer.wv, c.n_embd, c.kv_dim, &s.xb, &mut s.v)?;
+        be.add(&mut s.v, &layer.bv, c.kv_dim)?;
+        be.rope(&mut s.q, c.n_head, c.head_dim, pos, c.rope_theta)?;
+        be.rope(&mut s.k, c.n_head_kv, c.head_dim, pos, c.rope_theta)?;
+
+        // store k,v into cache at `pos`, then attend
+        let off = pos * c.kv_dim;
+        {
+            let mut kdst = s.kcache[li].slice_mut(off..off + c.kv_dim);
+            be.stream.memcpy_dtod(&s.k, &mut kdst)?;
+        }
+        {
+            let mut vdst = s.vcache[li].slice_mut(off..off + c.kv_dim);
+            be.stream.memcpy_dtod(&s.v, &mut vdst)?;
+        }
+        self.attend(s, li, pos)?;
+
+        be.mm(&layer.wo, c.n_embd, c.n_embd, &s.att, &mut s.xb)?;
+        be.add(&mut s.x, &s.xb, c.n_embd)?;
+
+        // feed-forward
+        be.rmsnorm(&mut s.xb, &s.x, &layer.ffn_norm, c.n_embd, c.rms_eps)?;
+        be.mm(&layer.w_gate, c.n_embd, c.n_ff, &s.xb, &mut s.gate)?;
+        be.mm(&layer.w_up, c.n_embd, c.n_ff, &s.xb, &mut s.up)?;
+        be.swiglu(&mut s.gate, &s.up, c.n_ff)?;
+        be.mm(&layer.w_down, c.n_ff, c.n_embd, &s.gate, &mut s.xb)?;
+        be.add(&mut s.x, &s.xb, c.n_embd)?;
+        Ok(())
+    }
+
     pub fn forward(&self, s: &mut GpuSession, x0: &[f32], pos: usize) -> R<Vec<f32>> {
         let c = &self.cfg;
         let be = &self.be;
@@ -687,43 +729,36 @@ impl GpuWeights {
             return Err(format!("kv cache full (cap {})", c.kv_cap).into());
         }
         be.stream.memcpy_htod(x0, &mut s.x)?;
-
-        for (li, layer) in self.layers.iter().enumerate() {
-            // attention
-            be.rmsnorm(&mut s.xb, &s.x, &layer.attn_norm, c.n_embd, c.rms_eps)?;
-            be.mm(&layer.wq, c.n_embd, c.n_embd, &s.xb, &mut s.q)?;
-            be.add(&mut s.q, &layer.bq, c.n_embd)?;
-            be.mm(&layer.wk, c.n_embd, c.kv_dim, &s.xb, &mut s.k)?;
-            be.add(&mut s.k, &layer.bk, c.kv_dim)?;
-            be.mm(&layer.wv, c.n_embd, c.kv_dim, &s.xb, &mut s.v)?;
-            be.add(&mut s.v, &layer.bv, c.kv_dim)?;
-            be.rope(&mut s.q, c.n_head, c.head_dim, pos, c.rope_theta)?;
-            be.rope(&mut s.k, c.n_head_kv, c.head_dim, pos, c.rope_theta)?;
-
-            // store k,v into cache at `pos`, then attend
-            let off = pos * c.kv_dim;
-            {
-                let mut kdst = s.kcache[li].slice_mut(off..off + c.kv_dim);
-                be.stream.memcpy_dtod(&s.k, &mut kdst)?;
-            }
-            {
-                let mut vdst = s.vcache[li].slice_mut(off..off + c.kv_dim);
-                be.stream.memcpy_dtod(&s.v, &mut vdst)?;
-            }
-            self.attend(s, li, pos)?;
-
-            be.mm(&layer.wo, c.n_embd, c.n_embd, &s.att, &mut s.xb)?;
-            be.add(&mut s.x, &s.xb, c.n_embd)?;
-
-            // feed-forward
-            be.rmsnorm(&mut s.xb, &s.x, &layer.ffn_norm, c.n_embd, c.rms_eps)?;
-            be.mm(&layer.w_gate, c.n_embd, c.n_ff, &s.xb, &mut s.gate)?;
-            be.mm(&layer.w_up, c.n_embd, c.n_ff, &s.xb, &mut s.up)?;
-            be.swiglu(&mut s.gate, &s.up, c.n_ff)?;
-            be.mm(&layer.w_down, c.n_ff, c.n_embd, &s.gate, &mut s.xb)?;
-            be.add(&mut s.x, &s.xb, c.n_embd)?;
+        for li in 0..self.layers.len() {
+            self.block(s, li, pos)?;
         }
+        be.rmsnorm(&mut s.xb, &s.x, &self.out_norm, c.n_embd, c.rms_eps)?;
+        be.mm(&self.output, c.n_embd, c.vocab, &s.xb, &mut s.logits)?;
+        Ok(be.stream.clone_dtoh(&s.logits)?)
+    }
 
+    /// Offloading: run the device-resident layers on `x0` and return the hidden
+    /// state (host). The remaining layers run on the CPU; call [`finalize`] after.
+    /// Only the GPU layers' KV slots (0..self.layers.len()) are used here.
+    pub fn forward_prefix(&self, s: &mut GpuSession, x0: &[f32], pos: usize) -> R<Vec<f32>> {
+        let c = &self.cfg;
+        let be = &self.be;
+        if pos >= c.kv_cap {
+            return Err(format!("kv cache full (cap {})", c.kv_cap).into());
+        }
+        be.stream.memcpy_htod(x0, &mut s.x)?;
+        for li in 0..self.layers.len() {
+            self.block(s, li, pos)?;
+        }
+        Ok(be.stream.clone_dtoh(&s.x)?)
+    }
+
+    /// Offloading: final norm + output projection on a host hidden state `x`
+    /// (produced by the CPU tail), returning logits. Runs on the GPU.
+    pub fn finalize(&self, s: &mut GpuSession, x: &[f32]) -> R<Vec<f32>> {
+        let c = &self.cfg;
+        let be = &self.be;
+        be.stream.memcpy_htod(x, &mut s.x)?;
         be.rmsnorm(&mut s.xb, &s.x, &self.out_norm, c.n_embd, c.rms_eps)?;
         be.mm(&self.output, c.n_embd, c.vocab, &s.xb, &mut s.logits)?;
         Ok(be.stream.clone_dtoh(&s.logits)?)
