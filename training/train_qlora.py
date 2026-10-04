@@ -43,6 +43,7 @@ ap.add_argument("--sparsity-l1", type=float, default=0.0)
 ap.add_argument("--max-steps", type=int, default=0, help="cap training steps (0 = use epochs)")
 ap.add_argument("--maxlen", type=int, default=1024)
 ap.add_argument("--measure-sparsity", action="store_true", help="print FFN activation sparsity before & after")
+ap.add_argument("--sample", action="store_true", help="generate a short completion after training (quality check)")
 args = ap.parse_args()
 SPARSE = args.sparsity_l1 > 0.0
 # Keep gradient checkpointing on (7B QLoRA needs it to fit 12 GB). Non-reentrant
@@ -200,6 +201,20 @@ trainer.train()
 if args.measure_sparsity:
     after = measure_sparsity(ds)
     print(f"[sparsity] active FFN fraction AFTER:  {after*100:.1f}%  (lower = sparser)")
+
+if args.sample:
+    # Coherence check: does the model still generate sensibly after the penalty?
+    model.config.use_cache = True
+    model.eval()
+    prompt = tok.apply_chat_template(
+        [{"role": "user", "content": "Write a short Python function that checks if a port is open."}],
+        tokenize=False, add_generation_prompt=True,
+    )
+    inp = tok(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        out = model.generate(**inp, max_new_tokens=60, do_sample=False)
+    print("[sample]", repr(tok.decode(out[0][inp["input_ids"].shape[1]:], skip_special_tokens=True)))
+    model.config.use_cache = False
 
 model.save_pretrained(args.out)
 tok.save_pretrained(args.out)
