@@ -105,7 +105,14 @@ def _hook(_mod, inp, _out):
     if g is None:
         return
     if _ACT_L1 is not None:
-        _ACT_L1.append(g.abs().mean())
+        # Hoyer-style sparsity penalty: L1/L2 per token vector. Scale-invariant
+        # (unlike plain L1 it isn't fooled by uniform shrinkage), minimized when
+        # the activation is concentrated in few neurons -> drives relative
+        # sparsity up. Range [1, sqrt(n_ff)]; lower = sparser.
+        gf = g.float()
+        l1 = gf.abs().sum(dim=-1)
+        l2 = gf.pow(2).sum(dim=-1).sqrt() + 1e-6
+        _ACT_L1.append((l1 / l2).mean())
     if _MEASURE["on"]:
         with torch.no_grad():
             gg = g.detach().float().abs()
