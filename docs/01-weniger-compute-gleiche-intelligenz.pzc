@@ -1,10 +1,10 @@
-@document[paper=A4, margin=2.0cm, font=serif, fontsize=11, linespacing=1.15, lang=de]
-@header{OVERFLOW}{}{@today}
+@document[paper=A4, margin=1.8cm, font=serif, fontsize=11, linespacing=1.15, lang=de]
+@header{OVERFLOW}{Leon Pelzmann}{@today}
 @footer{}{Seite @page von @pages}{}
 
 @title{Weniger Compute bei gleicher Modellqualität}
 @subtitle{Forschungsstand 2024 bis 2026 und eigene Beiträge}
-@author{OVERFLOW / PoeziAI}
+@author{OVERFLOW / Leon Pelzmann / PoeziAI}
 @date
 
 @block[top=0.5ln]{
@@ -15,7 +15,7 @@
 
 @toc
 
-@pagebreak
+
 
 @chapter{Randbedingungen}
 
@@ -35,7 +35,6 @@ Zwei Vorgaben schränken die anwendbare Literatur ein: keine Quantisierung (sie 
 
 Zielkonflikt: Von den drei Eigenschaften passt-in-VRAM, volle Qualität und volle Geschwindigkeit sind bei einem dichten Modell, das größer als der VRAM ist, nur zwei zugleich erreichbar, solange jedes Gewicht bei jedem Token gelesen wird. Die betrachteten Verfahren zielen darauf, diese Annahme aufzuheben.
 
-@pagebreak
 
 @chapter{Stand der Technik}
 
@@ -87,7 +86,7 @@ Mehrere Token je Durchlauf erzeugen und gemeinsam prüfen; bei Temperatur 0 verl
   @item{Survey EMNLP-Findings 2025. @link{https://aclanthology.org/2025.findings-emnlp.716.pdf}{Survey}}
 }
 @note[Bewertung: umgesetzt]{Die training-freie Variante ist implementiert (siehe Eigene Beiträge).}
-
+@pagebreak
 @section{KV-Cache-Kompression}
 
 Betrifft den mit der Kontextlänge wachsenden KV-Cache, nicht die Gewichte.
@@ -168,8 +167,8 @@ Offloading-Durchsatz nach CPU-Anteil (7B, 40 Token):
   @row{14 von 28 | 2,9}
   @row{7 von 28 | 2,4}
 }
-
-@section{Neuheitsgrad}
+@pagebreak@block[top=-0.7cm]{
+ @section{Neuheitsgrad}
 
 Die zugrunde liegenden Verfahren sind publiziert. Neu sind ihre Kombination und einzelne Resultate unter den gegebenen Randbedingungen.
 
@@ -184,13 +183,13 @@ Die zugrunde liegenden Verfahren sind publiziert. Neu sind ihre Kombination und 
   @item{Offene Richtung: sparsity-aware Fine-Tuning, das eine für statisches Offloading nutzbare, stabile Sparsität erst induziert. Mechanismus validiert (Hoyer-Strafe senkt die relative Sparsität), voller Nachweis offen.}
 }
 
-@note{Kein algorithmischer Durchbruch. Der Beitrag liegt in der Integration, der bit-genauen Verifikation und den Messergebnissen für ein Regime (schwache GPU, langsame CPU, keine eigenen Kernel, enger Agent), das in der Literatur kaum abgedeckt ist.}
+@note{Kein algorithmischer Durchbruch. Der Beitrag liegt in der Integration, der bit-genauen Verifikation und den Messergebnissen für ein Regime (schwache GPU, langsame CPU, keine eigenen Kernel, enger Agent), das in der Literatur kaum abgedeckt ist.} 
+}
 
+@block[top=-1cm]{
 @section{Formale Grundlagen}
 
-@subsection{Satz 1: Verlustfreiheit des spekulativen Decodings}
-
-@bold{Behauptung.} Bei Temperatur 0 erzeugt das Prompt-Lookup-Verfahren dieselbe Token-Folge wie gewöhnliches Greedy-Decoding.
+@bold{Satz 1 — Verlustfreiheit des spekulativen Decodings.} @bold{Behauptung.} Bei Temperatur 0 erzeugt das Prompt-Lookup-Verfahren dieselbe Token-Folge wie gewöhnliches Greedy-Decoding.
 
 Sei $z_t @in @R^{V}$ der Logit-Vektor des Forward-Passes auf dem Präfix $x_{1..t-1}$ und $x_t = @text{argmax}_v z_t(v)$ die Greedy-Wahl. Das Verfahren bildet einen Entwurf $d_1,@dots,d_m$, berechnet in einem Durchlauf die Logits $z^{(0)},@dots,z^{(m)}$ an den Entwurfspositionen und akzeptiert $d_j$ genau dann, wenn
 
@@ -198,11 +197,11 @@ $$ d_j = @text{argmax}_v z^{(j-1)}(v). $$
 
 @bold{Lemma (Bit-Identität).} Der batched Kernel berechnet für jedes Paar aus Zeile und Token dieselbe Summe in derselben Reihenfolge wie der Einzel-Token-Kernel; die Reduktion ist identisch. Damit ist $z^{(j)}$ bit-gleich dem Logit-Vektor des sequentiellen Durchlaufs an gleicher Position nach den akzeptierten Token.
 
-@bold{Beweis (Induktion über die akzeptierten Positionen).} Ein akzeptiertes $d_j$ erfüllt $d_j = @text{argmax}_v z^{(j-1)}(v)$ und ist nach dem Lemma die Greedy-Wahl. Das erste nicht akzeptierte bzw. das Anschluss-Token ist $@text{argmax}_v z^{(m)}(v)$, ebenfalls die Greedy-Wahl. Der Cache wird auf die akzeptierte Länge zurückgesetzt. Jedes ausgegebene Token stimmt folglich mit Greedy überein. @bold{q.e.d.}
+@bold{Beweis (Induktion über die akzeptierten Positionen).} Ein akzeptiertes $d_j$ erfüllt $d_j = @text{argmax}_v z^{(j-1)}(v)$ und ist nach dem Lemma die Greedy-Wahl. Das erste nicht akzeptierte bzw. das Anschluss-Token ist $@text{argmax}_v z^{(m)}(v)$, ebenfalls die Greedy-Wahl. Der Cache wird auf die akzeptierte Länge zurückgesetzt. Jedes ausgegebene Token stimmt folglich mit Greedy überein. @bold{q.e.d.}  
+}
 
-@subsection{Satz 2: Fehlerschranke beim Weglassen inaktiver Neuronen}
 
-Die FFN-Ausgabe ist eine gewichtete Summe der Neuron-Beiträge
+@bold{Satz 2 — Fehlerschranke beim Weglassen inaktiver Neuronen.} Die FFN-Ausgabe ist eine gewichtete Summe der Neuron-Beiträge
 
 $$ y = @sum_{i=1}^{n} g_i w_i, $$
 
@@ -212,9 +211,7 @@ $$ @norm{y - @hat{y}} = @norm{@sum_{i @notin S} g_i w_i} @leq @sum_{i @notin S} 
 
 @bold{Folgerung.} Bei festem $@abs{S}$ wird die Schranke durch Weglassen der Neuronen mit kleinstem $@abs{g_i}$ minimiert. Die Magnitude-Maskierung entspricht dem; die Messung ergibt Fehler 0 bei 50\% Beibehaltung. @bold{q.e.d.}
 
-@subsection{Satz 3: Das Hoyer-Sparsitätsmaß}
-
-Die Trainingsstrafe minimiert $@frac{@norm{g}_1}{@norm{g}_2}$. Für $g @in @R^{n}, g @neq 0$ gilt
+@bold{Satz 3 — Das Hoyer-Sparsitätsmaß.} Die Trainingsstrafe minimiert $@frac{@norm{g}_1}{@norm{g}_2}$. Für $g @in @R^{n}, g @neq 0$ gilt
 
 $$ 1 @leq @frac{@norm{g}_1}{@norm{g}_2} @leq @sqrt{n}. $$
 
@@ -222,9 +219,7 @@ $$ 1 @leq @frac{@norm{g}_1}{@norm{g}_2} @leq @sqrt{n}. $$
 
 @bold{Skaleninvarianz.} Für $c > 0$ ist $@frac{@norm{c g}_1}{@norm{c g}_2} = @frac{@norm{g}_1}{@norm{g}_2}$. Das Maß erfasst die Form der Verteilung, nicht die Größe. Eine reine $L_1$-Strafe skaliert nur gleichmäßig und bewegt die relative Sparsität nicht. @bold{q.e.d.}
 
-@subsection{Satz 4: Verlustfreiheit des Layer-Offloadings}
-
-Der Forward-Pass ist eine Verkettung von Layer-Funktionen $h_1,@dots,h_L$ mit Kopf $p$:
+@bold{Satz 4 — Verlustfreiheit des Layer-Offloadings.} Der Forward-Pass ist eine Verkettung von Layer-Funktionen $h_1,@dots,h_L$ mit Kopf $p$:
 
 $$ f(x) = p @paren{h_L @paren{@dots h_{k+1} @paren{h_k @paren{@dots h_1(x)}}}}. $$
 
@@ -264,7 +259,30 @@ Die betrachteten Hebel sind publiziert. Die wenig untersuchte Lücke liegt im Re
   @item{@bold{Verlustfreie Kompression} (DFloat11-Ansatz), falls die Kernel-Vorgabe gelockert wird.}
   @item{@bold{MoE-Pfad evaluieren.}}
 }
+@pagebreak
 
+@chapter{Zusammenfassung}
+
+@color[green]{●} @small{Eigener Beitrag}
+
+In einfachen Worten, ohne Fachbegriffe, was dieses Projekt gemessen und gebaut hat.
+
+@bold{Was gemessen wurde.} Fast die gesamte Rechenarbeit eines Sprachmodells steckt in einem Teil, dem FFN (rund 87 Prozent). Pro Wort arbeiten dort nur wenige der tausenden Neuronen wirklich mit, rund ein Drittel; der Rest trägt fast nichts bei. Die Hälfte davon lässt sich weglassen, und es kommt Wort für Wort dasselbe heraus.
+
+@bold{Was gebaut wurde und funktioniert.} Eine eigene Programm-Engine, die Sprachmodelle ausführt und gegen die etablierte Referenz auf die Nachkommastelle genau geprüft ist:
+
+@list{
+  @item{Sie schreibt rund 1,7-mal schneller und gibt garantiert denselben Text aus.}
+  @item{Ein Modell, das zu groß für die Grafikkarte ist, läuft trotzdem in voller Qualität, nur langsamer.}
+  @item{Die Berechnung auf dem Prozessor wurde viermal schneller.}
+  @item{Auf Wunsch spart sie Rechenarbeit, indem sie schwache Neuronen überspringt.}
+}
+
+@bold{Was ehrlich offen ist.} Keines dieser Verfahren ist neu erfunden; alle sind in der Fachwelt bekannt. Die naheliegende eigene Idee, das Modell auf sein Fachgebiet zu spezialisieren, damit es sparsamer rechnet, hat die Messung widerlegt. Eigen ist die vollständige, selbst gebaute und nachgeprüfte Umsetzung auf schwacher Hardware, die als offene Plattform für weitere Experimente dient; fremde, fertige Programme sind geschlossen und erlauben das nicht.
+
+@bold{Nächster Schritt.} Die Struktur, die noch mehr Tempo bringen würde, ist im Modell natürlich nicht vorhanden. Sie lässt sich möglicherweise durch gezieltes Nachtrainieren erzeugen. Ob das gelingt, ist offen und wird gerade untersucht.
+
+@pagebreak
 @chapter{Quellen}
 
 @color[red]{●} @small{Stand der Technik}
