@@ -2,16 +2,16 @@
 @header{OVERFLOW}{}{@today}
 @footer{}{Seite @page von @pages}{}
 
-@title{Weniger Compute, gleiche Intelligenz}
+@title{Weniger Compute bei gleicher Modellqualität}
 @subtitle{Forschungsstand 2024 bis 2026 und eigene Beiträge}
 @author{OVERFLOW / PoeziAI}
 @date
 
 @block[top=0.5ln]{
-  @note{Dieses Dokument trennt sauber: der Stand der Technik ist die Landkarte, unsere Beiträge sind der Punkt darauf. Der fremde Teil liefert den Bezugsrahmen, ohne den unsere Messungen und Beweise keine Aussage hätten.}
+  @note{Das Dokument trennt den Stand der Technik von den eigenen Beiträgen. Der erste Teil ordnet die Literatur gegen die Randbedingungen des Projekts ein; der zweite Teil dokumentiert die umgesetzten Verfahren, deren Messung und formale Grundlagen.}
 }
 
-@center{@color[green]{●} @small{von uns — eigener Beitrag}    @color[red]{●} @small{fremd — Stand der Technik}}
+@center{@color[green]{●} @small{Eigener Beitrag}    @color[red]{●} @small{Stand der Technik}}
 
 @toc
 
@@ -19,242 +19,259 @@
 
 @chapter{Randbedingungen}
 
-@color[green]{●} @small{@italic{von uns — eigenes Setup}}
+@color[green]{●} @small{Eigener Beitrag}
 
-Zwei Regeln sind streng und schließen viel Literatur aus: keine Quantisierung (sie würde das Modell dümmer machen) und keine eigenen CUDA-Kernels. Fast alle veröffentlichten GPU-Speedups brauchen maßgeschneiderte Kernels. Reiner Rust lässt uns vor allem auf der Orchestrierungs-Ebene und auf dem CPU-Pfad forschen.
+Zwei Vorgaben schränken die anwendbare Literatur ein: keine Quantisierung (sie senkt die Modellqualität) und keine eigenen CUDA-Kernel. Die meisten veröffentlichten GPU-Beschleunigungen setzen eigene Kernel voraus. In reinem Rust bleiben die Orchestrierungs-Ebene und der CPU-Pfad.
 
 @table[header]{
-  @row{Faktor | Bei uns}
+  @row{Faktor | Wert}
   @row{Modell | dichtes Qwen2.5-Coder (7B, perspektivisch 14B\/32B), SwiGLU\/SiLU, kein MoE}
   @row{GPU | RTX 3060, 12 GB (~10 GB nutzbar mit Desktop)}
   @row{CPU | ~37x langsamer pro Token als die GPU}
   @row{Präzision | voll, keine Quantisierung}
-  @row{Umsetzung | Rust, keine eigenen CUDA-Kernels}
-  @row{Workload | agentisch, eng: Security und Code}
+  @row{Umsetzung | Rust, keine eigenen CUDA-Kernel}
+  @row{Workload | agentisch, Domäne Security und Code}
 }
 
-Das unmögliche Dreieck: Von den drei Zielen passt-in-VRAM, volle-Qualität und volle-Geschwindigkeit kann man bei einem dichten Modell, das größer als der VRAM ist, nur zwei gleichzeitig haben, solange man jedes Gewicht bei jedem Token liest. Die ganze Forschung zielt darauf, genau diese letzte Annahme zu brechen.
+Zielkonflikt: Von den drei Eigenschaften passt-in-VRAM, volle Qualität und volle Geschwindigkeit sind bei einem dichten Modell, das größer als der VRAM ist, nur zwei zugleich erreichbar, solange jedes Gewicht bei jedem Token gelesen wird. Die betrachteten Verfahren zielen darauf, diese Annahme aufzuheben.
 
 @pagebreak
 
 @chapter{Stand der Technik}
 
-@color[red]{●} @small{@italic{fremd — fremde Arbeiten, gesichtet und gegen unsere Lage bewertet}}
+@color[red]{●} @small{Stand der Technik}
 
 @section{Verlustfreie Gewichts-Kompression}
 
-Das Modell verlustfrei kleiner speichern und beim Rechnen entpacken. Die Ausgabe bleibt bit-identisch.
+Das Modell verlustfrei kleiner speichern und zur Laufzeit entpacken; die Ausgabe bleibt bit-identisch.
 
 @list{
-  @item{@bold{DFloat11} (NeurIPS 2025). Huffman-Codierung der BF16-Exponenten ergibt ~30\% kleiner bei bit-identischer Ausgabe. Für uns: 15 GB werden zu ~10,5 GB. @link{https://arxiv.org/pdf/2504.11651}{arxiv 2504.11651}}
-  @item{@bold{Approaching Shannon Bound} (2026). Näher ans informationstheoretische Optimum. @link{https://arxiv.org/pdf/2606.15789}{arxiv 2606.15789}}
-  @item{@bold{NeuZip}. Frühere verlustfreie Kompression, Vergleichsbasis.}
+  @item{@bold{DFloat11} (NeurIPS 2025). Huffman-Codierung der BF16-Exponenten, ~30\% kleiner bei bit-identischer Ausgabe. Übertragen: 15 GB werden zu ~10,5 GB. @link{https://arxiv.org/pdf/2504.11651}{arxiv 2504.11651}}
+  @item{@bold{Approaching Shannon Bound} (2026). Kompression näher am informationstheoretischen Optimum. @link{https://arxiv.org/pdf/2606.15789}{arxiv 2606.15789}}
+  @item{@bold{NeuZip}. Frühere verlustfreie Kompression als Vergleichsbasis.}
 }
-@note[Verdict: bedingt]{Perfekt im Konzept, aber das Entpacken braucht einen GPU-Decode-Kernel (kollidiert mit keine-Kernels), und DFloat11 zielt auf BF16, unsere Gewichte sind bereits Q8.}
+@note[Bewertung: bedingt]{Das Entpacken erfordert einen GPU-Decode-Kernel (Konflikt mit der Kernel-Vorgabe). DFloat11 zielt auf BF16; die vorhandenen Gewichte sind bereits Q8, die Entropie-Reserve ist geringer.}
 
-@section{Aktivierungs-Sparsity}
+@section{Aktivierungs-Sparsität}
 
-Die meisten FFN-Neuronen tragen pro Token fast nichts bei. Der Trick: das bei SwiGLU\/SiLU (keine harten Nullen) ausnutzen.
+Pro Token tragen die meisten FFN-Neuronen wenig bei. Die Herausforderung ist die Nutzung bei SwiGLU\/SiLU ohne harte Nullen.
 
 @list{
-  @item{@bold{TEAL} (ICLR 2025). Magnitude-Sparsity ohne Retraining, 40 bis 50\% modellweit, 1,5x bis 1,8x schneller. @link{https://arxiv.org/pdf/2408.14690}{arxiv 2408.14690}}
-  @item{@bold{CATS}. Training-free Sparsity für SwiGLU, Magnitude-Pruning auf dem Wgate-Ausgang.}
-  @item{@bold{SparseInfer}. Training-free Vorhersage des aktiven Satzes. @link{https://arxiv.org/pdf/2411.12692}{arxiv 2411.12692}}
-  @item{@bold{Polar Sparsity} (2025). Hochdurchsatz-Variante. @link{https://arxiv.org/pdf/2505.14884}{arxiv 2505.14884}}
-  @item{Kontext: @bold{DejaVu} und @bold{PowerInfer} nutzen einen festen Hot-Satz, nur bei ReLU-Modellen, nicht bei SwiGLU.}
+  @item{@bold{TEAL} (ICLR 2025). Magnitude-Sparsität ohne Retraining, 40 bis 50\% modellweit, Faktor 1,5 bis 1,8. @link{https://arxiv.org/pdf/2408.14690}{arxiv 2408.14690}}
+  @item{@bold{CATS}. Training-freie Sparsität für SwiGLU, Magnitude-Pruning am Wgate-Ausgang.}
+  @item{@bold{SparseInfer}. Training-freie Vorhersage des aktiven Satzes. @link{https://arxiv.org/pdf/2411.12692}{arxiv 2411.12692}}
+  @item{@bold{Polar Sparsity} (2025). Durchsatzorientierte Variante. @link{https://arxiv.org/pdf/2505.14884}{arxiv 2505.14884}}
+  @item{@bold{DejaVu}, @bold{PowerInfer}: fester Hot-Satz, wirksam nur bei ReLU-Modellen.}
 }
-@note[Verdict: bestätigt aber kernel-abhängig]{40 bis 50\% der FFN-Rechnung sind verlustfrei streichbar, aber Rechnung zu sparen braucht einen Sparse-Kernel. Pure-Rust-Nutzen liegt auf dem CPU-Offload-Pfad.}
+@note[Bewertung: wirksam, kernel-abhängig]{40 bis 50\% der FFN-Rechnung sind verlustfrei streichbar; die Einsparung erfordert einen Sparse-Kernel. In reinem Rust ist der Nutzen auf den CPU-Offload-Pfad beschränkt.}
 
 @section{Offloading-Systeme}
 
-Modell zwischen GPU und CPU\/RAM aufteilen, verlustfrei.
+Aufteilung des Modells zwischen GPU und CPU\/RAM, verlustfrei.
 
 @list{
-  @item{@bold{PowerInfer}. GPU-CPU-Hybrid über Sparsity plus Offline-Placement, bis zu 11,69x über llama.cpp. @link{https://ipads.se.sjtu.edu.cn/_media/publications/powerinfer-20231219.pdf}{PowerInfer}}
-  @item{@bold{llama.cpp}. Ganze Layer GPU, Rest CPU; durch PCIe und schwache CPU limitiert.}
+  @item{@bold{PowerInfer}. GPU-CPU-Hybrid mit Sparsität und Offline-Placement, bis Faktor 11,69 über llama.cpp. @link{https://ipads.se.sjtu.edu.cn/_media/publications/powerinfer-20231219.pdf}{PowerInfer}}
+  @item{@bold{llama.cpp}. Ganze Layer auf GPU, Rest auf CPU; begrenzt durch PCIe und CPU.}
   @item{@bold{DynamicInfer} (ICLR 2026), @bold{PIPO}, @bold{FlexInfer}, @bold{NEO}, @bold{FlexGen}. Dynamisches Placement, Transfer-Compute-Overlap. @link{https://arxiv.org/pdf/2504.03664}{PIPO}, @link{https://arxiv.org/pdf/2411.01142}{NEO}}
 }
-@note[Verdict: passt und pure Rust]{Der robuste Fit-Weg, bestehende Kernels wiederverwenden. PowerInfers 11x gelten für ReLU plus eigene Kernels, nicht übertragbar.}
+@note[Bewertung: anwendbar, reines Rust]{Fit-Weg über ganze Layer, bestehende Kernel wiederverwendbar. Der Faktor 11 von PowerInfer setzt ReLU und eigene Kernel voraus und ist nicht übertragbar.}
 
 @section{Spekulatives Decoding}
 
-Mehrere Token auf einmal erzeugen und in einem Pass prüfen; bei Temperatur 0 verlustfrei.
+Mehrere Token je Durchlauf erzeugen und gemeinsam prüfen; bei Temperatur 0 verlustfrei.
 
 @list{
-  @item{@bold{Prompt-Lookup} und @bold{Lookahead}. Kein zweites Modell; Entwürfe aus dem Kontext.}
-  @item{@bold{Medusa}. Leichte Draft-Heads am Zielmodell.}
-  @item{@bold{EAGLE-2/3}. SOTA, ~1,98x. @link{https://arxiv.org/pdf/2503.01840}{EAGLE-3}}
+  @item{@bold{Prompt-Lookup}, @bold{Lookahead}. Kein zweites Modell; Entwürfe aus dem Kontext.}
+  @item{@bold{Medusa}. Draft-Heads am Zielmodell.}
+  @item{@bold{EAGLE-2/3}. Stand der Technik, Faktor ~1,98. @link{https://arxiv.org/pdf/2503.01840}{EAGLE-3}}
   @item{Survey EMNLP-Findings 2025. @link{https://aclanthology.org/2025.findings-emnlp.716.pdf}{Survey}}
 }
-@note[Verdict: erledigt]{Mit der trainingsfreien Variante umgesetzt (siehe eigene Beiträge).}
+@note[Bewertung: umgesetzt]{Die training-freie Variante ist implementiert (siehe Eigene Beiträge).}
 
 @section{KV-Cache-Kompression}
 
-Nicht die Gewichte, sondern den wachsenden KV-Cache. Relevant für lange Agent-Sessions.
+Betrifft den mit der Kontextlänge wachsenden KV-Cache, nicht die Gewichte.
 
 @list{
-  @item{@bold{StreamingLLM}, @bold{H2O}, @bold{SnapKV}. Wichtige KV-Positionen behalten.}
-  @item{@bold{PyramidKV}. Pro Layer unterschiedlich kürzen. @link{https://arxiv.org/pdf/2406.02069}{PyramidKV}}
-  @item{@bold{KIVI}. KV quantisieren (nicht unser Pfad). @bold{THINK}. Query-abhängiges Pruning.}
+  @item{@bold{StreamingLLM}, @bold{H2O}, @bold{SnapKV}. Auswahl wichtiger KV-Positionen.}
+  @item{@bold{PyramidKV}. Schichtweise unterschiedliche Kürzung. @link{https://arxiv.org/pdf/2406.02069}{PyramidKV}}
+  @item{@bold{KIVI}. KV-Quantisierung. @bold{THINK}. Query-abhängiges Pruning.}
 }
-@note[Verdict: später relevant]{Für das 15-GB-Fit-Problem nicht der Hebel.}
+@note[Bewertung: später relevant]{Für den VRAM-Bedarf der Gewichte nicht einschlägig.}
 
 @section{Adaptive Rechentiefe}
 
 @list{
   @item{@bold{Mixture-of-Depths} (2024). Nicht jedes Token durchläuft jeden Layer.}
-  @item{@bold{Mixture-of-Recursions} (2025). Pro Token dynamische Rekursionstiefe. @link{https://arxiv.org/pdf/2507.10524}{MoR}}
-  @item{@bold{Early-Exit}. Frühzeitig aussteigen bei sicheren Token.}
+  @item{@bold{Mixture-of-Recursions} (2025). Token-abhängige Rekursionstiefe. @link{https://arxiv.org/pdf/2507.10524}{MoR}}
+  @item{@bold{Early-Exit}. Vorzeitiger Abbruch bei hinreichender Sicherheit.}
 }
-@note[Verdict: Architektur oder Training]{Braucht ein anders trainiertes Modell.}
+@note[Bewertung: Architektur oder Training]{Erfordert ein anders trainiertes Modell.}
 
-@section{MoE statt dicht}
+@section{MoE statt dichtem Modell}
 
-15 GB gesamt, aber nur ~3 GB pro Token aktiv; der aktive Satz passt in den VRAM.
+15 GB Gesamtparameter, aber nur ~3 GB pro Token aktiv; der aktive Satz passt in den VRAM.
 
 @list{
-  @item{@bold{MoE-Infinity}. Experten auslagern, heiße Experten resident. @link{https://github.com/EfficientMoE/MoE-Infinity/}{MoE-Infinity}}
-  @item{@bold{DALI}, @bold{HybriMoE}, @bold{fMoE}. Workload-bewusstes Experten-Offloading. @link{https://arxiv.org/pdf/2602.03495}{DALI}}
+  @item{@bold{MoE-Infinity}. Experten ausgelagert, aktive Experten resident. @link{https://github.com/EfficientMoE/MoE-Infinity/}{MoE-Infinity}}
+  @item{@bold{DALI}, @bold{HybriMoE}, @bold{fMoE}. Workload-abhängiges Experten-Offloading. @link{https://arxiv.org/pdf/2602.03495}{DALI}}
 }
-@note[Verdict: strategisch interessant]{Setzt voraus, dass wir von dichtem Qwen2.5 weggehen.}
+@note[Bewertung: strategisch]{Setzt einen Wechsel vom dichten Qwen2.5 voraus.}
 
-@section{Domänen-Spezialisierung}
+@section{Domänenspezialisierung}
 
-Die Idee, dass ein enger Agent einen kleineren, stabileren aktiven Satz hat, gibt es bereits.
+Ein kleinerer, stabiler aktiver Satz für eine enge Domäne ist bereits untersucht.
 
 @list{
-  @item{@bold{SEAP}. Training-free Pruning task-spezifischer Neuronen. @link{https://arxiv.org/pdf/2402.14800}{SEAP}}
-  @item{@bold{DieT}. Aktivierungs-Magnituden über Tasks profilieren, globale Maske. @link{https://arxiv.org/html/2603.23985v1}{Diet Your LLM}}
-  @item{@bold{Half the Experts, All the Code}, @bold{TrimLLM}. Domänen-Pruning fürs Coding. @link{https://arxiv.org/pdf/2607.16721}{Half the Experts}}
+  @item{@bold{SEAP}. Training-freies Pruning task-spezifischer Neuronen. @link{https://arxiv.org/pdf/2402.14800}{SEAP}}
+  @item{@bold{DieT}. Profilierung der Aktivierungsmagnituden über Tasks, globale Maske. @link{https://arxiv.org/html/2603.23985v1}{Diet Your LLM}}
+  @item{@bold{Half the Experts, All the Code}, @bold{TrimLLM}. Domänen-Pruning für Code. @link{https://arxiv.org/pdf/2607.16721}{Half the Experts}}
 }
-@note[Verdict: nicht neu]{Unsere ursprüngliche Domänen-Idee existiert schon. Unser Beitrag ist die Messung, dass sie bei unserem Modell nicht trägt (siehe eigenes Experiment).}
+@note[Bewertung: nicht neu]{Der Ansatz existiert. Beitrag dieses Projekts ist der Nachweis, dass er für das vorliegende Modell nicht trägt (siehe Experiment).}
 
 @pagebreak
 
-@chapter{Was wir gemacht haben}
+@chapter{Eigene Beiträge}
 
-@color[green]{●} @small{@italic{von uns — Messungen, gebaute Systeme und ihre Beweise}}
+@color[green]{●} @small{Eigener Beitrag}
 
-@section{Eigene Messungen}
+@section{Messungen}
 
-Erhoben am echten overflow\_wt-7B mit unseren Sonden (@code{poezi sparsity}, @code{masktest}, @code{skew}):
+Erhoben am Modell overflow\_wt-7B mit den Sonden @code{poezi sparsity}, @code{masktest} und @code{skew}:
 
 @list{
-  @item{FFN ist ~87\% der Block-Gewichte, also der Haupthebel.}
-  @item{Aktivierungs-Sparsity ist real: nur ~4,5\% der FFN-Neuronen überschreiten 5\% des Maximums, ~35\% überschreiten 1\%.}
-  @item{Oracle-Masking: die oberen 50\% behalten ist bit-identisch; darunter sinkt die Top-1-Übereinstimmung sanft (25\% ergibt 90\%, 10\% ergibt 78\%).}
-  @item{Statischer Skew ist schwach: die 25\% häufigsten Neuronen decken nur ~39\% der Aktivierungen ab. SiLU liefert kein Power-Law.}
+  @item{FFN: ~87\% der Gewichte je Block.}
+  @item{Aktivierungs-Sparsität: ~4,5\% der FFN-Neuronen über 5\% des Maximums, ~35\% über 1\%.}
+  @item{Oracle-Maskierung: die oberen 50\% behalten ist bit-identisch; darunter sinkt die Top-1-Übereinstimmung (25\% ergibt 90\%, 10\% ergibt 78\%).}
+  @item{Statischer Skew: die 25\% häufigsten Neuronen decken ~39\% der Aktivierungen; SiLU ergibt kein Power-Law.}
 }
 
-@section{Was wir gebaut haben}
+@section{Umgesetzte Verfahren}
 
-Alles reiner Rust (bis auf die früher geschriebenen Spec-Decode-Kernels), end-to-end auf der 3060 vermessen:
+In Rust implementiert (mit Ausnahme der zuvor geschriebenen Spec-Decode-Kernel), auf der RTX 3060 vermessen:
 
 @table[header]{
-  @row{Baustein | Ergebnis}
-  @row{Speculative Decoding | verlustfrei, 1,67x auf Code\/Agent-Reuse}
-  @row{AVX2-CPU-Matmul | 4x Kernel (5 auf 19,5 GB\/s), 2x CPU-Forward}
-  @row{Whole-Layer-Offloading | verlustfrei, ein 15-GB-Modell läuft auf 12 GB}
+  @row{Verfahren | Ergebnis}
+  @row{Speculative Decoding | verlustfrei, Faktor 1,67 auf Code\/Agent-Reuse}
+  @row{AVX2-CPU-Matmul | Faktor 4 im Kernel (5 auf 19,5 GB\/s), Faktor 2 im CPU-Forward}
+  @row{Whole-Layer-Offloading | verlustfrei, 15-GB-Modell läuft auf 12 GB}
   @row{Sparse CPU-FFN (opt-in) | plus 13 bis 24\% auf dem CPU-Pfad}
   @row{Sparsity-aware Fine-Tuning | Hoyer-Strafe, Mechanismus validiert}
 }
 
-Die Offloading-Geschwindigkeit skaliert mit dem Anteil auf der CPU (7B, 40 Token):
+Offloading-Durchsatz nach CPU-Anteil (7B, 40 Token):
 
 @table[header]{
   @row{GPU-Layer | Token\/s}
-  @row{28 von 28 (voll GPU) | 5,7}
+  @row{28 von 28 | 5,7}
   @row{20 von 28 | 3,6}
   @row{14 von 28 | 2,9}
   @row{7 von 28 | 2,4}
 }
 
-@section{Mathematische Grundlagen}
+@section{Neuheitsgrad}
 
-@subsection{Satz 1: Verlustfreiheit des Spekulativen Decodings}
+Die zugrunde liegenden Verfahren sind publiziert. Neu sind ihre Kombination und einzelne Resultate unter den gegebenen Randbedingungen.
 
-@bold{Behauptung.} Bei Temperatur 0 erzeugt das Prompt-Lookup-Verfahren exakt dieselbe Token-Folge wie gewöhnliches Greedy-Decoding.
+@bold{Bekannt, hier eigenständig umgesetzt:} Prompt-Lookup Speculative Decoding, Whole-Layer-Offloading, AVX2-Matmul, CATS-artige FFN-Sparsität.
 
-Sei $z_t @in @R^{V}$ der Logit-Vektor des Forward-Passes auf dem Präfix $x_{1..t-1}$, und Greedy wähle $x_t = @text{argmax}_v z_t(v)$. Das Verfahren rät einen Entwurf $d_1,@dots,d_m$, berechnet in @bold{einem} batched Forward die Logits $z^{(0)},@dots,z^{(m)}$ an den Entwurfspositionen und akzeptiert $d_j$ genau dann, wenn
+@bold{Nach derzeitigem Kenntnisstand in dieser Form nicht vorhanden und funktionsfähig:}
+
+@numbered{
+  @item{Ein integrierter, gegen llama.cpp bit-identisch verifizierter Inferenz-Stack @bold{ohne externe Inferenzbibliothek}, der Speculative Decoding, auto-dimensioniertes Whole-Layer-Offloading und opt-in CPU-Sparsität auf einer 12-GB-Consumer-GPU unter der Vorgabe keiner eigenen Kernel für die Orchestrierung vereint.}
+  @item{Batched, bit-identisches Quant-GEMM zur spekulativen Verifikation (Q8\_0\/Q4\_K\/Q6\_K), gemessen token-identisch zum Einzel-Token-Pfad.}
+  @item{Empirisches Resultat: Für Qwen2.5-Coder ist der aktive FFN-Satz nicht domänenspezifisch (Differenz 3 Prozentpunkte); statisches Domänen-Offloading trägt nicht. Ein in dieser Form nicht publiziertes Negativresultat.}
+  @item{Offene Richtung: sparsity-aware Fine-Tuning, das eine für statisches Offloading nutzbare, stabile Sparsität erst induziert. Mechanismus validiert (Hoyer-Strafe senkt die relative Sparsität), voller Nachweis offen.}
+}
+
+@note{Kein algorithmischer Durchbruch. Der Beitrag liegt in der Integration, der bit-genauen Verifikation und den Messergebnissen für ein Regime (schwache GPU, langsame CPU, keine eigenen Kernel, enger Agent), das in der Literatur kaum abgedeckt ist.}
+
+@section{Formale Grundlagen}
+
+@subsection{Satz 1: Verlustfreiheit des spekulativen Decodings}
+
+@bold{Behauptung.} Bei Temperatur 0 erzeugt das Prompt-Lookup-Verfahren dieselbe Token-Folge wie gewöhnliches Greedy-Decoding.
+
+Sei $z_t @in @R^{V}$ der Logit-Vektor des Forward-Passes auf dem Präfix $x_{1..t-1}$ und $x_t = @text{argmax}_v z_t(v)$ die Greedy-Wahl. Das Verfahren bildet einen Entwurf $d_1,@dots,d_m$, berechnet in einem Durchlauf die Logits $z^{(0)},@dots,z^{(m)}$ an den Entwurfspositionen und akzeptiert $d_j$ genau dann, wenn
 
 $$ d_j = @text{argmax}_v z^{(j-1)}(v). $$
 
-@bold{Lemma (Bit-Identität).} Der batched Kernel berechnet für jedes Paar (Zeile, Token) dieselbe Summe in derselben Reihenfolge wie der Einzel-Token-Kernel; die Reduktion ist identisch. Also ist $z^{(j)}$ bit-gleich dem Logit-Vektor, den der sequentielle Greedy-Pass an derselben Position nach den bis dahin akzeptierten Token berechnet.
+@bold{Lemma (Bit-Identität).} Der batched Kernel berechnet für jedes Paar aus Zeile und Token dieselbe Summe in derselben Reihenfolge wie der Einzel-Token-Kernel; die Reduktion ist identisch. Damit ist $z^{(j)}$ bit-gleich dem Logit-Vektor des sequentiellen Durchlaufs an gleicher Position nach den akzeptierten Token.
 
-@bold{Beweis (Induktion über die akzeptierten Positionen).} Ein akzeptiertes $d_j$ erfüllt $d_j=@text{argmax}_v z^{(j-1)}(v)$ und ist nach dem Lemma gleich Greedys Wahl an dieser Stelle. Das erste nicht akzeptierte bzw. das Anschluss-Token ist $@text{argmax}_v z^{(m)}(v)$, wieder Greedys Wahl. Der Cache wird exakt auf die akzeptierte Länge zurückgesetzt. Damit stimmt jedes ausgegebene Token mit Greedy überein. @bold{q.e.d.}
+@bold{Beweis (Induktion über die akzeptierten Positionen).} Ein akzeptiertes $d_j$ erfüllt $d_j = @text{argmax}_v z^{(j-1)}(v)$ und ist nach dem Lemma die Greedy-Wahl. Das erste nicht akzeptierte bzw. das Anschluss-Token ist $@text{argmax}_v z^{(m)}(v)$, ebenfalls die Greedy-Wahl. Der Cache wird auf die akzeptierte Länge zurückgesetzt. Jedes ausgegebene Token stimmt folglich mit Greedy überein. @bold{q.e.d.}
 
 @subsection{Satz 2: Fehlerschranke beim Weglassen inaktiver Neuronen}
 
 Die FFN-Ausgabe ist eine gewichtete Summe der Neuron-Beiträge
 
-$$ y = @sum_{i=1}^{n} g_i  w_i, $$
+$$ y = @sum_{i=1}^{n} g_i w_i, $$
 
-wobei $w_i @in @R^{d}$ die $i$-te Spalte von $W_{@text{down}}$ ist und $g_i = @text{silu}(a_i)  u_i$ die post-SwiGLU-Aktivierung. Behalten wir nur eine Menge $S$ und setzen die übrigen $g_i$ auf 0, so ist der Fehler
+mit $w_i @in @R^{d}$ als $i$-ter Spalte von $W_{@text{down}}$ und $g_i = @text{silu}(a_i) u_i$ als post-SwiGLU-Aktivierung. Bei Beibehaltung einer Menge $S$ und Nullsetzen der übrigen $g_i$ gilt
 
 $$ @norm{y - @hat{y}} = @norm{@sum_{i @notin S} g_i w_i} @leq @sum_{i @notin S} @abs{g_i} @norm{w_i} @leq @paren{max_i @norm{w_i}} @sum_{i @notin S} @abs{g_i}. $$
 
-@bold{Folgerung.} Bei festem $@abs{S}$ wird diese Schranke minimiert, indem man die Neuronen mit den @bold{kleinsten} $@abs{g_i}$ weglässt. Genau das tut unser Masktest, und die Messung bestätigt es: bei 50\% behalten ist der Fehler 0 (bit-identisch). @bold{q.e.d.}
+@bold{Folgerung.} Bei festem $@abs{S}$ wird die Schranke durch Weglassen der Neuronen mit kleinstem $@abs{g_i}$ minimiert. Die Magnitude-Maskierung entspricht dem; die Messung ergibt Fehler 0 bei 50\% Beibehaltung. @bold{q.e.d.}
 
 @subsection{Satz 3: Das Hoyer-Sparsitätsmaß}
 
-Unsere Trainingsstrafe minimiert $@frac{@norm{g}_1}{@norm{g}_2}$. Für $g @in @R^{n}, g @neq 0$ gilt
+Die Trainingsstrafe minimiert $@frac{@norm{g}_1}{@norm{g}_2}$. Für $g @in @R^{n}, g @neq 0$ gilt
 
 $$ 1 @leq @frac{@norm{g}_1}{@norm{g}_2} @leq @sqrt{n}. $$
 
-@bold{Beweis.} Die obere Schranke ist Cauchy-Schwarz mit dem Einsvektor: $@norm{g}_1 = @sum_i @abs{g_i} @cdot 1 @leq @sqrt{@sum_i g_i^2}  @sqrt{@sum_i 1} = @sqrt{n}  @norm{g}_2$, mit Gleichheit genau dann, wenn alle $@abs{g_i}$ gleich sind (dicht). Die untere Schranke folgt aus $@norm{g}_2^2 = @sum_i g_i^2 @leq @paren{@sum_i @abs{g_i}}^2 = @norm{g}_1^2$, mit Gleichheit genau dann, wenn höchstens ein $g_i$ ungleich 0 ist (maximal sparse).
+@bold{Beweis.} Die obere Schranke folgt aus Cauchy-Schwarz mit dem Einsvektor: $@norm{g}_1 = @sum_i @abs{g_i} @cdot 1 @leq @sqrt{@sum_i g_i^2} @sqrt{@sum_i 1} = @sqrt{n} @norm{g}_2$, mit Gleichheit bei gleichen $@abs{g_i}$ (dicht). Die untere Schranke folgt aus $@norm{g}_2^2 = @sum_i g_i^2 @leq @paren{@sum_i @abs{g_i}}^2 = @norm{g}_1^2$, mit Gleichheit bei höchstens einem von 0 verschiedenen $g_i$ (maximal sparse).
 
-@bold{Skaleninvarianz.} Für $c > 0$ ist $@frac{@norm{c g}_1}{@norm{c g}_2} = @frac{c @norm{g}_1}{c @norm{g}_2} = @frac{@norm{g}_1}{@norm{g}_2}$. Das Maß misst also die @italic{Form} der Verteilung, nicht ihre Größe. Deshalb bewegt es die relative Sparsität, wo eine reine $L_1$-Strafe (die nur gleichmäßig schrumpft) sie nicht bewegt. @bold{q.e.d.}
+@bold{Skaleninvarianz.} Für $c > 0$ ist $@frac{@norm{c g}_1}{@norm{c g}_2} = @frac{@norm{g}_1}{@norm{g}_2}$. Das Maß erfasst die Form der Verteilung, nicht die Größe. Eine reine $L_1$-Strafe skaliert nur gleichmäßig und bewegt die relative Sparsität nicht. @bold{q.e.d.}
 
 @subsection{Satz 4: Verlustfreiheit des Layer-Offloadings}
 
-Der Forward-Pass ist eine Verkettung von Layer-Funktionen. Mit $h_1,@dots,h_L$ und Kopf $p$ (Norm plus Projektion) gilt
+Der Forward-Pass ist eine Verkettung von Layer-Funktionen $h_1,@dots,h_L$ mit Kopf $p$:
 
 $$ f(x) = p @paren{h_L @paren{@dots h_{k+1} @paren{h_k @paren{@dots h_1(x)}}}}. $$
 
-Beim Offloading rechnet die GPU $x' = h_k(@dots h_1(x))$, überträgt den Zwischenzustand $x'$ (nur $d$ Zahlen) auf die CPU, diese rechnet $x'' = h_L(@dots h_{k+1}(x'))$, und die GPU liefert $p(x'')$. Da die übertragene Größe exakt der Zwischenzustand ist und Funktionskomposition assoziativ ist, ist das Ergebnis mathematisch dasselbe $f(x)$; es unterscheidet sich nur um die Gleitkomma-Rundung zwischen GPU und CPU (bei uns ~$10^{-5}$), die die Greedy-Auswahl nicht kippt. Die Messung bestätigt es: bei erzwungenem 14-von-28-Split ist die Ausgabe token-identisch zur vollen GPU. @bold{q.e.d.}
+Beim Offloading berechnet die GPU $x' = h_k(@dots h_1(x))$, überträgt den Zwischenzustand $x'$ (Dimension $d$) auf die CPU, diese berechnet $x'' = h_L(@dots h_{k+1}(x'))$, und die GPU liefert $p(x'')$. Da die Übertragung dem Zwischenzustand entspricht und die Komposition assoziativ ist, ergibt sich dasselbe $f(x)$ bis auf die Gleitkomma-Rundung zwischen den Geräten (~$10^{-5}$), die die Greedy-Auswahl nicht ändert. Die Messung bei erzwungenem 14-von-28-Split ergibt token-identische Ausgabe zur vollen GPU. @bold{q.e.d.}
 
 @pagebreak
 
-@chapter{Eigenes Experiment: Domänen-Sparsity}
+@chapter{Experiment: Domänenspezifische Sparsität}
 
-@color[green]{●} @small{@italic{von uns — eigene Hypothese, eigenes Experiment (poezi domaintest)}}
+@color[green]{●} @small{Eigener Beitrag}
 
-@warning[Negatives Ergebnis]{Wir haben einen Hot-Satz aus Security\/Code-Prompts gelernt und seine Abdeckung auf anderen Security\/Code-Prompts gegen generischen Text gemessen (hot 25\%): Domäne 36,1\% gegen generisch 33,0\%, Gap nur 3,0 Prozentpunkte, nicht besser als die 39\%-Baseline. Der Hot-Satz ist nicht domänenspezifisch. Statisches Domänen-Offloading ist bei diesem dichten SiLU-Modell tot. Die eine potenziell originelle Idee ist damit empirisch widerlegt.}
+@warning[Negatives Ergebnis]{Ein Hot-Satz aus Security\/Code-Prompts wurde gelernt und seine Abdeckung auf anderen Security\/Code-Prompts gegen generischen Text gemessen (hot 25\%): Domäne 36,1\% gegen generisch 33,0\%, Differenz 3,0 Prozentpunkte, nicht über der 39\%-Baseline. Der Hot-Satz ist nicht domänenspezifisch. Statisches Domänen-Offloading trägt für das dichte SiLU-Modell nicht; die Hypothese ist widerlegt.}
 
-@chapter{Ehrliche Synthese}
+@chapter{Synthese}
 
-@color[green]{●} @small{@italic{von uns — eigene Analyse}}
+@color[green]{●} @small{Eigener Beitrag}
 
-Praktisch jeder Hebel ist publiziert. Die echte, unterbeleuchtete Lücke liegt nicht in einer neuen Technik, sondern in unserem Regime:
+Die betrachteten Hebel sind publiziert. Die wenig untersuchte Lücke liegt im Regime, nicht in einer neuen Technik:
 
 @numbered{
-  @item{@bold{Schwache GPU plus sehr langsame CPU plus keine eigenen Kernels.} Ob die Methoden der Literatur unter reiner Orchestrierung auf einer 3060 netto noch gewinnen, ist kaum untersucht.}
-  @item{@bold{Ein einzelner, eng spezialisierter, selbst fine-getunter Agent.} Unser Test zeigt: die Domäne allein erzeugt keine Struktur. Man müsste sie hineintrainieren, Richtung sparsity-aware Fine-Tuning.}
-  @item{@bold{Ein ehrlich gemessener, kombinierter Stack} für genau dieses Gerät: verlustfreie Kompression mal Sparsity mal Spekulation, end-to-end auf einer 3060.}
+  @item{@bold{Schwache GPU, langsame CPU, keine eigenen Kernel.} Ob die Verfahren der Literatur unter reiner Orchestrierung auf einer 3060 netto gewinnen, ist offen.}
+  @item{@bold{Einzelner, spezialisierter, fine-getunter Agent.} Die Domäne allein erzeugt keine ausnutzbare Struktur; sie müsste über sparsity-aware Fine-Tuning induziert werden.}
+  @item{@bold{Gemessener kombinierter Stack} für dieses Gerät: Kompression, Sparsität und Spekulation zusammen, end-to-end.}
 }
 
-@note{Nüchtern: einen algorithmischen Durchbruch versprechen wir nicht. Realistisch ist ein origineller Systems- und Empirie-Beitrag im Low-End- und Single-Agent-Regime.}
+@note{Ein algorithmischer Durchbruch ist nicht zu erwarten. Realistisch ist ein Beitrag auf System- und Empirie-Ebene im Low-End- und Single-Agent-Regime.}
 
-@chapter{Empfohlene Forschungsagenda}
+@chapter{Forschungsagenda}
 
-@color[green]{●} @small{@italic{von uns — eigener Plan}}
+@color[green]{●} @small{Eigener Beitrag}
 
 @numbered{
-  @item{@bold{CPU-Matmul beschleunigen} (reiner Rust, risikoarm). Fundament für alles Offloading. @italic{Erledigt: 4x.}}
-  @item{@bold{Whole-Layer-Offloading}. 15 GB in 12 GB bei voller Qualität. @italic{Erledigt.}}
-  @item{@bold{Sparsity auf dem CPU-Offload-Pfad.} @italic{Erledigt als opt-in, near-lossless.}}
-  @item{@bold{Sparsity-aware Fine-Tuning} (QLoRA, möglicher Eigenbeitrag). @italic{Mechanismus validiert, voller Lauf offen.}}
-  @item{@bold{DFloat11-artige verlustfreie Kompression}, falls wir die keine-Kernels-Regel lockern.}
+  @item{@bold{CPU-Matmul beschleunigen.} Grundlage des Offloadings. @italic{Umgesetzt: Faktor 4.}}
+  @item{@bold{Whole-Layer-Offloading.} 15 GB auf 12 GB bei voller Qualität. @italic{Umgesetzt.}}
+  @item{@bold{Sparsität auf dem CPU-Offload-Pfad.} @italic{Umgesetzt als opt-in.}}
+  @item{@bold{Sparsity-aware Fine-Tuning.} @italic{Mechanismus validiert, voller Lauf offen.}}
+  @item{@bold{Verlustfreie Kompression} (DFloat11-Ansatz), falls die Kernel-Vorgabe gelockert wird.}
   @item{@bold{MoE-Pfad evaluieren.}}
 }
 
 @chapter{Quellen}
 
-@color[red]{●} @small{@italic{fremd — alles Fremdarbeiten}}
+@color[red]{●} @small{Stand der Technik}
 
 @list{
   @item{Kompression: @link{https://arxiv.org/pdf/2504.11651}{DFloat11}, @link{https://github.com/LeanModels/DFloat11}{DFloat11 Code}, @link{https://arxiv.org/pdf/2606.15789}{Shannon-Bound}}
-  @item{Sparsity: @link{https://arxiv.org/pdf/2408.14690}{TEAL}, @link{https://arxiv.org/pdf/2411.12692}{SparseInfer}, @link{https://arxiv.org/pdf/2505.14884}{Polar Sparsity}}
+  @item{Sparsität: @link{https://arxiv.org/pdf/2408.14690}{TEAL}, @link{https://arxiv.org/pdf/2411.12692}{SparseInfer}, @link{https://arxiv.org/pdf/2505.14884}{Polar Sparsity}}
   @item{Offloading: @link{https://ipads.se.sjtu.edu.cn/_media/publications/powerinfer-20231219.pdf}{PowerInfer}, @link{https://arxiv.org/pdf/2504.03664}{PIPO}, @link{https://arxiv.org/pdf/2411.01142}{NEO}}
   @item{Spekulatives Decoding: @link{https://arxiv.org/pdf/2503.01840}{EAGLE-3}, @link{https://aclanthology.org/2025.findings-emnlp.716.pdf}{Survey}}
   @item{KV-Cache: @link{https://arxiv.org/pdf/2406.02069}{PyramidKV}, @link{https://arxiv.org/pdf/2412.09036}{ZigZagKV}}
