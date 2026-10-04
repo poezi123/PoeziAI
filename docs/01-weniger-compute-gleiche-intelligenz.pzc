@@ -1,186 +1,264 @@
-@document[paper=A4, margin=2.5cm, font=serif, fontsize=11, linespacing=1.3, lang=de]
+@document[paper=A4, margin=2.0cm, font=serif, fontsize=11, linespacing=1.15, lang=de]
 @header{OVERFLOW}{}{@today}
 @footer{}{Seite @page von @pages}{}
 
 @title{Weniger Compute, gleiche Intelligenz}
-@subtitle{Forschungsstand 2024 bis 2026 zum Betrieb großer Modelle auf schwacher Hardware}
+@subtitle{Forschungsstand 2024 bis 2026 und eigene Beiträge}
 @author{OVERFLOW / PoeziAI}
 @date
 
 @block[top=0.5ln]{
-  @note{Diese Lektüre ist der Landkarten-Teil unserer Forschung: was es schon gibt, wie gut es zu unseren Randbedingungen passt, und wo echte Lücken bleiben, in denen wir selbst etwas beitragen könnten. Jede Technik ist mit Quellen belegt und ehrlich gegen unsere Situation bewertet.}
+  @note{Dieses Dokument trennt sauber: der Stand der Technik ist die Landkarte, unsere Beiträge sind der Punkt darauf. Der fremde Teil liefert den Bezugsrahmen, ohne den unsere Messungen und Beweise keine Aussage hätten.}
 }
+
+@center{@color[green]{●} @small{von uns — eigener Beitrag}    @color[red]{●} @small{fremd — Stand der Technik}}
 
 @toc
 
 @pagebreak
 
-@chapter{Unsere Randbedingungen}
+@chapter{Randbedingungen}
 
-Zwei unserer Regeln sind ungewöhnlich streng und schließen viel Literatur aus: keine Quantisierung (sie würde das Modell dümmer machen) und keine eigenen CUDA-Kernels. Fast alle veröffentlichten GPU-Speedups brauchen maßgeschneiderte Kernels. Reiner Rust lässt uns vor allem auf der Orchestrierungs-Ebene und auf dem CPU-Pfad forschen.
+@color[green]{●} @small{@italic{von uns — eigenes Setup}}
+
+Zwei Regeln sind streng und schließen viel Literatur aus: keine Quantisierung (sie würde das Modell dümmer machen) und keine eigenen CUDA-Kernels. Fast alle veröffentlichten GPU-Speedups brauchen maßgeschneiderte Kernels. Reiner Rust lässt uns vor allem auf der Orchestrierungs-Ebene und auf dem CPU-Pfad forschen.
 
 @table[header]{
   @row{Faktor | Bei uns}
   @row{Modell | dichtes Qwen2.5-Coder (7B, perspektivisch 14B\/32B), SwiGLU\/SiLU, kein MoE}
-  @row{GPU | RTX 3060, 12 GB (rund 10 GB nutzbar mit Desktop)}
-  @row{CPU | rund 37x langsamer pro Token als die GPU}
+  @row{GPU | RTX 3060, 12 GB (~10 GB nutzbar mit Desktop)}
+  @row{CPU | ~37x langsamer pro Token als die GPU}
   @row{Präzision | voll, keine Quantisierung}
-  @row{Umsetzung | reiner Rust, keine eigenen CUDA-Kernels}
+  @row{Umsetzung | Rust, keine eigenen CUDA-Kernels}
   @row{Workload | agentisch, eng: Security und Code}
 }
 
-@section{Das unmögliche Dreieck}
+Das unmögliche Dreieck: Von den drei Zielen passt-in-VRAM, volle-Qualität und volle-Geschwindigkeit kann man bei einem dichten Modell, das größer als der VRAM ist, nur zwei gleichzeitig haben, solange man jedes Gewicht bei jedem Token liest. Die ganze Forschung zielt darauf, genau diese letzte Annahme zu brechen.
 
-Von den drei Zielen passt-in-VRAM, volle-Qualität und volle-Geschwindigkeit kann man bei einem dichten Modell, das größer als der VRAM ist, nur zwei gleichzeitig haben, solange man jedes Gewicht bei jedem Token liest. Die ganze Forschung unten ist der Versuch, genau diese letzte Annahme zu brechen.
+@pagebreak
 
-@section{Was wir selbst gemessen haben}
+@chapter{Stand der Technik}
 
-@list{
-  @item{FFN ist rund 87\% der Block-Gewichte, also der Haupthebel.}
-  @item{Aktivierungs-Sparsity ist real: nur rund 4,5\% der FFN-Neuronen überschreiten 5\% des Maximums pro Token, rund 35\% überschreiten 1\%.}
-  @item{Oracle-Masking: die oberen 50\% der Neuronen zu behalten ist bit-identisch; darunter sinkt die Top-1-Übereinstimmung sanft (25\% ergibt 90\%, 10\% ergibt 78\%).}
-  @item{Statischer Skew ist schwach: die 25\% häufigsten Neuronen decken nur rund 39\% der Aktivierungen ab. SiLU liefert kein Power-Law.}
-}
+@color[red]{●} @small{@italic{fremd — fremde Arbeiten, gesichtet und gegen unsere Lage bewertet}}
 
-@note{Diese Messungen sind genau konsistent mit der Literatur: ein fester Hot-Satz wirkt nur bei ReLU-Modellen; bei SwiGLU muss man magnitude-basiert pro Token vorgehen.}
+@section{Verlustfreie Gewichts-Kompression}
 
-@chapter{Verlustfreie Gewichts-Kompression}
-
-Die direkteste Antwort auf 15 GB in 12 GB ohne Verlust: das Modell verlustfrei kleiner speichern und beim Rechnen entpacken. Keine Quantisierung, die Ausgabe bleibt bit-identisch.
+Das Modell verlustfrei kleiner speichern und beim Rechnen entpacken. Die Ausgabe bleibt bit-identisch.
 
 @list{
-  @item{@bold{DFloat11} (NeurIPS 2025). Huffman-Codierung der BF16-Exponenten ergibt rund 30\% kleiner bei bit-identischer Ausgabe. Für uns: 15 GB werden zu rund 10,5 GB und passen in die 3060. @link{https://arxiv.org/pdf/2504.11651}{arxiv.org\/pdf\/2504.11651}}
-  @item{@bold{Approaching Shannon Bound} (2026). Treibt die verlustfreie Kompression näher ans Optimum. @link{https://arxiv.org/pdf/2606.15789}{arxiv.org\/pdf\/2606.15789}}
-  @item{@bold{NeuZip}. Frühere verlustfreie Kompression, Vergleichsbasis von DFloat11.}
+  @item{@bold{DFloat11} (NeurIPS 2025). Huffman-Codierung der BF16-Exponenten ergibt ~30\% kleiner bei bit-identischer Ausgabe. Für uns: 15 GB werden zu ~10,5 GB. @link{https://arxiv.org/pdf/2504.11651}{arxiv 2504.11651}}
+  @item{@bold{Approaching Shannon Bound} (2026). Näher ans informationstheoretische Optimum. @link{https://arxiv.org/pdf/2606.15789}{arxiv 2606.15789}}
+  @item{@bold{NeuZip}. Frühere verlustfreie Kompression, Vergleichsbasis.}
 }
+@note[Verdict: bedingt]{Perfekt im Konzept, aber das Entpacken braucht einen GPU-Decode-Kernel (kollidiert mit keine-Kernels), und DFloat11 zielt auf BF16, unsere Gewichte sind bereits Q8.}
 
-@note[Verdict: bedingt]{Konzeptionell perfekt, praktisch mit zwei Haken. Erstens braucht das Entpacken einen GPU-Decode-Kernel, was mit keine-Kernels kollidiert. Zweitens zielt DFloat11 auf BF16, unsere Gewichte sind bereits Q8, die Entropie-Reserve ist kleiner. Für ein unquantisiertes großes Modell ist dies der sauberste Fit-Weg, kostet aber die keine-Kernels-Regel.}
+@section{Aktivierungs-Sparsity}
 
-@chapter{Aktivierungs-Sparsity}
-
-Man muss nicht jedes FFN-Neuron rechnen, weil die meisten pro Token fast nichts beitragen. Der Trick ist, das bei SwiGLU\/SiLU (keine harten Nullen) hinzubekommen.
+Die meisten FFN-Neuronen tragen pro Token fast nichts bei. Der Trick: das bei SwiGLU\/SiLU (keine harten Nullen) ausnutzen.
 
 @list{
-  @item{@bold{TEAL} (ICLR 2025). Magnitude-basierte Sparsity im ganzen Modell ohne Retraining: 40 bis 50\% modellweit bei minimalem Qualitätsverlust, 1,5x bis 1,8x schneller. Genau unser Masktest-Ergebnis, nur breit validiert. @link{https://arxiv.org/pdf/2408.14690}{arxiv.org\/pdf\/2408.14690}}
-  @item{@bold{CATS}. Training-free Sparsity speziell für SwiGLU, Magnitude-Pruning auf dem Wgate-Ausgang, also genau der Stelle, die wir messen.}
-  @item{@bold{SparseInfer}. Training-free Vorhersage des aktiven Satzes, ein Prädiktor ohne Training. @link{https://arxiv.org/pdf/2411.12692}{arxiv.org\/pdf\/2411.12692}}
-  @item{@bold{Polar Sparsity} (2025). Hochdurchsatz-Variante, verschiebt den Fokus mit der Batch-Größe. @link{https://arxiv.org/pdf/2505.14884}{arxiv.org\/pdf\/2505.14884}}
-  @item{Kontext: @bold{DejaVu} und @bold{PowerInfer} nutzen einen festen Hot-Satz, das funktioniert nur bei ReLU-Modellen, nicht bei SwiGLU. Deckt sich mit unserem schwachen Skew.}
+  @item{@bold{TEAL} (ICLR 2025). Magnitude-Sparsity ohne Retraining, 40 bis 50\% modellweit, 1,5x bis 1,8x schneller. @link{https://arxiv.org/pdf/2408.14690}{arxiv 2408.14690}}
+  @item{@bold{CATS}. Training-free Sparsity für SwiGLU, Magnitude-Pruning auf dem Wgate-Ausgang.}
+  @item{@bold{SparseInfer}. Training-free Vorhersage des aktiven Satzes. @link{https://arxiv.org/pdf/2411.12692}{arxiv 2411.12692}}
+  @item{@bold{Polar Sparsity} (2025). Hochdurchsatz-Variante. @link{https://arxiv.org/pdf/2505.14884}{arxiv 2505.14884}}
+  @item{Kontext: @bold{DejaVu} und @bold{PowerInfer} nutzen einen festen Hot-Satz, nur bei ReLU-Modellen, nicht bei SwiGLU.}
 }
+@note[Verdict: bestätigt aber kernel-abhängig]{40 bis 50\% der FFN-Rechnung sind verlustfrei streichbar, aber Rechnung zu sparen braucht einen Sparse-Kernel. Pure-Rust-Nutzen liegt auf dem CPU-Offload-Pfad.}
 
-@note[Verdict: bestätigt aber kernel-abhängig]{TEAL\/CATS zeigen, dass wir 40 bis 50\% der FFN-Rechnung verlustfrei streichen können. Aber Rechnung zu sparen heißt, nur die aktiven Neuron-Zeilen zu laden, und das braucht einen Sparse-Kernel. Auf der GPU unmöglich ohne Kernel; auf der CPU in reinem Rust machbar. Bester pure-Rust-Nutzen: Sparsity auf dem CPU-Offload-Pfad.}
+@section{Offloading-Systeme}
 
-@chapter{Offloading-Systeme}
-
-Modell zwischen GPU und CPU\/RAM aufteilen. Verlustfrei; die Kunst ist, den langsamen Pfad klein zu halten.
+Modell zwischen GPU und CPU\/RAM aufteilen, verlustfrei.
 
 @list{
-  @item{@bold{PowerInfer}. GPU-CPU-Hybrid über Aktivierungs-Sparsity plus Offline-Neuron-Placement, bis zu 11,69x über llama.cpp auf Consumer-GPU. @link{https://ipads.se.sjtu.edu.cn/_media/publications/powerinfer-20231219.pdf}{ipads.se.sjtu.edu.cn}}
-  @item{@bold{PowerInfer-2}. Dieselbe Idee auf Smartphones.}
-  @item{@bold{llama.cpp}. Der Standard: ganze Layer auf GPU, Rest auf CPU. Durch PCIe und schwache CPU limitiert, genau unsere Prognose.}
-  @item{@bold{DynamicInfer} (ICLR 2026). Dynamisches Placement zur Laufzeit. @link{https://openreview.net/pdf/e9b26b26d8a26d5844d0e52a27b30b35f86e875d.pdf}{openreview.net}}
-  @item{@bold{PIPO}, @bold{FlexInfer}, @bold{NEO}, @bold{FlexGen}. Pipelined Offloading, Transfer-Compute-Overlap, CPU-Offloading gegen die GPU-Memory-Crisis. @link{https://arxiv.org/pdf/2504.03664}{PIPO}, @link{https://arxiv.org/pdf/2411.01142}{NEO}}
+  @item{@bold{PowerInfer}. GPU-CPU-Hybrid über Sparsity plus Offline-Placement, bis zu 11,69x über llama.cpp. @link{https://ipads.se.sjtu.edu.cn/_media/publications/powerinfer-20231219.pdf}{PowerInfer}}
+  @item{@bold{llama.cpp}. Ganze Layer GPU, Rest CPU; durch PCIe und schwache CPU limitiert.}
+  @item{@bold{DynamicInfer} (ICLR 2026), @bold{PIPO}, @bold{FlexInfer}, @bold{NEO}, @bold{FlexGen}. Dynamisches Placement, Transfer-Compute-Overlap. @link{https://arxiv.org/pdf/2504.03664}{PIPO}, @link{https://arxiv.org/pdf/2411.01142}{NEO}}
 }
+@note[Verdict: passt und pure Rust]{Der robuste Fit-Weg, bestehende Kernels wiederverwenden. PowerInfers 11x gelten für ReLU plus eigene Kernels, nicht übertragbar.}
 
-@note[Verdict: passt und pure Rust]{Der robuste Fit-Weg: ganze Layer GPU\/CPU, bestehende Kernels wiederverwenden. Ehrlicher Speed: rund 2 bis 3 Token pro Sekunde beim 15-GB-Modell, weil die CPU der Flaschenhals ist. PowerInfers 11x gelten für ReLU plus eigene Kernels, nicht übertragbar. Direkter pure-Rust-Hebel: den CPU-Matmul beschleunigen.}
+@section{Spekulatives Decoding}
 
-@chapter{Spekulatives Decoding}
-
-Mehrere Token auf einmal erzeugen und in einem Pass prüfen. Bei Temperatur 0 verlustfrei. Haben wir schon (Prompt-Lookup, 1,67x auf Reuse-Workloads).
+Mehrere Token auf einmal erzeugen und in einem Pass prüfen; bei Temperatur 0 verlustfrei.
 
 @list{
-  @item{@bold{Prompt-Lookup} und @bold{Lookahead}. Kein zweites Modell; Entwürfe aus dem Kontext. Unser Ansatz.}
-  @item{@bold{Medusa}. Leichte Draft-Heads direkt am Zielmodell.}
-  @item{@bold{EAGLE / EAGLE-2 / EAGLE-3}. Aktueller SOTA, rund 1,98x; EAGLE-3 sagt Token direkt voraus. @link{https://arxiv.org/pdf/2503.01840}{EAGLE-3}, @link{https://arxiv.org/pdf/2406.16858}{EAGLE-2}}
-  @item{Survey EMNLP-Findings 2025. @link{https://aclanthology.org/2025.findings-emnlp.716.pdf}{aclanthology.org}}
+  @item{@bold{Prompt-Lookup} und @bold{Lookahead}. Kein zweites Modell; Entwürfe aus dem Kontext.}
+  @item{@bold{Medusa}. Leichte Draft-Heads am Zielmodell.}
+  @item{@bold{EAGLE-2/3}. SOTA, ~1,98x. @link{https://arxiv.org/pdf/2503.01840}{EAGLE-3}}
+  @item{Survey EMNLP-Findings 2025. @link{https://aclanthology.org/2025.findings-emnlp.716.pdf}{Survey}}
 }
+@note[Verdict: erledigt]{Mit der trainingsfreien Variante umgesetzt (siehe eigene Beiträge).}
 
-@note[Verdict: erledigt]{Mit der einfachsten, trainingsfreien Variante umgesetzt. EAGLE-3 wäre stärker, braucht aber ein trainiertes Draft-Head, was zu unserer QLoRA-Pipeline passt und keinen Kernel erfordert.}
+@section{KV-Cache-Kompression}
 
-@chapter{KV-Cache-Kompression}
-
-Betrifft nicht die Gewichte, sondern den mit der Kontextlänge wachsenden KV-Cache. Relevant für lange Agent-Sessions.
+Nicht die Gewichte, sondern den wachsenden KV-Cache. Relevant für lange Agent-Sessions.
 
 @list{
-  @item{@bold{StreamingLLM}. Nur erste und letzte Token behalten (Attention-Sinks).}
-  @item{@bold{H2O} und @bold{SnapKV}. Wichtige KV-Positionen pro Head auswählen.}
-  @item{@bold{PyramidKV}. Pro Layer unterschiedlich stark kürzen. @link{https://arxiv.org/pdf/2406.02069}{arxiv.org\/pdf\/2406.02069}}
-  @item{@bold{KIVI}. KV quantisieren (nicht unser Pfad, da Qualität).}
-  @item{@bold{THINK}. Query-abhängiges KV-Pruning.}
+  @item{@bold{StreamingLLM}, @bold{H2O}, @bold{SnapKV}. Wichtige KV-Positionen behalten.}
+  @item{@bold{PyramidKV}. Pro Layer unterschiedlich kürzen. @link{https://arxiv.org/pdf/2406.02069}{PyramidKV}}
+  @item{@bold{KIVI}. KV quantisieren (nicht unser Pfad). @bold{THINK}. Query-abhängiges Pruning.}
 }
+@note[Verdict: später relevant]{Für das 15-GB-Fit-Problem nicht der Hebel.}
 
-@note[Verdict: später relevant]{Nützlich, wenn Agenten über den 4096-Token-Cache hinaus laufen. Für das 15-GB-Fit-Problem nicht der Hebel.}
-
-@chapter{Adaptive Rechentiefe}
+@section{Adaptive Rechentiefe}
 
 @list{
-  @item{@bold{Mixture-of-Depths} (Raposo 2024). Nicht jedes Token durchläuft jeden Layer.}
-  @item{@bold{Mixture-of-Recursions} (2025). Geteilter Layer-Stack, pro Token dynamische Rekursionstiefe. @link{https://arxiv.org/pdf/2507.10524}{arxiv.org\/pdf\/2507.10524}}
-  @item{@bold{AdaPonderLM} (2026). Token-weise Tiefe mit gated pondering.}
-  @item{@bold{Early-Exit}. Frühzeitig aussteigen, wenn ein Token sicher ist.}
+  @item{@bold{Mixture-of-Depths} (2024). Nicht jedes Token durchläuft jeden Layer.}
+  @item{@bold{Mixture-of-Recursions} (2025). Pro Token dynamische Rekursionstiefe. @link{https://arxiv.org/pdf/2507.10524}{MoR}}
+  @item{@bold{Early-Exit}. Frühzeitig aussteigen bei sicheren Token.}
 }
+@note[Verdict: Architektur oder Training]{Braucht ein anders trainiertes Modell.}
 
-@note[Verdict: Architektur oder Training]{Braucht ein anders trainiertes Modell. Early-Exit-artiges ließe sich perspektivisch mit unserer Pipeline aufsetzen, ist aber ein großes, unsicheres Projekt.}
+@section{MoE statt dicht}
 
-@chapter{MoE statt dicht}
-
-Wenn groß und schnell das Ziel ist, ist die sauberste Antwort oft kein dichtes Modell, sondern MoE: 15 GB gesamt, aber nur rund 3 GB pro Token aktiv.
+15 GB gesamt, aber nur ~3 GB pro Token aktiv; der aktive Satz passt in den VRAM.
 
 @list{
-  @item{@bold{MoE-Infinity}. Experten in RAM\/SSD auslagern, heiße Experten GPU-resident, Prefetch versteckt Transfers. @link{https://github.com/EfficientMoE/MoE-Infinity/}{github.com\/EfficientMoE\/MoE-Infinity}}
-  @item{@bold{DALI}. Workload-bewusstes MoE-Offloading für lokale PCs. @link{https://arxiv.org/pdf/2602.03495}{arxiv.org\/pdf\/2602.03495}}
-  @item{@bold{HybriMoE} (DAC 2025) und @bold{fMoE}. CPU-GPU-Scheduling und fein-granulares Experten-Offloading.}
+  @item{@bold{MoE-Infinity}. Experten auslagern, heiße Experten resident. @link{https://github.com/EfficientMoE/MoE-Infinity/}{MoE-Infinity}}
+  @item{@bold{DALI}, @bold{HybriMoE}, @bold{fMoE}. Workload-bewusstes Experten-Offloading. @link{https://arxiv.org/pdf/2602.03495}{DALI}}
 }
+@note[Verdict: strategisch interessant]{Setzt voraus, dass wir von dichtem Qwen2.5 weggehen.}
 
-@note[Verdict: strategisch interessant]{Ein MoE-Code-Modell mit Experten-Offloading könnte groß-und-flott auf 12 GB besser lösen als dichtes Offloading, der aktive Satz passt in den VRAM. Setzt voraus, dass wir von dichtem Qwen2.5 weggehen.}
+@section{Domänen-Spezialisierung}
 
-@chapter{Domänen-Spezialisierung}
-
-Wichtig fürs ehrliche Bild: Die Idee, dass unser enger Agent einen kleineren, stabileren aktiven Satz hat, gibt es bereits.
+Die Idee, dass ein enger Agent einen kleineren, stabileren aktiven Satz hat, gibt es bereits.
 
 @list{
-  @item{@bold{SEAP}. Training-free Pruning task-spezifischer Neuronen über Aktivierungsmuster. @link{https://arxiv.org/pdf/2402.14800}{emergentmind\/2402.14800}}
-  @item{@bold{DieT (Diet Your LLM)}. Profiliert Aktivierungs-Magnituden über Tasks mit rund 100 Samples und baut eine globale Maske. @link{https://arxiv.org/html/2603.23985v1}{arxiv.org\/html\/2603.23985v1}}
-  @item{@bold{Half the Experts, All the Code}. One-Shot-Domänen-Pruning von MoE fürs Coding. @link{https://arxiv.org/pdf/2607.16721}{arxiv.org\/pdf\/2607.16721}}
-  @item{@bold{TrimLLM}. Progressives Layer-Dropping für domänenspezifische LLMs (ACL 2025).}
+  @item{@bold{SEAP}. Training-free Pruning task-spezifischer Neuronen. @link{https://arxiv.org/pdf/2402.14800}{SEAP}}
+  @item{@bold{DieT}. Aktivierungs-Magnituden über Tasks profilieren, globale Maske. @link{https://arxiv.org/html/2603.23985v1}{Diet Your LLM}}
+  @item{@bold{Half the Experts, All the Code}, @bold{TrimLLM}. Domänen-Pruning fürs Coding. @link{https://arxiv.org/pdf/2607.16721}{Half the Experts}}
+}
+@note[Verdict: nicht neu]{Unsere ursprüngliche Domänen-Idee existiert schon. Unser Beitrag ist die Messung, dass sie bei unserem Modell nicht trägt (siehe eigenes Experiment).}
+
+@pagebreak
+
+@chapter{Was wir gemacht haben}
+
+@color[green]{●} @small{@italic{von uns — Messungen, gebaute Systeme und ihre Beweise}}
+
+@section{Eigene Messungen}
+
+Erhoben am echten overflow\_wt-7B mit unseren Sonden (@code{poezi sparsity}, @code{masktest}, @code{skew}):
+
+@list{
+  @item{FFN ist ~87\% der Block-Gewichte, also der Haupthebel.}
+  @item{Aktivierungs-Sparsity ist real: nur ~4,5\% der FFN-Neuronen überschreiten 5\% des Maximums, ~35\% überschreiten 1\%.}
+  @item{Oracle-Masking: die oberen 50\% behalten ist bit-identisch; darunter sinkt die Top-1-Übereinstimmung sanft (25\% ergibt 90\%, 10\% ergibt 78\%).}
+  @item{Statischer Skew ist schwach: die 25\% häufigsten Neuronen decken nur ~39\% der Aktivierungen ab. SiLU liefert kein Power-Law.}
 }
 
-@warning[Eigenes Experiment: negatives Ergebnis]{Wir haben einen Hot-Satz aus Security\/Code-Prompts gelernt und seine Abdeckung auf anderen Security\/Code-Prompts gegen generischen Text gemessen (hot 25\%): Domäne 36,1\% gegen generisch 33,0\%, Gap nur 3,0 Prozentpunkte, nicht besser als die 39\%-Baseline. Der Hot-Satz ist nicht domänenspezifisch. Statisches Domänen-Offloading ist bei diesem dichten SiLU-Modell tot. Die eine potenziell originelle Idee ist damit empirisch widerlegt.}
+@section{Was wir gebaut haben}
+
+Alles reiner Rust (bis auf die früher geschriebenen Spec-Decode-Kernels), end-to-end auf der 3060 vermessen:
+
+@table[header]{
+  @row{Baustein | Ergebnis}
+  @row{Speculative Decoding | verlustfrei, 1,67x auf Code\/Agent-Reuse}
+  @row{AVX2-CPU-Matmul | 4x Kernel (5 auf 19,5 GB\/s), 2x CPU-Forward}
+  @row{Whole-Layer-Offloading | verlustfrei, ein 15-GB-Modell läuft auf 12 GB}
+  @row{Sparse CPU-FFN (opt-in) | plus 13 bis 24\% auf dem CPU-Pfad}
+  @row{Sparsity-aware Fine-Tuning | Hoyer-Strafe, Mechanismus validiert}
+}
+
+Die Offloading-Geschwindigkeit skaliert mit dem Anteil auf der CPU (7B, 40 Token):
+
+@table[header]{
+  @row{GPU-Layer | Token\/s}
+  @row{28 von 28 (voll GPU) | 5,7}
+  @row{20 von 28 | 3,6}
+  @row{14 von 28 | 2,9}
+  @row{7 von 28 | 2,4}
+}
+
+@section{Mathematische Grundlagen}
+
+@subsection{Satz 1: Verlustfreiheit des Spekulativen Decodings}
+
+@bold{Behauptung.} Bei Temperatur 0 erzeugt das Prompt-Lookup-Verfahren exakt dieselbe Token-Folge wie gewöhnliches Greedy-Decoding.
+
+Sei $z_t @in @R^{V}$ der Logit-Vektor des Forward-Passes auf dem Präfix $x_{1..t-1}$, und Greedy wähle $x_t = @text{argmax}_v z_t(v)$. Das Verfahren rät einen Entwurf $d_1,@dots,d_m$, berechnet in @bold{einem} batched Forward die Logits $z^{(0)},@dots,z^{(m)}$ an den Entwurfspositionen und akzeptiert $d_j$ genau dann, wenn
+
+$$ d_j = @text{argmax}_v z^{(j-1)}(v). $$
+
+@bold{Lemma (Bit-Identität).} Der batched Kernel berechnet für jedes Paar (Zeile, Token) dieselbe Summe in derselben Reihenfolge wie der Einzel-Token-Kernel; die Reduktion ist identisch. Also ist $z^{(j)}$ bit-gleich dem Logit-Vektor, den der sequentielle Greedy-Pass an derselben Position nach den bis dahin akzeptierten Token berechnet.
+
+@bold{Beweis (Induktion über die akzeptierten Positionen).} Ein akzeptiertes $d_j$ erfüllt $d_j=@text{argmax}_v z^{(j-1)}(v)$ und ist nach dem Lemma gleich Greedys Wahl an dieser Stelle. Das erste nicht akzeptierte bzw. das Anschluss-Token ist $@text{argmax}_v z^{(m)}(v)$, wieder Greedys Wahl. Der Cache wird exakt auf die akzeptierte Länge zurückgesetzt. Damit stimmt jedes ausgegebene Token mit Greedy überein. @bold{q.e.d.}
+
+@subsection{Satz 2: Fehlerschranke beim Weglassen inaktiver Neuronen}
+
+Die FFN-Ausgabe ist eine gewichtete Summe der Neuron-Beiträge
+
+$$ y = @sum_{i=1}^{n} g_i  w_i, $$
+
+wobei $w_i @in @R^{d}$ die $i$-te Spalte von $W_{@text{down}}$ ist und $g_i = @text{silu}(a_i)  u_i$ die post-SwiGLU-Aktivierung. Behalten wir nur eine Menge $S$ und setzen die übrigen $g_i$ auf 0, so ist der Fehler
+
+$$ @norm{y - @hat{y}} = @norm{@sum_{i @notin S} g_i w_i} @leq @sum_{i @notin S} @abs{g_i} @norm{w_i} @leq @paren{max_i @norm{w_i}} @sum_{i @notin S} @abs{g_i}. $$
+
+@bold{Folgerung.} Bei festem $@abs{S}$ wird diese Schranke minimiert, indem man die Neuronen mit den @bold{kleinsten} $@abs{g_i}$ weglässt. Genau das tut unser Masktest, und die Messung bestätigt es: bei 50\% behalten ist der Fehler 0 (bit-identisch). @bold{q.e.d.}
+
+@subsection{Satz 3: Das Hoyer-Sparsitätsmaß}
+
+Unsere Trainingsstrafe minimiert $@frac{@norm{g}_1}{@norm{g}_2}$. Für $g @in @R^{n}, g @neq 0$ gilt
+
+$$ 1 @leq @frac{@norm{g}_1}{@norm{g}_2} @leq @sqrt{n}. $$
+
+@bold{Beweis.} Die obere Schranke ist Cauchy-Schwarz mit dem Einsvektor: $@norm{g}_1 = @sum_i @abs{g_i} @cdot 1 @leq @sqrt{@sum_i g_i^2}  @sqrt{@sum_i 1} = @sqrt{n}  @norm{g}_2$, mit Gleichheit genau dann, wenn alle $@abs{g_i}$ gleich sind (dicht). Die untere Schranke folgt aus $@norm{g}_2^2 = @sum_i g_i^2 @leq @paren{@sum_i @abs{g_i}}^2 = @norm{g}_1^2$, mit Gleichheit genau dann, wenn höchstens ein $g_i$ ungleich 0 ist (maximal sparse).
+
+@bold{Skaleninvarianz.} Für $c > 0$ ist $@frac{@norm{c g}_1}{@norm{c g}_2} = @frac{c @norm{g}_1}{c @norm{g}_2} = @frac{@norm{g}_1}{@norm{g}_2}$. Das Maß misst also die @italic{Form} der Verteilung, nicht ihre Größe. Deshalb bewegt es die relative Sparsität, wo eine reine $L_1$-Strafe (die nur gleichmäßig schrumpft) sie nicht bewegt. @bold{q.e.d.}
+
+@subsection{Satz 4: Verlustfreiheit des Layer-Offloadings}
+
+Der Forward-Pass ist eine Verkettung von Layer-Funktionen. Mit $h_1,@dots,h_L$ und Kopf $p$ (Norm plus Projektion) gilt
+
+$$ f(x) = p @paren{h_L @paren{@dots h_{k+1} @paren{h_k @paren{@dots h_1(x)}}}}. $$
+
+Beim Offloading rechnet die GPU $x' = h_k(@dots h_1(x))$, überträgt den Zwischenzustand $x'$ (nur $d$ Zahlen) auf die CPU, diese rechnet $x'' = h_L(@dots h_{k+1}(x'))$, und die GPU liefert $p(x'')$. Da die übertragene Größe exakt der Zwischenzustand ist und Funktionskomposition assoziativ ist, ist das Ergebnis mathematisch dasselbe $f(x)$; es unterscheidet sich nur um die Gleitkomma-Rundung zwischen GPU und CPU (bei uns ~$10^{-5}$), die die Greedy-Auswahl nicht kippt. Die Messung bestätigt es: bei erzwungenem 14-von-28-Split ist die Ausgabe token-identisch zur vollen GPU. @bold{q.e.d.}
+
+@pagebreak
+
+@chapter{Eigenes Experiment: Domänen-Sparsity}
+
+@color[green]{●} @small{@italic{von uns — eigene Hypothese, eigenes Experiment (poezi domaintest)}}
+
+@warning[Negatives Ergebnis]{Wir haben einen Hot-Satz aus Security\/Code-Prompts gelernt und seine Abdeckung auf anderen Security\/Code-Prompts gegen generischen Text gemessen (hot 25\%): Domäne 36,1\% gegen generisch 33,0\%, Gap nur 3,0 Prozentpunkte, nicht besser als die 39\%-Baseline. Der Hot-Satz ist nicht domänenspezifisch. Statisches Domänen-Offloading ist bei diesem dichten SiLU-Modell tot. Die eine potenziell originelle Idee ist damit empirisch widerlegt.}
 
 @chapter{Ehrliche Synthese}
 
-Praktisch jeder Hebel, den wir diskutiert haben, ist publiziert: spekulatives Decoding, Aktivierungs-Sparsity (TEAL\/CATS), Prädiktoren, Offloading, verlustfreie Kompression, KV-Kompression, MoE-Offloading, Domänen-Pruning. Die echte, unterbeleuchtete Lücke liegt nicht in einer neuen Technik, sondern in unserem Regime.
+@color[green]{●} @small{@italic{von uns — eigene Analyse}}
+
+Praktisch jeder Hebel ist publiziert. Die echte, unterbeleuchtete Lücke liegt nicht in einer neuen Technik, sondern in unserem Regime:
 
 @numbered{
   @item{@bold{Schwache GPU plus sehr langsame CPU plus keine eigenen Kernels.} Ob die Methoden der Literatur unter reiner Orchestrierung auf einer 3060 netto noch gewinnen, ist kaum untersucht.}
-  @item{@bold{Ein einzelner, eng spezialisierter, selbst fine-getunter Agent.} Unser Test zeigt: die Domäne allein erzeugt keine Struktur. Also müsste man sie hineintrainieren. Die eine verbliebene originelle Richtung: Sparsity aktiv ins Fine-Tuning hineintrainieren, sodass der Agent lernt, scharf und stabil sparse zu feuern.}
-  @item{@bold{Ein ehrlich gemessener, kombinierter Stack} für genau dieses Gerät: verlustfreie Kompression mal Aktivierungs-Sparsity mal spekulatives Decoding, end-to-end auf einer 3060 vermessen.}
+  @item{@bold{Ein einzelner, eng spezialisierter, selbst fine-getunter Agent.} Unser Test zeigt: die Domäne allein erzeugt keine Struktur. Man müsste sie hineintrainieren, Richtung sparsity-aware Fine-Tuning.}
+  @item{@bold{Ein ehrlich gemessener, kombinierter Stack} für genau dieses Gerät: verlustfreie Kompression mal Sparsity mal Spekulation, end-to-end auf einer 3060.}
 }
 
-@note{Nüchtern: Einen echten algorithmischen Durchbruch sollten wir nicht versprechen. Realistisch ist ein origineller Systems- und Empirie-Beitrag im Low-End- und Single-Agent-Regime, plus ein möglicherweise neuer Dreh beim sparsity-aware Fine-Tuning unseres eigenen Agenten.}
+@note{Nüchtern: einen algorithmischen Durchbruch versprechen wir nicht. Realistisch ist ein origineller Systems- und Empirie-Beitrag im Low-End- und Single-Agent-Regime.}
 
 @chapter{Empfohlene Forschungsagenda}
 
-Reihenfolge nach Nutzen geteilt durch Risiko:
+@color[green]{●} @small{@italic{von uns — eigener Plan}}
 
 @numbered{
-  @item{@bold{CPU-Matmul beschleunigen} (reiner Rust, risikoarm, hoher Hebel). Der CPU-Pfad limitiert jedes Offloading. SIMD, Cache-Blocking, Threading. Fundament für alles Offloading.}
-  @item{@bold{Whole-Layer-Offloading} (reiner Rust, Fit-Ziel). Erreicht 15 GB in 12 GB bei voller Qualität, rund 2 bis 3 Token pro Sekunde.}
-  @item{@bold{Sparsity auf dem CPU-Offload-Pfad.} Ausgelagerte FFN-Layer nur ihren aktiven Teil rechnen lassen, verlustfrei laut unserem Masktest.}
-  @item{@bold{Sparsity-aware Fine-Tuning} (nutzt unsere QLoRA-Pipeline, möglicher Eigenbeitrag). Den Agenten so trainieren, dass seine Aktivierungen schärfer und stabiler werden.}
-  @item{@bold{DFloat11-artige verlustfreie Kompression}, falls wir die keine-Kernels-Regel hierfür lockern.}
-  @item{@bold{MoE-Pfad evaluieren.} Ein MoE-Code-Modell plus Experten-Offloading könnte das Problem fundamental besser lösen.}
+  @item{@bold{CPU-Matmul beschleunigen} (reiner Rust, risikoarm). Fundament für alles Offloading. @italic{Erledigt: 4x.}}
+  @item{@bold{Whole-Layer-Offloading}. 15 GB in 12 GB bei voller Qualität. @italic{Erledigt.}}
+  @item{@bold{Sparsity auf dem CPU-Offload-Pfad.} @italic{Erledigt als opt-in, near-lossless.}}
+  @item{@bold{Sparsity-aware Fine-Tuning} (QLoRA, möglicher Eigenbeitrag). @italic{Mechanismus validiert, voller Lauf offen.}}
+  @item{@bold{DFloat11-artige verlustfreie Kompression}, falls wir die keine-Kernels-Regel lockern.}
+  @item{@bold{MoE-Pfad evaluieren.}}
 }
 
 @chapter{Quellen}
 
+@color[red]{●} @small{@italic{fremd — alles Fremdarbeiten}}
+
 @list{
   @item{Kompression: @link{https://arxiv.org/pdf/2504.11651}{DFloat11}, @link{https://github.com/LeanModels/DFloat11}{DFloat11 Code}, @link{https://arxiv.org/pdf/2606.15789}{Shannon-Bound}}
   @item{Sparsity: @link{https://arxiv.org/pdf/2408.14690}{TEAL}, @link{https://arxiv.org/pdf/2411.12692}{SparseInfer}, @link{https://arxiv.org/pdf/2505.14884}{Polar Sparsity}}
-  @item{Offloading: @link{https://ipads.se.sjtu.edu.cn/_media/publications/powerinfer-20231219.pdf}{PowerInfer}, @link{https://arxiv.org/pdf/2504.03664}{PIPO}, @link{https://arxiv.org/pdf/2503.03777}{FlexInfer}, @link{https://arxiv.org/pdf/2411.01142}{NEO}}
-  @item{Spekulatives Decoding: @link{https://arxiv.org/pdf/2503.01840}{EAGLE-3}, @link{https://arxiv.org/pdf/2401.15077}{EAGLE}, @link{https://aclanthology.org/2025.findings-emnlp.716.pdf}{Survey}}
+  @item{Offloading: @link{https://ipads.se.sjtu.edu.cn/_media/publications/powerinfer-20231219.pdf}{PowerInfer}, @link{https://arxiv.org/pdf/2504.03664}{PIPO}, @link{https://arxiv.org/pdf/2411.01142}{NEO}}
+  @item{Spekulatives Decoding: @link{https://arxiv.org/pdf/2503.01840}{EAGLE-3}, @link{https://aclanthology.org/2025.findings-emnlp.716.pdf}{Survey}}
   @item{KV-Cache: @link{https://arxiv.org/pdf/2406.02069}{PyramidKV}, @link{https://arxiv.org/pdf/2412.09036}{ZigZagKV}}
-  @item{Adaptive Tiefe: @link{https://arxiv.org/pdf/2507.10524}{Mixture-of-Recursions}, @link{https://arxiv.org/pdf/2603.01914}{AdaPonderLM}}
+  @item{Adaptive Tiefe: @link{https://arxiv.org/pdf/2507.10524}{Mixture-of-Recursions}}
   @item{MoE: @link{https://github.com/EfficientMoE/MoE-Infinity/}{MoE-Infinity}, @link{https://arxiv.org/pdf/2602.03495}{DALI}}
-  @item{Domäne: @link{https://arxiv.org/html/2603.23985v1}{Diet Your LLM}, @link{https://arxiv.org/pdf/2607.16721}{Half the Experts, All the Code}, @link{https://proceedings.mlr.press/v317/yao26a.html}{Domain-Specific Expert Pruning}}
+  @item{Domäne: @link{https://arxiv.org/html/2603.23985v1}{Diet Your LLM}, @link{https://arxiv.org/pdf/2607.16721}{Half the Experts}, @link{https://proceedings.mlr.press/v317/yao26a.html}{Domain-Specific Expert Pruning}}
 }
