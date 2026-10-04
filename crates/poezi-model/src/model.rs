@@ -113,6 +113,23 @@ impl KvCache {
             gpu: None,
         }
     }
+
+    /// Rewind the cache to `len` positions (speculative decoding: drop the
+    /// rejected tail after a partial accept). On GPU only the logical length
+    /// moves — stale entries past `len` are overwritten by the next forward and
+    /// never read (attention reads 0..=pos). On CPU the per-layer buffers shrink.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        if self.gpu.is_none() {
+            for layer in self.k.iter_mut().chain(self.v.iter_mut()) {
+                let per = if self.len > 0 { layer.len() / self.len } else { 0 };
+                layer.truncate(len * per);
+            }
+        }
+        self.len = len;
+    }
 }
 
 /// Max sequence length the GPU KV cache preallocates (VRAM: n_layer*cap*kv_dim*2).
@@ -280,6 +297,33 @@ impl<'a> Model<'a> {
         };
         cache.len += 1;
         logits
+    }
+
+    /// Verify `tokens` in ONE batched forward: they occupy positions
+    /// `cache.len .. cache.len + tokens.len()`, and the returned logits[i] are
+    /// the prediction *after* `tokens[i]` (i.e. for the next position). The GPU
+    /// path is bit-identical to calling [`forward`] on each token in turn, so a
+    /// caller can accept a verified prefix losslessly and then [`KvCache::truncate`]
+    /// back. Without a GPU this falls back to exactly that token-by-token loop.
+    pub fn forward_batch(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<Vec<f32>> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        if let (Some(w), Some(s)) = (&self.gpu, cache.gpu.as_mut()) {
+            let cfg = &self.cfg;
+            let base = cache.len;
+            let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
+            let mut xs = vec![0f32; tokens.len() * cfg.n_embd];
+            for (t, &tok) in tokens.iter().enumerate() {
+                let row = &self.tok_embd.data[tok as usize * rb..(tok as usize + 1) * rb];
+                dequant_row(self.tok_embd.ty, row, &mut xs[t * cfg.n_embd..(t + 1) * cfg.n_embd]);
+            }
+            let logits = w.forward_batch(s, &xs, base, tokens.len()).expect("gpu forward_batch");
+            cache.len += tokens.len();
+            logits
+        } else {
+            tokens.iter().map(|&t| self.forward(t, cache)).collect()
+        }
     }
 
     /// CPU forward pass (fallback when no GPU is available).

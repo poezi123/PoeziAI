@@ -143,7 +143,142 @@ extern "C" __global__ void rope(float* x,int n_heads,int head_dim,int pos,float 
         float ang=(float)pos*inv; float c=cosf(ang),s=sinf(ang);
         float x0=xh[k],x1=xh[k+half]; xh[k]=x0*c-x1*s; xh[k+half]=x0*s+x1*c; }
 }
+
+// ======================================================================
+// Batched variants (speculative decoding): verify k tokens in ONE pass.
+// Each kernel does, for every (row,token) pair, the SAME arithmetic in the
+// SAME order as its single-token sibling above — so the weight is read once
+// per row but the result is BIT-IDENTICAL to running the single kernel k
+// times. x is laid out [k][in_dim], y as [k][out_dim]. KB caps the batch.
+// ======================================================================
+// KB must be a compile-time constant and match SPEC_BATCH_MAX in Rust: the
+// accumulator array `acc[KB]` with #pragma-unrolled loops stays in registers
+// (a runtime-indexed acc[] spills to local memory and tanks throughput). Unused
+// lanes (t>=k) are predicated out; k is a kernel arg so t<k is warp-uniform,
+// which keeps the warp_sum (__shfl) reductions safe.
+#define KB 8
+// ---- Q8_0 GEMM: warp per row, k tokens verified at once ----
+extern "C" __global__ void matmul_q8_0_batch(float* y,const unsigned char* w,const float* x,int in_dim,int out_dim,int k){
+    unsigned int gid=blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5,lane=gid&31;
+    if(row>=out_dim) return;
+    int nb=in_dim/32; long rowbase=(long)row*nb*34; float acc[KB];
+    #pragma unroll
+    for(int t=0;t<KB;t++) acc[t]=0.0f;
+    for(int b=0;b<nb;b++){ long base=rowbase+(long)b*34;
+        float d=h2f((unsigned short)w[base]|((unsigned short)w[base+1]<<8));
+        signed char q=(signed char)w[base+2+lane];
+        float dq=d*(float)q; int col=b*32+lane;
+        #pragma unroll
+        for(int t=0;t<KB;t++) if(t<k) acc[t]+=dq*x[t*in_dim+col];
+    }
+    #pragma unroll
+    for(int t=0;t<KB;t++){ if(t<k){ float a=warp_sum(acc[t]); if(lane==0) y[t*out_dim+row]=a; } }
+}
+// ---- Q4_K GEMM ----
+extern "C" __global__ void matmul_q4_k_batch(float* y,const unsigned char* w,const float* x,int in_dim,int out_dim,int k){
+    unsigned int gid=blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5,lane=gid&31;
+    if(row>=out_dim) return; int nb=in_dim/256; long rowbase=(long)row*nb*144; float acc[KB];
+    #pragma unroll
+    for(int t=0;t<KB;t++) acc[t]=0.0f;
+    for(int sb=0;sb<nb;sb++){ long base=rowbase+(long)sb*144;
+        float d=h2f((unsigned short)w[base]|((unsigned short)w[base+1]<<8));
+        float dmin=h2f((unsigned short)w[base+2]|((unsigned short)w[base+3]<<8));
+        const unsigned char* scales=w+base+4; const unsigned char* qs=w+base+16;
+        int vb=sb*256;
+        for(int grp=0;grp<4;grp++){ unsigned char sc,m;
+            get_sm(grp*2,scales,&sc,&m);   float d1=d*sc, mm1=dmin*m;
+            get_sm(grp*2+1,scales,&sc,&m); float d2=d*sc, mm2=dmin*m;
+            unsigned char byte=qs[grp*32+lane];
+            float v1=d1*(float)(byte&0xF)-mm1; int c1=vb+grp*64+lane;
+            float v2=d2*(float)(byte>>4)-mm2;  int c2=vb+grp*64+32+lane;
+            #pragma unroll
+            for(int t=0;t<KB;t++) if(t<k){ acc[t]+=v1*x[t*in_dim+c1]; acc[t]+=v2*x[t*in_dim+c2]; }
+        }
+    }
+    #pragma unroll
+    for(int t=0;t<KB;t++){ if(t<k){ float a=warp_sum(acc[t]); if(lane==0) y[t*out_dim+row]=a; } }
+}
+// ---- Q6_K GEMM ----
+extern "C" __global__ void matmul_q6_k_batch(float* y,const unsigned char* w,const float* x,int in_dim,int out_dim,int k){
+    unsigned int gid=blockIdx.x*blockDim.x+threadIdx.x; int row=gid>>5,lane=gid&31;
+    if(row>=out_dim) return; int nb=in_dim/256; long rowbase=(long)row*nb*210; float acc[KB];
+    #pragma unroll
+    for(int t=0;t<KB;t++) acc[t]=0.0f; int is=lane/16;
+    for(int sb=0;sb<nb;sb++){ long base=rowbase+(long)sb*210;
+        const unsigned char* ql=w+base; const unsigned char* qh=w+base+128;
+        const signed char* sc=(const signed char*)(w+base+192);
+        float d=h2f((unsigned short)w[base+208]|((unsigned short)w[base+209]<<8));
+        for(int n=0;n<2;n++){ int qlb=n*64,qhb=n*32,scb=n*8,vb=sb*256+n*128;
+            int ql0=ql[qlb+lane], ql1=ql[qlb+lane+32], qhb_=qh[qhb+lane];
+            int q1=((ql0&0xF)|(((qhb_>>0)&3)<<4))-32;
+            int q2=((ql1&0xF)|(((qhb_>>2)&3)<<4))-32;
+            int q3=((ql0>>4) |(((qhb_>>4)&3)<<4))-32;
+            int q4=((ql1>>4) |(((qhb_>>6)&3)<<4))-32;
+            float w1=d*(float)sc[scb+is+0]*(float)q1;
+            float w2=d*(float)sc[scb+is+2]*(float)q2;
+            float w3=d*(float)sc[scb+is+4]*(float)q3;
+            float w4=d*(float)sc[scb+is+6]*(float)q4;
+            int c1=vb+lane,c2=vb+lane+32,c3=vb+lane+64,c4=vb+lane+96;
+            #pragma unroll
+            for(int t=0;t<KB;t++) if(t<k){ acc[t]+=w1*x[t*in_dim+c1]; acc[t]+=w2*x[t*in_dim+c2];
+                                  acc[t]+=w3*x[t*in_dim+c3]; acc[t]+=w4*x[t*in_dim+c4]; }
+        }
+    }
+    #pragma unroll
+    for(int t=0;t<KB;t++){ if(t<k){ float a=warp_sum(acc[t]); if(lane==0) y[t*out_dim+row]=a; } }
+}
+// ---- batched attention: block per (head, query token). Token `tok` sits at
+//      absolute position base_pos+tok and attends over 0..=base_pos+tok. ----
+extern "C" __global__ void attention_batch(float* out,const float* q,const float* kc,const float* vc,
+                                     int base_pos,int head_dim,int n_head,int n_head_kv,int kv_dim,int k){
+    int h=blockIdx.x; int tok=blockIdx.y; if(h>=n_head||tok>=k) return;
+    int n_pos=base_pos+tok+1;
+    int group=n_head/n_head_kv; int kvh=h/group; int t=threadIdx.x,nt=blockDim.x;
+    extern __shared__ float s[]; __shared__ float red[128];
+    const float* qh=q+(size_t)tok*n_head*head_dim+h*head_dim; float scale=rsqrtf((float)head_dim);
+    for(int p=t;p<n_pos;p+=nt){ const float* kt=kc+(size_t)p*kv_dim+kvh*head_dim;
+        float dp=0.0f; for(int i=0;i<head_dim;i++) dp+=qh[i]*kt[i]; s[p]=dp*scale; }
+    __syncthreads();
+    float m=-3.4e38f; for(int p=t;p<n_pos;p+=nt) m=fmaxf(m,s[p]);
+    red[t]=m; __syncthreads();
+    for(int o=nt>>1;o>0;o>>=1){ if(t<o) red[t]=fmaxf(red[t],red[t+o]); __syncthreads(); }
+    float gmax=red[0]; __syncthreads();
+    float sm=0.0f; for(int p=t;p<n_pos;p+=nt){ float e=__expf(s[p]-gmax); s[p]=e; sm+=e; }
+    red[t]=sm; __syncthreads();
+    for(int o=nt>>1;o>0;o>>=1){ if(t<o) red[t]+=red[t+o]; __syncthreads(); }
+    float gsum=red[0]; __syncthreads();
+    if(t<head_dim){ float acc=0.0f;
+        for(int p=0;p<n_pos;p++) acc+=(s[p]/gsum)*vc[(size_t)p*kv_dim+kvh*head_dim+t];
+        out[(size_t)tok*n_head*head_dim+h*head_dim+t]=acc; }
+}
+// ---- batched elementwise / norm ----
+extern "C" __global__ void rmsnorm_batch(float* out,const float* x,const float* w,int n,float eps,int k){
+    int tok=blockIdx.x; if(tok>=k) return;
+    const float* xt=x+(size_t)tok*n; float* ot=out+(size_t)tok*n;
+    int t=threadIdx.x,nt=blockDim.x; __shared__ float red[256];
+    float ss=0.0f; for(int i=t;i<n;i+=nt){ float v=xt[i]; ss+=v*v; }
+    red[t]=ss; __syncthreads();
+    for(int o=nt>>1;o>0;o>>=1){ if(t<o) red[t]+=red[t+o]; __syncthreads(); }
+    float scale=rsqrtf(red[0]/(float)n+eps);
+    for(int i=t;i<n;i+=nt) ot[i]=xt[i]*scale*w[i];
+}
+// bias broadcast: a[k][n] += bias[n]
+extern "C" __global__ void bias_batch(float* a,const float* bias,int n,int k){
+    int i=blockIdx.x*blockDim.x+threadIdx.x; if(i<n*k) a[i]+=bias[i%n];
+}
+extern "C" __global__ void rope_batch(float* x,int n_heads,int head_dim,int base_pos,float theta,int k){
+    int h=blockIdx.x; int tok=blockIdx.y; if(h>=n_heads||tok>=k) return;
+    int half=head_dim/2; float* xh=x+(size_t)tok*n_heads*head_dim+h*head_dim; int pos=base_pos+tok;
+    for(int kk=threadIdx.x;kk<half;kk+=blockDim.x){
+        float inv=1.0f/powf(theta,(2.0f*(float)kk)/(float)head_dim);
+        float ang=(float)pos*inv; float c=cosf(ang),s=sinf(ang);
+        float x0=xh[kk],x1=xh[kk+half]; xh[kk]=x0*c-x1*s; xh[kk+half]=x0*s+x1*c; }
+}
 "#;
+
+/// Max tokens verified per batched forward (prompt-lookup draft + 1). Must be
+/// <= KB in the kernels above.
+pub const SPEC_BATCH_MAX: usize = 8;
 
 /// A quantized weight resident in VRAM, with its ggml type.
 pub struct GpuWeight {
@@ -163,6 +298,13 @@ pub struct GpuBackend {
     f_add: CudaFunction,
     f_swiglu: CudaFunction,
     f_rope: CudaFunction,
+    f_q8_b: CudaFunction,
+    f_q4k_b: CudaFunction,
+    f_q6k_b: CudaFunction,
+    f_attn_b: CudaFunction,
+    f_rmsnorm_b: CudaFunction,
+    f_bias_b: CudaFunction,
+    f_rope_b: CudaFunction,
 }
 
 impl GpuBackend {
@@ -179,6 +321,13 @@ impl GpuBackend {
             f_add: m.load_function("add_inplace")?,
             f_swiglu: m.load_function("swiglu")?,
             f_rope: m.load_function("rope")?,
+            f_q8_b: m.load_function("matmul_q8_0_batch")?,
+            f_q4k_b: m.load_function("matmul_q4_k_batch")?,
+            f_q6k_b: m.load_function("matmul_q6_k_batch")?,
+            f_attn_b: m.load_function("attention_batch")?,
+            f_rmsnorm_b: m.load_function("rmsnorm_batch")?,
+            f_bias_b: m.load_function("bias_batch")?,
+            f_rope_b: m.load_function("rope_batch")?,
             ctx,
             stream,
         })
@@ -271,12 +420,88 @@ impl GpuBackend {
         Ok(())
     }
 
+    // --- batched launchers (speculative decoding) ---
+    fn mm_batch_fn(&self, ty: GgmlType) -> R<&CudaFunction> {
+        Ok(match ty {
+            GgmlType::Q8_0 => &self.f_q8_b,
+            GgmlType::Q4K => &self.f_q4k_b,
+            GgmlType::Q6K => &self.f_q6k_b,
+            o => return Err(format!("gpu batched matmul: unsupported type {o:?}").into()),
+        })
+    }
+    /// Batched matmul: x is [k][in_dim], y is [k][out_dim] (both buffers may be
+    /// larger; only the first k rows are touched).
+    fn mm_batch(&self, w: &GpuWeight, in_dim: usize, out_dim: usize, k: usize, x: &CudaSlice<f32>, y: &mut CudaSlice<f32>) -> R<()> {
+        let func = self.mm_batch_fn(w.ty)?.clone();
+        let (in_i, out_i, k_i) = (in_dim as i32, out_dim as i32, k as i32);
+        const T: u32 = 256;
+        let blocks = (out_dim as u32).div_ceil(T / 32);
+        let cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (T, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.stream.launch_builder(&func);
+        b.arg(y);
+        b.arg(&w.buf);
+        b.arg(x);
+        b.arg(&in_i);
+        b.arg(&out_i);
+        b.arg(&k_i);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+    fn rmsnorm_batch(&self, out: &mut CudaSlice<f32>, x: &CudaSlice<f32>, w: &CudaSlice<f32>, n: usize, eps: f32, k: usize) -> R<()> {
+        let (n_i, k_i) = (n as i32, k as i32);
+        let cfg = LaunchConfig { grid_dim: (k as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let f = self.f_rmsnorm_b.clone();
+        let mut b = self.stream.launch_builder(&f);
+        b.arg(out);
+        b.arg(x);
+        b.arg(w);
+        b.arg(&n_i);
+        b.arg(&eps);
+        b.arg(&k_i);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+    /// Add a length-`n` bias to each of the k rows of `a` (a is [k][n]).
+    fn bias_batch(&self, a: &mut CudaSlice<f32>, bias: &CudaSlice<f32>, n: usize, k: usize) -> R<()> {
+        let (n_i, k_i) = (n as i32, k as i32);
+        let f = self.f_bias_b.clone();
+        let mut b = self.stream.launch_builder(&f);
+        b.arg(a);
+        b.arg(bias);
+        b.arg(&n_i);
+        b.arg(&k_i);
+        unsafe { b.launch(LaunchConfig::for_num_elems((n * k) as u32)) }?;
+        Ok(())
+    }
+    fn rope_batch(&self, x: &mut CudaSlice<f32>, n_heads: usize, head_dim: usize, base_pos: usize, theta: f32, k: usize) -> R<()> {
+        let (nh, hd, bp, k_i) = (n_heads as i32, head_dim as i32, base_pos as i32, k as i32);
+        let cfg = LaunchConfig { grid_dim: (n_heads as u32, k as u32, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };
+        let f = self.f_rope_b.clone();
+        let mut b = self.stream.launch_builder(&f);
+        b.arg(x);
+        b.arg(&nh);
+        b.arg(&hd);
+        b.arg(&bp);
+        b.arg(&theta);
+        b.arg(&k_i);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
     // --- test helpers (host in/out) ---
     pub fn matmul_bytes(&self, ty: GgmlType, w: &[u8], in_dim: usize, out_dim: usize, x: &[f32]) -> R<Vec<f32>> {
         let gw = self.upload_weight(w, ty)?;
         let x_dev = self.stream.clone_htod(x)?;
         let mut y_dev = self.stream.alloc_zeros::<f32>(out_dim)?;
         self.mm(&gw, in_dim, out_dim, &x_dev, &mut y_dev)?;
+        Ok(self.stream.clone_dtoh(&y_dev)?)
+    }
+    /// Batched matmul test helper: `x` is [k][in_dim], returns [k][out_dim].
+    pub fn matmul_bytes_batch(&self, ty: GgmlType, w: &[u8], in_dim: usize, out_dim: usize, x: &[f32], k: usize) -> R<Vec<f32>> {
+        let gw = self.upload_weight(w, ty)?;
+        let x_dev = self.stream.clone_htod(x)?;
+        let mut y_dev = self.stream.alloc_zeros::<f32>(out_dim * k)?;
+        self.mm_batch(&gw, in_dim, out_dim, k, &x_dev, &mut y_dev)?;
         Ok(self.stream.clone_dtoh(&y_dev)?)
     }
 }
@@ -334,6 +559,16 @@ pub struct GpuSession {
     logits: CudaSlice<f32>,
     kcache: Vec<CudaSlice<f32>>,
     vcache: Vec<CudaSlice<f32>>,
+    // batched scratch (speculative decoding): each holds SPEC_BATCH_MAX rows.
+    xb_x: CudaSlice<f32>,  // residual stream  [B][n_embd]
+    xb_t: CudaSlice<f32>,  // normed / matmul-out temp [B][n_embd]
+    xb_q: CudaSlice<f32>,  // [B][n_embd]
+    xb_k: CudaSlice<f32>,  // [B][kv_dim]
+    xb_v: CudaSlice<f32>,  // [B][kv_dim]
+    xb_att: CudaSlice<f32>, // [B][n_embd]
+    xb_gate: CudaSlice<f32>, // [B][n_ff]
+    xb_up: CudaSlice<f32>,   // [B][n_ff]
+    xb_logits: CudaSlice<f32>, // [B][vocab]
 }
 
 /// Builder: feed weights in, get a GpuWeights out.
@@ -432,6 +667,15 @@ impl GpuWeights {
             logits: z(c.vocab)?,
             kcache,
             vcache,
+            xb_x: z(SPEC_BATCH_MAX * c.n_embd)?,
+            xb_t: z(SPEC_BATCH_MAX * c.n_embd)?,
+            xb_q: z(SPEC_BATCH_MAX * c.n_embd)?,
+            xb_k: z(SPEC_BATCH_MAX * c.kv_dim)?,
+            xb_v: z(SPEC_BATCH_MAX * c.kv_dim)?,
+            xb_att: z(SPEC_BATCH_MAX * c.n_embd)?,
+            xb_gate: z(SPEC_BATCH_MAX * c.n_ff)?,
+            xb_up: z(SPEC_BATCH_MAX * c.n_ff)?,
+            xb_logits: z(SPEC_BATCH_MAX * c.vocab)?,
         })
     }
 
@@ -508,6 +752,103 @@ impl GpuWeights {
         b.arg(&nh);
         b.arg(&nhkv);
         b.arg(&kvd);
+        unsafe { b.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// Batched forward (speculative decoding): verify `k` tokens in ONE pass.
+    /// `x0s` holds the k token embeddings concatenated ([k][n_embd]); they occupy
+    /// positions `base_pos .. base_pos+k`. Returns k logit vectors (one per token).
+    /// Uses the batched kernels, which are bit-identical to running `forward`
+    /// token-by-token — so accepting a prefix is lossless. The caller rewinds the
+    /// KV cache (`len`) to the accepted length afterwards.
+    pub fn forward_batch(&self, s: &mut GpuSession, x0s: &[f32], base_pos: usize, k: usize) -> R<Vec<Vec<f32>>> {
+        let c = &self.cfg;
+        let be = &self.be;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        if k > SPEC_BATCH_MAX {
+            return Err(format!("batch {k} exceeds SPEC_BATCH_MAX {SPEC_BATCH_MAX}").into());
+        }
+        if base_pos + k > c.kv_cap {
+            return Err(format!("kv cache full (cap {})", c.kv_cap).into());
+        }
+        {
+            let mut xdst = s.xb_x.slice_mut(0..k * c.n_embd);
+            be.stream.memcpy_htod(x0s, &mut xdst)?;
+        }
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // attention
+            be.rmsnorm_batch(&mut s.xb_t, &s.xb_x, &layer.attn_norm, c.n_embd, c.rms_eps, k)?;
+            be.mm_batch(&layer.wq, c.n_embd, c.n_embd, k, &s.xb_t, &mut s.xb_q)?;
+            be.bias_batch(&mut s.xb_q, &layer.bq, c.n_embd, k)?;
+            be.mm_batch(&layer.wk, c.n_embd, c.kv_dim, k, &s.xb_t, &mut s.xb_k)?;
+            be.bias_batch(&mut s.xb_k, &layer.bk, c.kv_dim, k)?;
+            be.mm_batch(&layer.wv, c.n_embd, c.kv_dim, k, &s.xb_t, &mut s.xb_v)?;
+            be.bias_batch(&mut s.xb_v, &layer.bv, c.kv_dim, k)?;
+            be.rope_batch(&mut s.xb_q, c.n_head, c.head_dim, base_pos, c.rope_theta, k)?;
+            be.rope_batch(&mut s.xb_k, c.n_head_kv, c.head_dim, base_pos, c.rope_theta, k)?;
+
+            // store all k new k/v into the cache (contiguous: positions base..base+k)
+            let off = base_pos * c.kv_dim;
+            let span = k * c.kv_dim;
+            {
+                let ksrc = s.xb_k.slice(0..span);
+                let mut kdst = s.kcache[li].slice_mut(off..off + span);
+                be.stream.memcpy_dtod(&ksrc, &mut kdst)?;
+            }
+            {
+                let vsrc = s.xb_v.slice(0..span);
+                let mut vdst = s.vcache[li].slice_mut(off..off + span);
+                be.stream.memcpy_dtod(&vsrc, &mut vdst)?;
+            }
+            self.attend_batch(s, li, base_pos, k)?;
+
+            be.mm_batch(&layer.wo, c.n_embd, c.n_embd, k, &s.xb_att, &mut s.xb_t)?;
+            be.add(&mut s.xb_x, &s.xb_t, k * c.n_embd)?;
+
+            // feed-forward
+            be.rmsnorm_batch(&mut s.xb_t, &s.xb_x, &layer.ffn_norm, c.n_embd, c.rms_eps, k)?;
+            be.mm_batch(&layer.w_gate, c.n_embd, c.n_ff, k, &s.xb_t, &mut s.xb_gate)?;
+            be.mm_batch(&layer.w_up, c.n_embd, c.n_ff, k, &s.xb_t, &mut s.xb_up)?;
+            be.swiglu(&mut s.xb_gate, &s.xb_up, k * c.n_ff)?;
+            be.mm_batch(&layer.w_down, c.n_ff, c.n_embd, k, &s.xb_gate, &mut s.xb_t)?;
+            be.add(&mut s.xb_x, &s.xb_t, k * c.n_embd)?;
+        }
+
+        be.rmsnorm_batch(&mut s.xb_t, &s.xb_x, &self.out_norm, c.n_embd, c.rms_eps, k)?;
+        be.mm_batch(&self.output, c.n_embd, c.vocab, k, &s.xb_t, &mut s.xb_logits)?;
+        let flat = be.stream.clone_dtoh(&s.xb_logits.slice(0..k * c.vocab))?;
+        Ok(flat.chunks(c.vocab).map(|r| r.to_vec()).collect())
+    }
+
+    fn attend_batch(&self, s: &mut GpuSession, layer: usize, base_pos: usize, k: usize) -> R<()> {
+        let c = &self.cfg;
+        let bp = base_pos as i32;
+        let hd = c.head_dim as i32;
+        let nh = c.n_head as i32;
+        let nhkv = c.n_head_kv as i32;
+        let kvd = c.kv_dim as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (c.n_head as u32, k as u32, 1),
+            block_dim: (c.head_dim as u32, 1, 1),
+            shared_mem_bytes: ((base_pos + k) * 4) as u32,
+        };
+        let f = self.be.f_attn_b.clone();
+        let mut b = self.be.stream.launch_builder(&f);
+        b.arg(&mut s.xb_att);
+        b.arg(&s.xb_q);
+        b.arg(&s.kcache[layer]);
+        b.arg(&s.vcache[layer]);
+        b.arg(&bp);
+        b.arg(&hd);
+        b.arg(&nh);
+        b.arg(&nhkv);
+        b.arg(&kvd);
+        let k_i = k as i32;
+        b.arg(&k_i);
         unsafe { b.launch(cfg) }?;
         Ok(())
     }
@@ -613,4 +954,50 @@ mod tests {
     #[test] fn gpu_q8_matches_cpu() { check(GgmlType::Q8_0, 34, 32); }
     #[test] fn gpu_q4k_matches_cpu() { check(GgmlType::Q4K, 144, 256); }
     #[test] fn gpu_q6k_matches_cpu() { check(GgmlType::Q6K, 210, 256); }
+
+    /// The batched kernel must be BIT-IDENTICAL to running the single-token
+    /// kernel on each column — that identity is what makes speculative decoding
+    /// lossless. We check exact f32 bit equality, not a tolerance.
+    fn check_batch(ty: GgmlType, block_bytes: usize, block_elems: usize) {
+        if !gpu_available() { return; }
+        let (in_dim, out_dim, k) = (block_elems * 3, 200, 5);
+        let nb = in_dim / block_elems;
+        let row = nb * block_bytes;
+        let mut r = rng();
+        let mut w = vec![0u8; out_dim * row];
+        for byte in w.iter_mut() { *byte = (r() & 0xff) as u8; }
+        for j in 0..out_dim {
+            for b in 0..nb {
+                let base = j * row + b * block_bytes;
+                match ty {
+                    GgmlType::Q4K => {
+                        let d = fp16_bytes(&mut r); let dm = fp16_bytes(&mut r);
+                        w[base..base + 2].copy_from_slice(&d);
+                        w[base + 2..base + 4].copy_from_slice(&dm);
+                    }
+                    GgmlType::Q6K => {
+                        let d = fp16_bytes(&mut r);
+                        w[base + 208..base + 210].copy_from_slice(&d);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let xb: Vec<f32> = (0..in_dim * k).map(|_| (r() % 1000) as f32 / 1000.0 - 0.5).collect();
+        let be = GpuBackend::new().expect("gpu");
+        let batched = be.matmul_bytes_batch(ty, &w, in_dim, out_dim, &xb, k).expect("batch");
+        for t in 0..k {
+            let single = be.matmul_bytes(ty, &w, in_dim, out_dim, &xb[t * in_dim..(t + 1) * in_dim]).expect("single");
+            for j in 0..out_dim {
+                assert_eq!(
+                    batched[t * out_dim + j].to_bits(),
+                    single[j].to_bits(),
+                    "{ty:?} token {t} row {j} not bit-identical"
+                );
+            }
+        }
+    }
+    #[test] fn gpu_q8_batch_bit_identical() { check_batch(GgmlType::Q8_0, 34, 32); }
+    #[test] fn gpu_q4k_batch_bit_identical() { check_batch(GgmlType::Q4K, 144, 256); }
+    #[test] fn gpu_q6k_batch_bit_identical() { check_batch(GgmlType::Q6K, 210, 256); }
 }

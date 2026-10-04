@@ -153,12 +153,19 @@ pub fn run(
     max_rounds: usize,
 ) {
     let mut last = Vec::new();
-    let feed = |text: &str, cache: &mut KvCache, last: &mut Vec<f32>| {
+    // `ctx` mirrors every token id currently in the KV cache (prompt + tool
+    // results + generated) — it is the haystack prompt-lookup drafts from.
+    let mut ctx: Vec<u32> = Vec::new();
+    let feed = |text: &str, cache: &mut KvCache, last: &mut Vec<f32>, ctx: &mut Vec<u32>| {
         for id in tok.encode(text, false, true) {
             *last = model.forward(id, cache);
+            ctx.push(id);
         }
     };
     let mut rng = Rng::new(0x9E3779B97F4A7C15);
+    // Speculative decoding (prompt-lookup) is only lossless under greedy
+    // selection, so restrict it to temp==0; otherwise use the single-token path.
+    let spec = gen.temp <= 0.0;
 
     // Tools are only offered when the sandbox is off AND at least one capability
     // is granted. Otherwise OVERFLOW just answers in plain text (no tool loop) —
@@ -175,11 +182,12 @@ pub fn run(
     } else {
         format!("<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", query)
     };
-    feed(&opening, cache, &mut last);
+    feed(&opening, cache, &mut last, &mut ctx);
 
     let mut last_sig = String::new();
     let mut repeats = 0;
     let mut recent: Vec<u32> = Vec::new();
+    let mut policy = SpecPolicy::default();
     for _ in 0..max_rounds {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -187,37 +195,119 @@ pub fn run(
         // Generate the assistant turn, streaming decoded text to the host.
         let mut raw = Vec::new();
         let mut pending = Vec::new();
-        for _ in 0..gen.max_tokens {
+        let mut produced = 0usize;
+        'gen: loop {
+            if produced >= gen.max_tokens {
+                break;
+            }
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
             let recent_set: std::collections::HashSet<u32> =
                 recent.iter().rev().take(gen.repeat_last_n).copied().collect();
-            let next = sample(&last, gen, &recent_set, &mut rng);
-            if Some(next) == tok.eos_id {
+            let tok0 = sample(&last, gen, &recent_set, &mut rng);
+            if Some(tok0) == tok.eos_id {
                 break;
             }
-            recent.push(next);
-            tok.push_token_bytes(next, &mut raw);
-            tok.push_token_bytes(next, &mut pending);
-            if let Ok(s) = std::str::from_utf8(&pending) {
-                host.event(Event::Token(s));
-                pending.clear();
-            } else if let Some(valid) = valid_prefix(&pending) {
-                host.event(Event::Token(&valid));
-                let n = valid.len();
-                pending.drain(..n);
-            }
-            // Once the model finishes a tool call, stop this turn and execute it —
-            // don't let it keep generating and HALLUCINATE the tool's response.
-            // Also stop if it starts fabricating a <tool_response> itself.
-            if tools_enabled {
-                let tail = String::from_utf8_lossy(&raw[raw.len().saturating_sub(48)..]);
-                if tail.contains("</tool_call>") || tail.contains("<tool_response>") {
+            let p = cache.len;
+
+            // Prompt-lookup draft from the context so far (ending with tok0). At
+            // temp==0 we verify the draft in one batched forward; otherwise the
+            // draft is empty and we fall back to the single-token path.
+            let draft = if spec {
+                let mut probe = ctx.clone();
+                probe.push(tok0);
+                prompt_lookup_draft(&probe, SPEC_NGRAM, SPEC_DRAFT)
+            } else {
+                Vec::new()
+            };
+
+            // Decide the tokens to commit this step, with per-token logits. Only
+            // run the batched verify when a draft exists and the adaptive gate
+            // says it is likely to pay off; otherwise take the single-token path.
+            let do_batch = !draft.is_empty() && policy.speculate();
+            let (to_emit, step_logits): (Vec<u32>, Vec<Vec<f32>>) = if !do_batch {
+                if !draft.is_empty() {
+                    policy.skipped();
+                }
+                let l = model.forward(tok0, cache);
+                (vec![tok0], vec![l])
+            } else {
+                // One batched forward over [tok0, draft…]; logits[i] predict the
+                // token after batch[i]. Accept the leading draft tokens that equal
+                // the model's own greedy choice (with the same repetition penalty
+                // applied to the evolving context) — this is exactly what the
+                // one-at-a-time path would have produced, hence lossless.
+                let batch: Vec<u32> = std::iter::once(tok0).chain(draft.iter().copied()).collect();
+                let lb = model.forward_batch(&batch, cache);
+                let mut rec = recent.clone();
+                rec.push(tok0);
+                let mut model_argmax = Vec::with_capacity(draft.len());
+                for (j, &d) in draft.iter().enumerate() {
+                    let rs: std::collections::HashSet<u32> =
+                        rec.iter().rev().take(gen.repeat_last_n).copied().collect();
+                    let mt = sample(&lb[j], gen, &rs, &mut rng);
+                    model_argmax.push(mt);
+                    if mt == d {
+                        rec.push(d); // accepted: it joins the penalty window
+                    } else {
+                        break; // first rejection ends the verifiable prefix
+                    }
+                }
+                let accepted = accepted_prefix(&draft, &model_argmax);
+                policy.record(accepted);
+                (batch[..=accepted].to_vec(), lb)
+            };
+
+            // Emit the committed tokens in order, applying the same stop checks
+            // as the single-token path after each one.
+            let mut emitted = 0usize;
+            let mut stop = false;
+            for &t in &to_emit {
+                if Some(t) == tok.eos_id {
+                    stop = true;
+                    break;
+                }
+                recent.push(t);
+                ctx.push(t);
+                tok.push_token_bytes(t, &mut raw);
+                tok.push_token_bytes(t, &mut pending);
+                if let Ok(s) = std::str::from_utf8(&pending) {
+                    host.event(Event::Token(s));
+                    pending.clear();
+                } else if let Some(valid) = valid_prefix(&pending) {
+                    host.event(Event::Token(&valid));
+                    let n = valid.len();
+                    pending.drain(..n);
+                }
+                emitted += 1;
+                produced += 1;
+                // Once the model finishes a tool call, stop this turn and execute
+                // it — don't let it keep generating and HALLUCINATE the tool's
+                // response. Also stop if it starts fabricating a <tool_response>.
+                if tools_enabled {
+                    let tail = String::from_utf8_lossy(&raw[raw.len().saturating_sub(48)..]);
+                    if tail.contains("</tool_call>") || tail.contains("<tool_response>") {
+                        stop = true;
+                        break;
+                    }
+                }
+                if produced >= gen.max_tokens {
+                    stop = true;
                     break;
                 }
             }
-            last = model.forward(next, cache);
+
+            // The batched forward committed every draft token to the KV cache;
+            // rewind to the tokens we actually emitted (lossless partial accept).
+            if do_batch {
+                cache.truncate(p + emitted);
+            }
+            // `last` now predicts the token after the last emitted one.
+            last = step_logits[emitted - 1].clone();
+            if stop {
+                break 'gen;
+            }
         }
 
         // In no-tools mode the generated turn IS the final answer.
@@ -265,7 +355,7 @@ pub fn run(
         let resp = format!(
             "<|im_end|>\n<|im_start|>user\n{responses}<|im_end|>\n<|im_start|>assistant\n"
         );
-        feed(&resp, cache, &mut last);
+        feed(&resp, cache, &mut last, &mut ctx);
     }
 }
 
@@ -596,5 +686,112 @@ pub fn compact(v: &Value) -> String {
         format!("{}…", &s[..140])
     } else {
         s
+    }
+}
+
+// --- Speculative decoding (prompt-lookup), CPU half ------------------------
+// Lossless speed-up: guess the next tokens from repetition in the text so far,
+// then let the model verify the whole guess in ONE batched forward pass. The
+// win needs `Model::forward_batch` + `KvCache::truncate` (added together with
+// the batched GPU kernel); these two pure helpers are that loop's draft and
+// verify steps, kept ready and unit-tested.
+
+/// Longest suffix n-gram prompt-lookup tries to match, and how many tokens it
+/// drafts per step. `SPEC_DRAFT + 1` must not exceed `poezi_cuda::SPEC_BATCH_MAX`.
+const SPEC_NGRAM: usize = 3;
+const SPEC_DRAFT: usize = 6;
+
+/// Prompt-lookup draft: find where the most recent `ng`-token suffix of `seq`
+/// occurred earlier and return up to `max_draft` tokens that followed it — a
+/// guess for what comes next. Empty if nothing matches (then decode normally).
+pub fn prompt_lookup_draft(seq: &[u32], max_ngram: usize, max_draft: usize) -> Vec<u32> {
+    let n = seq.len();
+    for ng in (1..=max_ngram).rev() {
+        if n <= ng {
+            continue;
+        }
+        let pat = &seq[n - ng..];
+        for i in (0..n - ng).rev() {
+            if &seq[i..i + ng] == pat {
+                let start = i + ng;
+                let end = (start + max_draft).min(n);
+                if start < end {
+                    return seq[start..end].to_vec();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Greedy verification: how many leading draft tokens match the model's own
+/// argmax at each slot (`model_argmax[j]` is what the model emits where
+/// `draft[j]` sits). Accepting this prefix is exactly what greedy decoding would
+/// have produced — hence lossless; the next token is then `model_argmax[m]`.
+pub fn accepted_prefix(draft: &[u32], model_argmax: &[u32]) -> usize {
+    let mut m = 0;
+    while m < draft.len() && m < model_argmax.len() && draft[m] == model_argmax[m] {
+        m += 1;
+    }
+    m
+}
+
+/// Adaptive gate for speculation. A batched verify costs ~1.5 single-token
+/// forwards (it is bandwidth-bound on the weights, read once) but emits
+/// `1 + accepted` tokens, so it only pays off once the average accepted length
+/// clears ~0.5. We track an EMA of accepted length and skip the batch when it
+/// drops below that — re-probing periodically so we notice when reuse resumes.
+/// This keeps speculation a big win on repetitive/agentic output and at worst a
+/// few-percent probe cost on freeform generation.
+pub struct SpecPolicy {
+    ema: f32,
+    since_probe: u32,
+}
+
+impl Default for SpecPolicy {
+    fn default() -> Self {
+        // Start optimistic: speculate from the first draft (agentic/code output
+        // reuses context heavily), then adapt down if drafts keep missing.
+        SpecPolicy { ema: 6.0, since_probe: 0 }
+    }
+}
+
+impl SpecPolicy {
+    const THRESH: f32 = 0.5;
+    const ALPHA: f32 = 0.4;
+    const REPROBE: u32 = 16;
+
+    /// Run a batched verify for this (already non-empty) draft?
+    pub fn speculate(&self) -> bool {
+        self.ema >= Self::THRESH || self.since_probe >= Self::REPROBE
+    }
+    /// Record a batch outcome (`accepted` = drafted tokens the model kept).
+    pub fn record(&mut self, accepted: usize) {
+        self.ema = Self::ALPHA * accepted as f32 + (1.0 - Self::ALPHA) * self.ema;
+        self.since_probe = 0;
+    }
+    /// Record that a draft existed but we skipped the batch (re-probe timer).
+    pub fn skipped(&mut self) {
+        self.since_probe += 1;
+    }
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::{accepted_prefix, prompt_lookup_draft};
+    #[test]
+    fn draft_finds_repeat() {
+        // suffix [20,30] last occurred at index 1, followed by 40,20,30.
+        let seq = [10u32, 20, 30, 40, 20, 30];
+        assert_eq!(prompt_lookup_draft(&seq, 3, 4), vec![40, 20, 30]);
+    }
+    #[test]
+    fn draft_empty_when_no_repeat() {
+        assert!(prompt_lookup_draft(&[1, 2, 3], 3, 4).is_empty());
+    }
+    #[test]
+    fn verify_stops_at_mismatch() {
+        assert_eq!(accepted_prefix(&[5, 6, 7], &[5, 6, 9, 1]), 2);
+        assert_eq!(accepted_prefix(&[5, 6], &[5, 6, 9]), 2);
     }
 }
