@@ -255,6 +255,36 @@ fn spec_selftest(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
     }
 }
 
+/// Research: quantify the sparse CPU FFN's quality. Generate a dense reference,
+/// then for several keep fractions measure the teacher-forced top-1 agreement
+/// of the CATS sparse path against it. Shows how lossy the |silu(gate)|-proxy
+/// threshold really is (vs the lossless oracle masktest on |g|).
+fn ffnquality(path: &str, n: usize) -> ExitCode {
+    let gguf = match poezi_gguf::GgufFile::open(path) {
+        Ok(f) => f, Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let tok = match poezi_model::Tokenizer::from_gguf(&gguf) {
+        Ok(t) => t, Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let mut model = match poezi_model::Model::load(&gguf) {
+        Ok(m) => m, Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let ids = tok.encode("Write a Rust function that reverses a linked list, then explain it.", tok.add_bos, true);
+    eprintln!("dense reference ({} prompt tokens, {n} new, CPU)…", ids.len());
+    model.set_ffn_keep(1.0);
+    let dense = model.greedy_cpu(&ids, n, None, tok.eos_id);
+    let nd = dense.len();
+    println!("sparse CPU FFN (CATS, threshold on |silu(gate)|) vs dense:\n");
+    println!("keep%   top1-agreement");
+    for &keep in &[0.75f32, 0.5, 0.25, 0.1] {
+        model.set_ffn_keep(keep);
+        let agree = model.teacher_forced_agreement(&ids, &dense, None);
+        println!("{:>4.0}%   {:>3}/{:<3}  ({:.0}%)", keep * 100.0, agree, nd, agree as f64 / nd as f64 * 100.0);
+    }
+    println!("\ntop1-agreement = positions where the sparse path's argmax equals dense.");
+    ExitCode::SUCCESS
+}
+
 /// Time a pure-CPU greedy generation (forces the CPU forward) and print the
 /// text + tok/s. Compare the text against `poezi gen` (GPU) to confirm the SIMD
 /// CPU path still produces correct output.
@@ -716,6 +746,15 @@ fn main() -> ExitCode {
             let n: usize = args.iter().position(|a| a == "-n")
                 .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(32);
             cpugen(path, prompt, n)
+        }
+        Some("ffnquality") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: poezi ffnquality <model.gguf> [-n N]");
+                return ExitCode::FAILURE;
+            };
+            let n: usize = args.iter().position(|a| a == "-n")
+                .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(48);
+            ffnquality(path, n)
         }
         Some("cpumatbench") => {
             let in_dim: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3584);

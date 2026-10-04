@@ -344,6 +344,12 @@ impl<'a> Model<'a> {
         self.gpu_layers
     }
 
+    /// Set the CPU-path FFN keep fraction at runtime (research: sweep quality vs
+    /// speed). Values outside (0,1) disable sparsity (full FFN).
+    pub fn set_ffn_keep(&mut self, k: f32) {
+        self.ffn_keep = if k > 0.0 && k < 1.0 { k } else { 1.0 };
+    }
+
     /// Offloading active: a GPU prefix plus a CPU tail.
     fn is_hybrid(&self) -> bool {
         self.gpu.is_some() && self.gpu_layers < self.cfg.n_layer
