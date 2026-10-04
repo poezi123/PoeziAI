@@ -254,6 +254,47 @@ fn spec_selftest(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
     }
 }
 
+/// Research: per-neuron activation skew. If a small fixed "hot" set of neurons
+/// captures most activations, a static hot(VRAM)/cold(CPU) split is lossless and
+/// keeps most FFN work on the fast path — PowerInfer's key enabler.
+fn skew_probe(path: &str, prompt: &str) -> ExitCode {
+    let gguf = match poezi_gguf::GgufFile::open(path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let tok = match poezi_model::Tokenizer::from_gguf(&gguf) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let model = match poezi_model::Model::load(&gguf) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let mut ids = tok.encode(prompt, tok.add_bos, true);
+    ids.truncate(64);
+    eprintln!("measuring neuron skew over {} tokens (CPU)…", ids.len());
+
+    let hot = [0.10f32, 0.25, 0.50];
+    let s = model.probe_neuron_skew(&ids, 0.01, &hot);
+    println!("threshold: |act| > {:.3}·max, {} tokens", s.thresh, s.n_tokens);
+    println!("\nhot-set%  activation coverage (fast-path hit rate)");
+    println!("          overall   per-layer min / median / max");
+    for (hi, &h) in s.hot_fracs.iter().enumerate() {
+        let mut pl = s.coverage_per_layer[hi].clone();
+        pl.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (min, med, max) = (pl[0], pl[pl.len() / 2], pl[pl.len() - 1]);
+        println!(
+            "{:>6.0}%   {:>5.1}%    {:>5.1}% / {:>5.1}% / {:>5.1}%",
+            h * 100.0, s.coverage_overall[hi] * 100.0, min * 100.0, med * 100.0, max * 100.0
+        );
+    }
+    println!("\nCoverage = share of per-token activations that land in the hot set.");
+    println!("High coverage at small hot% ⇒ keep hot% of FFN in VRAM, rest on CPU:");
+    println!("lossless (all neurons still computed) and only (100−coverage)% hits the");
+    println!("slow path. This is the static offloading plan — no predictor needed.");
+    ExitCode::SUCCESS
+}
+
 /// Research go/no-go: does dropping inactive FFN neurons change the output?
 /// Greedy-decode once dense, then with an oracle mask keeping only the top-X%
 /// neurons per layer, and report how long the token streams stay identical.
@@ -540,6 +581,18 @@ fn main() -> ExitCode {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(40);
             masktest(path, prompt, n)
+        }
+        Some("skew") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: poezi skew <model.gguf> [prompt]");
+                return ExitCode::FAILURE;
+            };
+            let prompt = args
+                .get(2)
+                .filter(|s| !s.starts_with('-'))
+                .map(String::as_str)
+                .unwrap_or("Write a Rust function that reverses a linked list, then explain how it works step by step.");
+            skew_probe(path, prompt)
         }
         Some("tokenize") => {
             let (Some(path), Some(text)) = (args.get(1), args.get(2)) else {

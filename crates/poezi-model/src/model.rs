@@ -150,6 +150,24 @@ struct SparsityAccum {
     thresh: f32,
     active: Vec<u64>,
     total: Vec<u64>,
+    /// Per-layer, per-neuron count of tokens the neuron was active for. Enabled
+    /// for the skew probe; `None` for the plain sparsity probe.
+    freq: Option<Vec<Vec<u32>>>,
+}
+
+/// Per-neuron activation skew (see [`Model::probe_neuron_skew`]). Answers: does a
+/// fixed "hot" set of neurons capture most activations (power-law)? If so, a
+/// static hot(VRAM)/cold(CPU) split is lossless AND fast.
+pub struct SkewStats {
+    /// Candidate hot-set fractions H (share of neurons kept resident).
+    pub hot_fracs: Vec<f32>,
+    /// For each H: fraction of all activation-events that land in the top-H
+    /// most-frequently-active neurons, pooled over all layers.
+    pub coverage_overall: Vec<f64>,
+    /// For each H: per-layer coverage.
+    pub coverage_per_layer: Vec<Vec<f64>>,
+    pub thresh: f32,
+    pub n_tokens: usize,
 }
 
 impl<'a> Model<'a> {
@@ -356,6 +374,7 @@ impl<'a> Model<'a> {
             thresh: rel_thresh,
             active: vec![0u64; cfg.n_layer],
             total: vec![0u64; cfg.n_layer],
+            freq: None,
         };
         let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
         for (pos, &token) in tokens.iter().enumerate() {
@@ -378,6 +397,59 @@ impl<'a> Model<'a> {
             per_layer_active,
             n_tokens: tokens.len(),
             rel_thresh,
+        }
+    }
+
+    /// Research: per-neuron activation skew. Run a CPU forward over `tokens`,
+    /// count how often each FFN neuron is active, then for each hot-fraction H
+    /// report what share of all activation-events the top-H most-frequent
+    /// neurons capture. High coverage at small H ⇒ a static hot(VRAM)/cold(CPU)
+    /// split is lossless and keeps most work on the fast path.
+    pub fn probe_neuron_skew(&self, tokens: &[u32], rel_thresh: f32, hot_fracs: &[f32]) -> SkewStats {
+        let cfg = &self.cfg;
+        let mut cache = KvCache::new(cfg.n_layer);
+        let mut acc = SparsityAccum {
+            thresh: rel_thresh,
+            active: vec![0u64; cfg.n_layer],
+            total: vec![0u64; cfg.n_layer],
+            freq: Some(vec![vec![0u32; cfg.n_ff]; cfg.n_layer]),
+        };
+        let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
+        for (pos, &token) in tokens.iter().enumerate() {
+            let mut x = vec![0f32; cfg.n_embd];
+            let row = &self.tok_embd.data[token as usize * rb..(token as usize + 1) * rb];
+            dequant_row(self.tok_embd.ty, row, &mut x);
+            self.forward_cpu(x, pos, &mut cache, Some(&mut acc), None);
+            cache.len += 1;
+        }
+        let freq = acc.freq.unwrap();
+        let mut coverage_per_layer = vec![Vec::with_capacity(cfg.n_layer); hot_fracs.len()];
+        // Pooled totals across layers for the overall figure.
+        let mut pooled_top = vec![0u64; hot_fracs.len()];
+        let mut pooled_all = 0u64;
+        for layer_freq in &freq {
+            let mut sorted: Vec<u32> = layer_freq.clone();
+            sorted.sort_unstable_by(|a, b| b.cmp(a)); // descending
+            let total: u64 = sorted.iter().map(|&c| c as u64).sum();
+            pooled_all += total;
+            for (hi, &h) in hot_fracs.iter().enumerate() {
+                let k = ((cfg.n_ff as f32 * h).ceil() as usize).clamp(0, cfg.n_ff);
+                let top: u64 = sorted[..k].iter().map(|&c| c as u64).sum();
+                pooled_top[hi] += top;
+                let cov = if total > 0 { top as f64 / total as f64 } else { 0.0 };
+                coverage_per_layer[hi].push(cov);
+            }
+        }
+        let coverage_overall: Vec<f64> = pooled_top
+            .iter()
+            .map(|&t| if pooled_all > 0 { t as f64 / pooled_all as f64 } else { 0.0 })
+            .collect();
+        SkewStats {
+            hot_fracs: hot_fracs.to_vec(),
+            coverage_overall,
+            coverage_per_layer,
+            thresh: rel_thresh,
+            n_tokens: tokens.len(),
         }
     }
 
@@ -543,7 +615,15 @@ impl<'a> Model<'a> {
             if let Some(acc) = probe.as_deref_mut() {
                 let maxabs = gate.iter().fold(0f32, |m, &g| m.max(g.abs()));
                 let thr = acc.thresh * maxabs;
-                let active = gate.iter().filter(|&&g| g.abs() > thr).count() as u64;
+                let mut active = 0u64;
+                for (i, &g) in gate.iter().enumerate() {
+                    if g.abs() > thr {
+                        active += 1;
+                        if let Some(freq) = acc.freq.as_mut() {
+                            freq[li][i] += 1;
+                        }
+                    }
+                }
                 acc.active[li] += active;
                 acc.total[li] += cfg.n_ff as u64;
             }
