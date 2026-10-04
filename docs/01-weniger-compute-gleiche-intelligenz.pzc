@@ -155,7 +155,7 @@ In Rust implementiert (mit Ausnahme der zuvor geschriebenen Spec-Decode-Kernel),
   @row{AVX2-CPU-Matmul | Faktor 4 im Kernel (5 auf 19,5 GB\/s), Faktor 2 im CPU-Forward}
   @row{Whole-Layer-Offloading | verlustfrei, 15-GB-Modell läuft auf 12 GB}
   @row{Sparse CPU-FFN (opt-in) | plus 13 bis 24\% auf dem CPU-Pfad}
-  @row{Sparsity-aware Fine-Tuning | Hoyer-Strafe, Mechanismus validiert}
+  @row{Sparsity-aware Fine-Tuning | Hoyer-Strafe induziert Sparsität: 35\% auf 21\% aktiv, Probe kohärent}
 }
 
 Offloading-Durchsatz nach CPU-Anteil (7B, 40 Token):
@@ -180,7 +180,7 @@ Die zugrunde liegenden Verfahren sind publiziert. Neu sind ihre Kombination und 
   @item{Ein integrierter, gegen llama.cpp bit-identisch verifizierter Inferenz-Stack @bold{ohne externe Inferenzbibliothek}, der Speculative Decoding, auto-dimensioniertes Whole-Layer-Offloading und opt-in CPU-Sparsität auf einer 12-GB-Consumer-GPU unter der Vorgabe keiner eigenen Kernel für die Orchestrierung vereint.}
   @item{Batched, bit-identisches Quant-GEMM zur spekulativen Verifikation (Q8\_0\/Q4\_K\/Q6\_K), gemessen token-identisch zum Einzel-Token-Pfad.}
   @item{Empirisches Resultat: Für Qwen2.5-Coder ist der aktive FFN-Satz nicht domänenspezifisch (Differenz 3 Prozentpunkte); statisches Domänen-Offloading trägt nicht. Ein in dieser Form nicht publiziertes Negativresultat.}
-  @item{Offene Richtung: sparsity-aware Fine-Tuning, das eine für statisches Offloading nutzbare, stabile Sparsität erst induziert. Mechanismus validiert (Hoyer-Strafe senkt die relative Sparsität), voller Nachweis offen.}
+  @item{Offene Richtung: sparsity-aware Fine-Tuning, das offload-nutzbare Sparsität erst induziert. Erstes Signal positiv (Hoyer-Strafe senkt den aktiven FFN-Anteil von 35\% auf 21\% über 100 Schritte, eine Textprobe bleibt kohärent). Noch kein Nachweis: kleiner Datensatz, Messung auf Trainingsdaten, Qualität nur an einer Probe geprüft.}
 }
 
 @note{Kein algorithmischer Durchbruch. Der Beitrag liegt in der Integration, der bit-genauen Verifikation und den Messergebnissen für ein Regime (schwache GPU, langsame CPU, keine eigenen Kernel, enger Agent), das in der Literatur kaum abgedeckt ist.} 
@@ -200,7 +200,7 @@ $$ d_j = @text{argmax}_v z^{(j-1)}(v). $$
 @bold{Beweis (Induktion über die akzeptierten Positionen).} Ein akzeptiertes $d_j$ erfüllt $d_j = @text{argmax}_v z^{(j-1)}(v)$ und ist nach dem Lemma die Greedy-Wahl. Das erste nicht akzeptierte bzw. das Anschluss-Token ist $@text{argmax}_v z^{(m)}(v)$, ebenfalls die Greedy-Wahl. Der Cache wird auf die akzeptierte Länge zurückgesetzt. Jedes ausgegebene Token stimmt folglich mit Greedy überein. @bold{q.e.d.}  
 }
 
-
+@pagebreak
 @bold{Satz 2 — Fehlerschranke beim Weglassen inaktiver Neuronen.} Die FFN-Ausgabe ist eine gewichtete Summe der Neuron-Beiträge
 
 $$ y = @sum_{i=1}^{n} g_i w_i, $$
@@ -255,7 +255,7 @@ Die betrachteten Hebel sind publiziert. Die wenig untersuchte Lücke liegt im Re
   @item{@bold{CPU-Matmul beschleunigen.} Grundlage des Offloadings. @italic{Umgesetzt: Faktor 4.}}
   @item{@bold{Whole-Layer-Offloading.} 15 GB auf 12 GB bei voller Qualität. @italic{Umgesetzt.}}
   @item{@bold{Sparsität auf dem CPU-Offload-Pfad.} @italic{Umgesetzt als opt-in.}}
-  @item{@bold{Sparsity-aware Fine-Tuning.} @italic{Mechanismus validiert, voller Lauf offen.}}
+  @item{@bold{Sparsity-aware Fine-Tuning.} @italic{Erstes Signal: 35\% auf 21\% aktiv bei erhaltener Kohärenz; Validierung (Held-out, Qualität, Offload-Tempo) offen.}}
   @item{@bold{Verlustfreie Kompression} (DFloat11-Ansatz), falls die Kernel-Vorgabe gelockert wird.}
   @item{@bold{MoE-Pfad evaluieren.}}
 }

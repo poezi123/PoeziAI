@@ -23,7 +23,7 @@
   @item{Man kann die @bold{Hälfte} dieser Neuronen weglassen und bekommt @bold{exakt dasselbe} Ergebnis, Wort für Wort.}
   @item{Ein Modell, das zu groß für die Grafikkarte ist, läuft trotzdem in @bold{voller Qualität}, nur langsamer. Beispiel: ein 15-GB-Modell auf einer 12-GB-Karte.}
   @item{Schneller rechnen @bold{ohne jede Qualitätsänderung} ist möglich: das Modell schreibt 1,67-mal schneller und gibt garantiert denselben Text aus.}
-  @item{Ein ehrlicher Fehlschlag: die naheliegende Idee, das Modell auf Security und Code zu spezialisieren, damit es sparsamer rechnet, @bold{funktioniert nicht} (gemessen, Unterschied nur 3 Prozentpunkte).}
+  @item{Erstes gutes Zeichen: Trainiert man dem Modell Sparsamkeit gezielt an, arbeitet pro Wort nur noch rund @bold{ein Fünftel} der Neuronen statt einem Drittel, und ein Testausschnitt bleibt sinnvoller Code. Noch nicht bewiesen, aber vielversprechend.}
 }
 
 @chapter{Was davon funktioniert}
@@ -46,7 +46,7 @@ Vier einfache Aussagen tragen das Ganze. Jede steht hier in einem Satz, als Form
 
 @bold{In einem Satz.} Das Modell rät die nächsten Wörter voraus und behält nur die Rätsel, die es selbst ganz genauso gewählt hätte. Darum kommt derselbe Text heraus, nur schneller.
 
-$$ x_t = @text{argmax}_v  z_t(v) $$
+$$ x_t = @text{argmax}_v @, z_t(v) $$
 
 @bold{Was die Formel sagt.} $z_t(v)$ ist die Punktzahl für ein mögliches nächstes Wort $v$. @text{argmax} heißt: nimm das Wort mit der höchsten Punktzahl. Genau dieses Wort hätte das Modell normal auch gewählt, also ist das Ergebnis identisch.
 
