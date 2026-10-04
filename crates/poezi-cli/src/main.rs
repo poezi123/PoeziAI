@@ -402,9 +402,11 @@ fn main() -> ExitCode {
                 eprintln!("usage: poezi spec <model.gguf> [prompt] [-n N]");
                 return ExitCode::FAILURE;
             };
-            let prompt = args.get(2).map(String::as_str).unwrap_or(
-                "fn fibonacci(n: u32) -> u64 {\n    if n < 2 {\n        n as u64\n    } else {\n",
-            );
+            let prompt = args
+                .get(2)
+                .filter(|s| !s.starts_with('-')) // don't mistake a flag for the prompt
+                .map(String::as_str)
+                .unwrap_or("fn fibonacci(n: u32) -> u64 {\n    if n < 2 {\n        n as u64\n    } else {\n");
             let n_predict: usize = args
                 .iter()
                 .position(|a| a == "-n")
