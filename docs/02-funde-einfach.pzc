@@ -1,0 +1,87 @@
+@document[paper=A4, margin=2.0cm, font=serif, fontsize=12, linespacing=1.25, lang=de]
+@header{OVERFLOW}{}{@today}
+@footer{}{Seite @page von @pages}{}
+
+@title{Unsere Funde, einfach erklärt}
+@subtitle{Was wir gemessen haben und die Mathematik dahinter}
+@author{OVERFLOW / PoeziAI}
+@date
+
+@block[top=0.5ln]{
+  @note{Ziel: große, kluge Sprachmodelle auf schwacher Hardware laufen lassen, ohne dass sie dümmer werden. Dieses Dokument fasst die eigenen Messergebnisse zusammen und erklärt die Mathematik so, dass sie ohne Vorwissen verständlich ist.}
+}
+
+@toc
+
+@pagebreak
+
+@chapter{Die Funde in einfachen Worten}
+
+@list{
+  @item{Fast die gesamte Rechenarbeit eines Modells steckt in einem Teil, dem FFN: rund @bold{87 Prozent} der Gewichte.}
+  @item{Pro Wort arbeiten nur wenige der tausenden Neuronen wirklich mit: ab einer sinnvollen Schwelle nur rund @bold{35 Prozent}, der Rest trägt fast nichts bei.}
+  @item{Man kann die @bold{Hälfte} dieser Neuronen weglassen und bekommt @bold{exakt dasselbe} Ergebnis, Wort für Wort.}
+  @item{Ein Modell, das zu groß für die Grafikkarte ist, läuft trotzdem in @bold{voller Qualität}, nur langsamer. Beispiel: ein 15-GB-Modell auf einer 12-GB-Karte.}
+  @item{Schneller rechnen @bold{ohne jede Qualitätsänderung} ist möglich: das Modell schreibt 1,67-mal schneller und gibt garantiert denselben Text aus.}
+  @item{Ein ehrlicher Fehlschlag: die naheliegende Idee, das Modell auf Security und Code zu spezialisieren, damit es sparsamer rechnet, @bold{funktioniert nicht} (gemessen, Unterschied nur 3 Prozentpunkte).}
+}
+
+@chapter{Was davon funktioniert}
+
+@table[header]{
+  @row{Was | Ergebnis}
+  @row{Schneller schreiben, identisch | 1,67-mal schneller, gleiche Ausgabe}
+  @row{Großes Modell, kleine Karte | läuft in voller Qualität, 2 bis 3 Wörter pro Sekunde}
+  @row{Prozessor-Rechnen beschleunigt | 4-mal schneller}
+  @row{Neuronen sparen (optional) | 13 bis 24 Prozent schneller; bei Hälfte behalten 94 Prozent gleich}
+}
+
+@pagebreak
+
+@chapter{Die Mathematik, ganz einfach}
+
+Vier einfache Aussagen tragen das Ganze. Jede steht hier in einem Satz, als Formel und als Alltagsbild.
+
+@section{1. Schneller schreiben, ohne Fehler}
+
+@bold{In einem Satz.} Das Modell rät die nächsten Wörter voraus und behält nur die Rätsel, die es selbst ganz genauso gewählt hätte. Darum kommt derselbe Text heraus, nur schneller.
+
+$$ x_t = @text{argmax}_v  z_t(v) $$
+
+@bold{Was die Formel sagt.} $z_t(v)$ ist die Punktzahl für ein mögliches nächstes Wort $v$. @text{argmax} heißt: nimm das Wort mit der höchsten Punktzahl. Genau dieses Wort hätte das Modell normal auch gewählt, also ist das Ergebnis identisch.
+
+@bold{Alltagsbild.} Eine Autovervollständigung, die du nur übernimmst, wenn sie Wort für Wort genau das trifft, was du ohnehin getippt hättest.
+
+@section{2. Weglassen ohne Schaden}
+
+@bold{In einem Satz.} Jedes Neuron trägt höchstens seine Stärke mal seine Gewichtsgröße zum Ergebnis bei. Lässt man die schwächsten weg, bleibt der Gesamtfehler winzig.
+
+$$ @norm{y - @hat{y}} @leq @paren{max_i @norm{w_i}} @sum_{i @notin S} @abs{g_i} $$
+
+@bold{Was die Formel sagt.} Links steht der Fehler, wenn man Neuronen weglässt. Rechts steht die Summe der Stärken $@abs{g_i}$ der weggelassenen Neuronen. Der Fehler ist nie größer als diese Summe. Lässt man die mit den kleinsten $@abs{g_i}$ weg, ist die Summe und damit der Fehler am kleinsten.
+
+@bold{Alltagsbild.} In einem großen Chor die leisesten Stimmen weglassen: der Klang bleibt praktisch gleich. Die Messung zeigt sogar: bei der Hälfte weggelassen ändert sich gar nichts.
+
+@section{3. Wie "spitz" ist die Aktivität}
+
+@bold{In einem Satz.} Dieses Maß sagt, ob wenige Neuronen fast alles machen (spitz) oder alle gleich viel (flach), unabhängig von der Lautstärke.
+
+$$ 1 @leq @frac{@norm{g}_1}{@norm{g}_2} @leq @sqrt{n} $$
+
+@bold{Was die Formel sagt.} Der Wert liegt immer zwischen 1 und der Wurzel aus $n$ (der Anzahl der Neuronen). Nahe 1 bedeutet: ein einziges Neuron macht fast alles (sehr spitz, sehr sparsam). Nahe Wurzel $n$ bedeutet: alle gleich stark (flach). Beim Training drücken wir diesen Wert nach unten, damit nur wenige Neuronen feuern und man den Rest überspringen kann.
+
+@bold{Alltagsbild.} Eine Klasse, in der einer fast alles redet (spitz), gegen eine, in der alle gleich viel reden (flach). Wir hätten gern wenige, die reden.
+
+@section{4. Großes Modell auf kleiner Karte}
+
+@bold{In einem Satz.} Man teilt die Rechenkette in zwei Hälften, Grafikkarte und Prozessor, reicht das Zwischenergebnis weiter, und das Endergebnis ist dasselbe.
+
+$$ f(x) = p @paren{h_L @paren{@dots h_1(x)}} $$
+
+@bold{Was die Formel sagt.} Ein Modell ist eine Kette von Schichten $h_1$ bis $h_L$. Egal, wo man die Kette aufteilt und das Zwischenergebnis von einem Gerät zum anderen reicht: am Ende steht dasselbe $f(x)$.
+
+@bold{Alltagsbild.} Ein Fließband, das in der Mitte an einen zweiten Arbeiter übergibt. Das fertige Produkt ist identisch, es dauert nur etwas länger.
+
+@chapter{Das ehrliche Fazit}
+
+@note{Keine dieser Aussagen ist eine neue Weltformel, und die einzelnen Verfahren sind bekannt. Eigen ist die Kombination auf schwacher Hardware ohne fremde Bibliotheken, die bit-genaue Überprüfung, dass nichts an Qualität verloren geht, und die ehrlichen Messungen, bis hin zum widerlegten Spezialisierungs-Versuch.}
