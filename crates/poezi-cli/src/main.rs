@@ -254,6 +254,63 @@ fn spec_selftest(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
     }
 }
 
+/// Research (domain hypothesis): learn a hot neuron set from security/code
+/// prompts, then measure how well it covers OTHER security/code prompts vs
+/// generic text. If domain coverage >> generic coverage (and >> the ~39%
+/// generic self-skew), our narrow agent has a concentrated, transferable hot
+/// set — static per-domain offloading becomes viable where it fails generally.
+fn domaintest(path: &str) -> ExitCode {
+    let gguf = match poezi_gguf::GgufFile::open(path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let tok = match poezi_model::Tokenizer::from_gguf(&gguf) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let model = match poezi_model::Model::load(&gguf) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+
+    let fit_text = "Write a TCP SYN port scanner in Python using raw sockets. \
+        Explain how a stack-based buffer overflow overwrites the saved return address. \
+        Write a pwntools script that sends a cyclic pattern to find the offset. \
+        Implement AES-CBC encryption and decryption in Rust. \
+        Parse an ELF header and print the section table.";
+    let domain_eval = "Write a SQL injection proof of concept for a login form. \
+        Explain how ASLR and NX make exploitation harder and how ret2libc bypasses them. \
+        Write a Rust function that parses a PCAP file and extracts TCP streams. \
+        Generate a reverse shell one-liner in bash and explain each part. \
+        Implement a simple XOR cipher brute-forcer.";
+    let generic_eval = "Write a short poem about autumn leaves falling in a quiet forest. \
+        Explain how to bake a classic Italian tiramisu step by step. \
+        Summarize the plot of Romeo and Juliet in three sentences. \
+        What are good stretching exercises for lower back pain? \
+        Describe the history of the founding of the Roman Empire.";
+
+    let enc = |s: &str| {
+        let mut v = tok.encode(s, tok.add_bos, true);
+        v.truncate(150);
+        v
+    };
+    let fit = enc(fit_text);
+    let dom = enc(domain_eval);
+    let gen = enc(generic_eval);
+    eprintln!("fit {} tok, domain-eval {} tok, generic-eval {} tok (CPU, be patient)…", fit.len(), dom.len(), gen.len());
+
+    println!("Hot set learned from SECURITY/CODE prompts; coverage on held-out corpora:");
+    println!("\nhot%   domain-eval   generic-eval   gap (domain − generic)");
+    let t = model.probe_hotset_transfer(&fit, &[&dom, &gen], 0.01, 0.25);
+    let (d, g) = (t.coverage[0], t.coverage[1]);
+    println!("{:>4.0}%   {:>7.1}%     {:>7.1}%      {:+.1} pp", t.hot_frac * 100.0, d * 100.0, g * 100.0, (d - g) * 100.0);
+    println!("\nInterpretation: a large positive gap = the hot set is domain-specific and");
+    println!("transfers within security/code — evidence that static per-domain VRAM");
+    println!("placement works for our agent. A small gap = the hot set isn't special to");
+    println!("the domain (then this angle is a dead end, like generic static placement).");
+    ExitCode::SUCCESS
+}
+
 /// Research: per-neuron activation skew. If a small fixed "hot" set of neurons
 /// captures most activations, a static hot(VRAM)/cold(CPU) split is lossless and
 /// keeps most FFN work on the fast path — PowerInfer's key enabler.
@@ -593,6 +650,13 @@ fn main() -> ExitCode {
                 .map(String::as_str)
                 .unwrap_or("Write a Rust function that reverses a linked list, then explain how it works step by step.");
             skew_probe(path, prompt)
+        }
+        Some("domaintest") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: poezi domaintest <model.gguf>");
+                return ExitCode::FAILURE;
+            };
+            domaintest(path)
         }
         Some("tokenize") => {
             let (Some(path), Some(text)) = (args.get(1), args.get(2)) else {

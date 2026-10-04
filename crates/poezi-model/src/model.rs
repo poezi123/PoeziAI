@@ -153,6 +153,20 @@ struct SparsityAccum {
     /// Per-layer, per-neuron count of tokens the neuron was active for. Enabled
     /// for the skew probe; `None` for the plain sparsity probe.
     freq: Option<Vec<Vec<u32>>>,
+    /// Per-layer boolean "hot" mask (a fixed candidate hot-set). When set, count
+    /// how many active neurons fall inside it — used to test whether a hot-set
+    /// learned on one corpus transfers to another.
+    hot_mask: Option<Vec<Vec<bool>>>,
+    hot_hits: Vec<u64>,
+    hot_total: Vec<u64>,
+}
+
+/// Cross-corpus hot-set transfer result (see [`Model::probe_hotset_transfer`]).
+pub struct TransferStats {
+    pub hot_frac: f32,
+    /// Coverage (share of activations landing in the fit-corpus hot-set) for each
+    /// eval corpus, in the order passed.
+    pub coverage: Vec<f64>,
 }
 
 /// Per-neuron activation skew (see [`Model::probe_neuron_skew`]). Answers: does a
@@ -361,6 +375,73 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// Run a CPU forward over `tokens`, threading the sparsity accumulator.
+    fn run_corpus(&self, tokens: &[u32], acc: &mut SparsityAccum) {
+        let cfg = &self.cfg;
+        let mut cache = KvCache::new(cfg.n_layer);
+        let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
+        for (pos, &token) in tokens.iter().enumerate() {
+            let mut x = vec![0f32; cfg.n_embd];
+            let row = &self.tok_embd.data[token as usize * rb..(token as usize + 1) * rb];
+            dequant_row(self.tok_embd.ty, row, &mut x);
+            self.forward_cpu(x, pos, &mut cache, Some(acc), None);
+            cache.len += 1;
+        }
+    }
+
+    /// Research (domain-specialization hypothesis): learn a static "hot" neuron
+    /// set from `fit` (e.g. security/code prompts), then measure what share of
+    /// activations it covers on each corpus in `evals`. If a domain-fit hot-set
+    /// covers domain eval prompts far better than generic text, a static
+    /// per-domain VRAM placement is viable for our narrow agent where it fails
+    /// for a generalist. `hot_frac` = share of neurons kept hot.
+    pub fn probe_hotset_transfer(&self, fit: &[u32], evals: &[&[u32]], rel_thresh: f32, hot_frac: f32) -> TransferStats {
+        let cfg = &self.cfg;
+        // Phase 1: activation frequency on the fit corpus.
+        let mut fit_acc = SparsityAccum {
+            thresh: rel_thresh,
+            active: vec![0u64; cfg.n_layer],
+            total: vec![0u64; cfg.n_layer],
+            freq: Some(vec![vec![0u32; cfg.n_ff]; cfg.n_layer]),
+            hot_mask: None,
+            hot_hits: Vec::new(),
+            hot_total: Vec::new(),
+        };
+        self.run_corpus(fit, &mut fit_acc);
+        let freq = fit_acc.freq.unwrap();
+        // Hot mask per layer: the top hot_frac of neurons by fit frequency.
+        let k = ((cfg.n_ff as f32 * hot_frac).ceil() as usize).clamp(1, cfg.n_ff);
+        let mask: Vec<Vec<bool>> = freq
+            .iter()
+            .map(|lf| {
+                let mut sorted = lf.clone();
+                sorted.sort_unstable_by(|a, b| b.cmp(a));
+                let thr = sorted[k - 1];
+                lf.iter().map(|&f| f >= thr && f > 0).collect()
+            })
+            .collect();
+        // Phase 2: coverage of that hot set on each eval corpus.
+        let coverage = evals
+            .iter()
+            .map(|ev| {
+                let mut acc = SparsityAccum {
+                    thresh: rel_thresh,
+                    active: vec![0u64; cfg.n_layer],
+                    total: vec![0u64; cfg.n_layer],
+                    freq: None,
+                    hot_mask: Some(mask.clone()),
+                    hot_hits: vec![0u64; cfg.n_layer],
+                    hot_total: vec![0u64; cfg.n_layer],
+                };
+                self.run_corpus(ev, &mut acc);
+                let hits: u64 = acc.hot_hits.iter().sum();
+                let tot: u64 = acc.hot_total.iter().sum();
+                if tot > 0 { hits as f64 / tot as f64 } else { 0.0 }
+            })
+            .collect();
+        TransferStats { hot_frac, coverage }
+    }
+
     /// Research: measure FFN activation sparsity on the real model by running a
     /// CPU forward over `tokens` and counting, per layer, how many post-SwiGLU
     /// neurons exceed `rel_thresh * max|activation|`. A low active fraction means
@@ -375,6 +456,9 @@ impl<'a> Model<'a> {
             active: vec![0u64; cfg.n_layer],
             total: vec![0u64; cfg.n_layer],
             freq: None,
+            hot_mask: None,
+            hot_hits: Vec::new(),
+            hot_total: Vec::new(),
         };
         let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
         for (pos, &token) in tokens.iter().enumerate() {
@@ -413,6 +497,9 @@ impl<'a> Model<'a> {
             active: vec![0u64; cfg.n_layer],
             total: vec![0u64; cfg.n_layer],
             freq: Some(vec![vec![0u32; cfg.n_ff]; cfg.n_layer]),
+            hot_mask: None,
+            hot_hits: Vec::new(),
+            hot_total: Vec::new(),
         };
         let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
         for (pos, &token) in tokens.iter().enumerate() {
@@ -621,6 +708,12 @@ impl<'a> Model<'a> {
                         active += 1;
                         if let Some(freq) = acc.freq.as_mut() {
                             freq[li][i] += 1;
+                        }
+                        if let Some(mask) = acc.hot_mask.as_ref() {
+                            acc.hot_total[li] += 1;
+                            if mask[li][i] {
+                                acc.hot_hits[li] += 1;
+                            }
                         }
                     }
                 }
