@@ -135,6 +135,23 @@ impl KvCache {
 /// Max sequence length the GPU KV cache preallocates (VRAM: n_layer*cap*kv_dim*2).
 const GPU_KV_CAP: usize = 4096;
 
+/// Per-layer FFN activation-sparsity measurement (see [`Model::probe_ffn_sparsity`]).
+pub struct SparsityStats {
+    /// Mean fraction of FFN neurons active (above threshold) per layer.
+    pub per_layer_active: Vec<f64>,
+    /// Mean active fraction across all layers.
+    pub overall_active: f64,
+    pub n_tokens: usize,
+    pub rel_thresh: f32,
+}
+
+/// Internal accumulator threaded through the CPU forward while probing.
+struct SparsityAccum {
+    thresh: f32,
+    active: Vec<u64>,
+    total: Vec<u64>,
+}
+
 impl<'a> Model<'a> {
     pub fn load(g: &'a GgufFile) -> Result<Self> {
         let arch = g
@@ -293,7 +310,7 @@ impl<'a> Model<'a> {
             // Fully GPU-resident forward; only the logits come back to the host.
             w.forward(s, &x, pos).expect("gpu forward")
         } else {
-            self.forward_cpu(x, pos, cache)
+            self.forward_cpu(x, pos, cache, None, None)
         };
         cache.len += 1;
         logits
@@ -326,8 +343,133 @@ impl<'a> Model<'a> {
         }
     }
 
-    /// CPU forward pass (fallback when no GPU is available).
-    fn forward_cpu(&self, mut x: Vec<f32>, pos: usize, cache: &mut KvCache) -> Vec<f32> {
+    /// Research: measure FFN activation sparsity on the real model by running a
+    /// CPU forward over `tokens` and counting, per layer, how many post-SwiGLU
+    /// neurons exceed `rel_thresh * max|activation|`. A low active fraction means
+    /// most FFN weights barely contribute per token — the lever for PowerInfer-
+    /// style hot/cold neuron offloading (big model, small VRAM, no quantization).
+    /// Forces the CPU path regardless of GPU so it can read the activations.
+    pub fn probe_ffn_sparsity(&self, tokens: &[u32], rel_thresh: f32) -> SparsityStats {
+        let cfg = &self.cfg;
+        let mut cache = KvCache::new(cfg.n_layer);
+        let mut acc = SparsityAccum {
+            thresh: rel_thresh,
+            active: vec![0u64; cfg.n_layer],
+            total: vec![0u64; cfg.n_layer],
+        };
+        let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
+        for (pos, &token) in tokens.iter().enumerate() {
+            let mut x = vec![0f32; cfg.n_embd];
+            let row = &self.tok_embd.data[token as usize * rb..(token as usize + 1) * rb];
+            dequant_row(self.tok_embd.ty, row, &mut x);
+            self.forward_cpu(x, pos, &mut cache, Some(&mut acc), None);
+            cache.len += 1;
+        }
+        let per_layer_active: Vec<f64> = acc
+            .active
+            .iter()
+            .zip(&acc.total)
+            .map(|(&a, &t)| if t > 0 { a as f64 / t as f64 } else { 0.0 })
+            .collect();
+        let tot_a: u64 = acc.active.iter().sum();
+        let tot_t: u64 = acc.total.iter().sum();
+        SparsityStats {
+            overall_active: if tot_t > 0 { tot_a as f64 / tot_t as f64 } else { 0.0 },
+            per_layer_active,
+            n_tokens: tokens.len(),
+            rel_thresh,
+        }
+    }
+
+    /// Research: teacher-forced top-1 agreement. Feed `prompt` then each token
+    /// of `reference` (the dense greedy output), and count positions where the
+    /// masked model's argmax still equals `reference[i]`. Unlike greedy decode
+    /// this avoids the cascade (one flip derailing the rest), so it measures the
+    /// true per-position quality impact of the FFN mask. `keep = None` returns
+    /// `reference.len()` by construction.
+    pub fn teacher_forced_agreement(&self, prompt: &[u32], reference: &[u32], keep: Option<f32>) -> usize {
+        let cfg = &self.cfg;
+        let mut cache = KvCache::new(cfg.n_layer);
+        let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
+        let embed = |token: u32| {
+            let mut x = vec![0f32; cfg.n_embd];
+            let row = &self.tok_embd.data[token as usize * rb..(token as usize + 1) * rb];
+            dequant_row(self.tok_embd.ty, row, &mut x);
+            x
+        };
+        let argmax = |v: &[f32]| {
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &l) in v.iter().enumerate() {
+                if l > bv {
+                    bv = l;
+                    best = i;
+                }
+            }
+            best as u32
+        };
+        let mut last = Vec::new();
+        for (pos, &t) in prompt.iter().enumerate() {
+            last = self.forward_cpu(embed(t), pos, &mut cache, None, keep);
+            cache.len += 1;
+        }
+        let mut agree = 0usize;
+        for &r in reference {
+            if !last.is_empty() && argmax(&last) == r {
+                agree += 1;
+            }
+            let pos = cache.len;
+            last = self.forward_cpu(embed(r), pos, &mut cache, None, keep);
+            cache.len += 1;
+        }
+        agree
+    }
+
+    /// Research: greedy CPU decode with an optional oracle FFN sparsity mask
+    /// (`keep` = fraction of neurons retained per layer, by |activation|).
+    /// Returns the generated token ids. Used to measure the quality impact of
+    /// dropping inactive FFN neurons vs the dense (`keep = None`) output.
+    pub fn greedy_cpu(&self, prompt: &[u32], n: usize, keep: Option<f32>, eos: Option<u32>) -> Vec<u32> {
+        let cfg = &self.cfg;
+        let mut cache = KvCache::new(cfg.n_layer);
+        let rb = row_bytes(self.tok_embd.ty, cfg.n_embd);
+        let embed = |token: u32| {
+            let mut x = vec![0f32; cfg.n_embd];
+            let row = &self.tok_embd.data[token as usize * rb..(token as usize + 1) * rb];
+            dequant_row(self.tok_embd.ty, row, &mut x);
+            x
+        };
+        let mut last = Vec::new();
+        for (pos, &t) in prompt.iter().enumerate() {
+            last = self.forward_cpu(embed(t), pos, &mut cache, None, keep);
+            cache.len += 1;
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &l) in last.iter().enumerate() {
+                if l > bv {
+                    bv = l;
+                    best = i;
+                }
+            }
+            let nx = best as u32;
+            if Some(nx) == eos {
+                break;
+            }
+            out.push(nx);
+            let pos = cache.len;
+            last = self.forward_cpu(embed(nx), pos, &mut cache, None, keep);
+            cache.len += 1;
+        }
+        out
+    }
+
+    /// CPU forward pass (fallback when no GPU is available). `probe`, when set,
+    /// records FFN activation sparsity (research instrumentation; no effect on
+    /// the output).
+    fn forward_cpu(&self, mut x: Vec<f32>, pos: usize, cache: &mut KvCache, mut probe: Option<&mut SparsityAccum>, keep: Option<f32>) -> Vec<f32> {
         let cfg = &self.cfg;
         for (li, layer) in self.layers.iter().enumerate() {
             // ---- attention ----
@@ -394,6 +536,32 @@ impl<'a> Model<'a> {
             self.matvec(&layer.w_up, cfg.n_embd, cfg.n_ff, &f, &mut up);
             for i in 0..cfg.n_ff {
                 gate[i] = silu(gate[i]) * up[i];
+            }
+            // Research probe: how many of this layer's FFN neurons are "active"
+            // (|post-SwiGLU| above a relative threshold)? Inactive neurons
+            // contribute ~nothing to w_down — the basis for sparse/offloaded FFN.
+            if let Some(acc) = probe.as_deref_mut() {
+                let maxabs = gate.iter().fold(0f32, |m, &g| m.max(g.abs()));
+                let thr = acc.thresh * maxabs;
+                let active = gate.iter().filter(|&&g| g.abs() > thr).count() as u64;
+                acc.active[li] += active;
+                acc.total[li] += cfg.n_ff as u64;
+            }
+            // Oracle sparsity mask: keep only the top `keep` fraction of neurons
+            // by |activation|, zero the rest before w_down. Upper bound on what a
+            // perfect active-set predictor could achieve — tests quality impact.
+            if let Some(keep) = keep {
+                let k = ((cfg.n_ff as f32 * keep).ceil() as usize).clamp(1, cfg.n_ff);
+                if k < cfg.n_ff {
+                    let mut mags: Vec<f32> = gate.iter().map(|v| v.abs()).collect();
+                    mags.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+                    let thr = mags[k - 1];
+                    for g in gate.iter_mut() {
+                        if g.abs() < thr {
+                            *g = 0.0;
+                        }
+                    }
+                }
             }
             let mut down = vec![0f32; cfg.n_embd];
             self.matvec(&layer.w_down, cfg.n_ff, cfg.n_embd, &gate, &mut down);

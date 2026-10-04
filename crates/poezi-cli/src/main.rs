@@ -254,6 +254,102 @@ fn spec_selftest(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
     }
 }
 
+/// Research go/no-go: does dropping inactive FFN neurons change the output?
+/// Greedy-decode once dense, then with an oracle mask keeping only the top-X%
+/// neurons per layer, and report how long the token streams stay identical.
+/// If a small keep-fraction still matches, sparse offloading is near-lossless.
+fn masktest(path: &str, prompt: &str, n: usize) -> ExitCode {
+    let gguf = match poezi_gguf::GgufFile::open(path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let tok = match poezi_model::Tokenizer::from_gguf(&gguf) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let model = match poezi_model::Model::load(&gguf) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let ids = tok.encode(prompt, tok.add_bos, true);
+    eprintln!("dense greedy baseline ({} prompt tokens, {n} new, CPU)…", ids.len());
+    let dense = model.greedy_cpu(&ids, n, None, tok.eos_id);
+    println!("dense output ({} tok): {:?}", dense.len(), tok.decode(&dense));
+
+    // Greedy exact-match (harsh: cascades) + teacher-forced top-1 agreement
+    // (per-position, no cascade — the real quality signal).
+    let nd = dense.len();
+    println!("\nkeep%  greedy-match   top1-agreement (teacher-forced on dense)");
+    for &keep in &[0.50f32, 0.35, 0.25, 0.15, 0.10, 0.05] {
+        let masked = model.greedy_cpu(&ids, n, Some(keep), tok.eos_id);
+        let m = dense.iter().zip(&masked).take_while(|(a, b)| a == b).count();
+        let agree = model.teacher_forced_agreement(&ids, &dense, Some(keep));
+        println!(
+            "{:>4.0}%  {:>3}/{:<3}        {:>3}/{:<3}  ({:.0}%)",
+            keep * 100.0, m, nd, agree, nd, agree as f64 / nd as f64 * 100.0
+        );
+    }
+    println!("\ngreedy-match = identical prefix length (one flip derails the rest).");
+    println!("top1-agreement = positions where masked argmax still equals dense — the");
+    println!("true quality signal. High agreement at low keep% = exploitable headroom.");
+    ExitCode::SUCCESS
+}
+
+/// Research: measure FFN activation sparsity on the real model. A low active
+/// fraction means most FFN weights barely contribute per token — the basis for
+/// PowerInfer-style hot/cold neuron offloading (fit a big model in small VRAM at
+/// full precision). Runs on CPU over the prompt tokens.
+fn sparsity_probe(path: &str, prompt: &str) -> ExitCode {
+    let gguf = match poezi_gguf::GgufFile::open(path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let tok = match poezi_model::Tokenizer::from_gguf(&gguf) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let model = match poezi_model::Model::load(&gguf) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+
+    let mut ids = tok.encode(prompt, tok.add_bos, true);
+    ids.truncate(64); // CPU forward is slow; the prefill tokens are plenty of samples
+    eprintln!("probing FFN sparsity over {} tokens (CPU)…", ids.len());
+
+    let cfg = &model.cfg;
+    // FFN is the bulk of the weights: 3 * n_embd * n_ff per layer vs attention's
+    // 2*n_embd^2 + 2*n_embd*kv_dim. Sparsity here is the main offloading lever.
+    let ffn = 3.0 * cfg.n_embd as f64 * cfg.n_ff as f64;
+    let attn = 2.0 * (cfg.n_embd as f64).powi(2) + 2.0 * cfg.n_embd as f64 * cfg.kv_dim as f64;
+    let ffn_share = ffn / (ffn + attn);
+
+    println!("model: {} layers, n_embd {}, n_ff {}  (FFN ≈ {:.0}% of block weights)",
+        cfg.n_layer, cfg.n_embd, cfg.n_ff, ffn_share * 100.0);
+
+    for &thr in &[0.05f32, 0.01, 0.001] {
+        let s = model.probe_ffn_sparsity(&ids, thr);
+        let pl = &s.per_layer_active;
+        let mut sorted = pl.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = sorted[sorted.len() / 2];
+        let min = sorted.first().copied().unwrap_or(0.0);
+        let max = sorted.last().copied().unwrap_or(0.0);
+        println!("\nthreshold |act| > {:.3}·max :", thr);
+        println!("  active neurons: overall {:.1}%  (per-layer min {:.1}% / median {:.1}% / max {:.1}%)",
+            s.overall_active * 100.0, min * 100.0, median * 100.0, max * 100.0);
+        // If the active set were known and only it were computed/resident:
+        let ffn_cost = s.overall_active * ffn_share + (1.0 - ffn_share); // FFN scales, attn stays
+        println!("  => if the active set were predictable, per-token FFN work ~{:.1}% of dense,",
+            s.overall_active * 100.0);
+        println!("     whole-block compute ~{:.1}% of dense (FFN is {:.0}% of it)",
+            ffn_cost * 100.0, ffn_share * 100.0);
+    }
+    println!("\nNote: this measures how sparse activations ARE. Exploiting it needs a");
+    println!("cheap PREDICTOR of the active set per token — the next research step.");
+    ExitCode::SUCCESS
+}
+
 /// Count floats that differ (bitwise) between two logit matrices, and the max
 /// absolute difference. Equal length assumed.
 fn bit_diff(a: &[Vec<f32>], b: &[Vec<f32>]) -> (usize, f32) {
@@ -414,6 +510,36 @@ fn main() -> ExitCode {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(200);
             spec_selftest(path, prompt, n_predict)
+        }
+        Some("sparsity") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: poezi sparsity <model.gguf> [prompt]");
+                return ExitCode::FAILURE;
+            };
+            let prompt = args
+                .get(2)
+                .filter(|s| !s.starts_with('-'))
+                .map(String::as_str)
+                .unwrap_or("Write a Rust function that reverses a linked list, then explain how it works step by step.");
+            sparsity_probe(path, prompt)
+        }
+        Some("masktest") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: poezi masktest <model.gguf> [prompt] [-n N]");
+                return ExitCode::FAILURE;
+            };
+            let prompt = args
+                .get(2)
+                .filter(|s| !s.starts_with('-'))
+                .map(String::as_str)
+                .unwrap_or("Write a Rust function that reverses a linked list, then explain how it works step by step.");
+            let n: usize = args
+                .iter()
+                .position(|a| a == "-n")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(40);
+            masktest(path, prompt, n)
         }
         Some("tokenize") => {
             let (Some(path), Some(text)) = (args.get(1), args.get(2)) else {
