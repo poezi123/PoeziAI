@@ -155,6 +155,38 @@ pub fn matmul_q8_0(w: &[u8], in_dim: usize, out_dim: usize, x: &[f32], y: &mut [
     });
 }
 
+/// Like [`matmul_q8_0`] but only computes rows where `active[j]` is true; other
+/// rows are set to 0 and their weights are never read. Lets the FFN skip the
+/// up-projection of inactive neurons (activation sparsity) and save that
+/// bandwidth. `active.len()` must be `out_dim`.
+pub fn matmul_q8_0_masked(w: &[u8], in_dim: usize, out_dim: usize, x: &[f32], y: &mut [f32], active: &[bool]) {
+    assert_eq!(in_dim % QK8_0, 0);
+    assert_eq!(x.len(), in_dim);
+    assert_eq!(y.len(), out_dim);
+    assert_eq!(active.len(), out_dim);
+    let row_bytes = in_dim / QK8_0 * Q8_0_BLOCK_BYTES;
+    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(out_dim.max(1));
+    let chunk = out_dim.div_ceil(nthreads);
+    std::thread::scope(|scope| {
+        for (t, ychunk) in y.chunks_mut(chunk).enumerate() {
+            let start = t * chunk;
+            let w = &*w;
+            let x = &*x;
+            let active = &*active;
+            scope.spawn(move || {
+                for (jj, yj) in ychunk.iter_mut().enumerate() {
+                    let j = start + jj;
+                    if active[j] {
+                        *yj = dot_q8_0_best(&w[j * row_bytes..(j + 1) * row_bytes], x, in_dim);
+                    } else {
+                        *yj = 0.0;
+                    }
+                }
+            });
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // K-quants (Q4_K / Q5_K / Q6_K): super-blocks of 256 values with 6-bit
 // sub-block scales. Ported verbatim from ggml-quants.c dequantize_row_*.

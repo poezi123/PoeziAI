@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use poezi_cuda::{GpuBackend, GpuConfig, GpuSession, GpuWeights};
 use poezi_gguf::{GgmlType, GgufFile, MetaValue};
-use poezi_tensor::{dequant_row, matmul, row_bytes};
+use poezi_tensor::{dequant_row, matmul, matmul_q8_0_masked, row_bytes};
 
 /// A quantized weight: borrowed mmap bytes + its ggml type (CPU path).
 struct QTensor<'a> {
@@ -96,6 +96,10 @@ pub struct Model<'a> {
     /// GPU model; `< n_layer` means offloading (GPU prefix + CPU tail); `0` when
     /// there is no GPU at all.
     gpu_layers: usize,
+    /// Fraction of FFN neurons to keep in the CPU path (activation sparsity). 1.0
+    /// = full (default). `< 1.0` skips the up-projection of low-activation
+    /// neurons (CATS-style), speeding the CPU/offload path near-losslessly.
+    ffn_keep: f32,
 }
 
 /// Key/value cache. On CPU it grows per layer (kv_dim floats/position); on GPU
@@ -306,6 +310,14 @@ impl<'a> Model<'a> {
             .and_then(|be| build_gpu(&be, &cfg, &out_norm, &output, &layers, n_gpu).ok().map(Arc::new));
         let gpu_layers = if gpu.is_some() { n_gpu } else { 0 };
 
+        // Activation-sparsity keep fraction for the CPU path (opt-in). Only a
+        // value strictly between 0 and 1 enables the sparse FFN.
+        let ffn_keep = std::env::var("OVERFLOW_FFN_KEEP")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|&k| k > 0.0 && k < 1.0)
+            .unwrap_or(1.0);
+
         Ok(Model {
             cfg,
             tok_embd,
@@ -314,6 +326,7 @@ impl<'a> Model<'a> {
             layers,
             gpu,
             gpu_layers,
+            ffn_keep,
         })
     }
 
@@ -755,10 +768,30 @@ impl<'a> Model<'a> {
             let f = rmsnorm(&x, &layer.ffn_norm, cfg.rms_eps);
             let mut gate = vec![0f32; cfg.n_ff];
             let mut up = vec![0f32; cfg.n_ff];
-            self.matvec(&layer.w_gate, cfg.n_embd, cfg.n_ff, &f, &mut gate);
-            self.matvec(&layer.w_up, cfg.n_embd, cfg.n_ff, &f, &mut up);
-            for i in 0..cfg.n_ff {
-                gate[i] = silu(gate[i]) * up[i];
+            let sparse = self.ffn_keep < 1.0
+                && layer.w_gate.ty == GgmlType::Q8_0
+                && layer.w_up.ty == GgmlType::Q8_0;
+            if sparse {
+                // CATS-style sparse FFN: compute the gate fully, decide which
+                // neurons are active from |silu(gate)|, then skip the up-projection
+                // of the inactive ones (their contribution is ~0 anyway).
+                self.matvec(&layer.w_gate, cfg.n_embd, cfg.n_ff, &f, &mut gate);
+                for g in gate.iter_mut() {
+                    *g = silu(*g);
+                }
+                let k = ((cfg.n_ff as f32 * self.ffn_keep).ceil() as usize).clamp(1, cfg.n_ff);
+                let thr = kth_largest_abs(&gate, k);
+                let active: Vec<bool> = gate.iter().map(|g| g.abs() >= thr).collect();
+                matmul_q8_0_masked(layer.w_up.data, cfg.n_embd, cfg.n_ff, &f, &mut up, &active);
+                for i in 0..cfg.n_ff {
+                    gate[i] *= up[i]; // inactive up = 0 -> neuron contributes nothing
+                }
+            } else {
+                self.matvec(&layer.w_gate, cfg.n_embd, cfg.n_ff, &f, &mut gate);
+                self.matvec(&layer.w_up, cfg.n_embd, cfg.n_ff, &f, &mut up);
+                for i in 0..cfg.n_ff {
+                    gate[i] = silu(gate[i]) * up[i];
+                }
             }
             // Research probe: how many of this layer's FFN neurons are "active"
             // (|post-SwiGLU| above a relative threshold)? Inactive neurons
@@ -919,6 +952,19 @@ fn softmax(x: &mut [f32]) {
 
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// The `k`-th largest absolute value in `v` (1-indexed), via a partial select
+/// (O(n), no full sort). Used as the activation-sparsity threshold: the top `k`
+/// neurons by |activation| have |value| >= this.
+fn kth_largest_abs(v: &[f32], k: usize) -> f32 {
+    if k >= v.len() {
+        return 0.0;
+    }
+    let mut mags: Vec<f32> = v.iter().map(|x| x.abs()).collect();
+    // Put the k largest first; element k-1 is the smallest of those = threshold.
+    mags.select_nth_unstable_by(k - 1, |a, b| b.partial_cmp(a).unwrap());
+    mags[k - 1]
 }
 
 /// NEOX-style rotary position embedding on a single head vector, in place.
