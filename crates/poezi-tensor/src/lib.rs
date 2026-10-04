@@ -75,6 +75,55 @@ fn dot_q8_0(row: &[u8], x: &[f32], in_dim: usize) -> f32 {
     acc
 }
 
+/// AVX2+FMA fused Q8_0 row·x dot. Per 32-value block: `s = Σ qᵢ·xᵢ` via 8-lane
+/// FMA (int8→f32), then `acc += d·s`. Same block-factored arithmetic as
+/// [`dot_q8_0`], just vectorized (results agree to rounding).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_q8_0_avx2(row: &[u8], x: &[f32], in_dim: usize) -> f32 { unsafe {
+    use std::arch::x86_64::*;
+    let nb = in_dim / QK8_0;
+    let mut acc = 0f32;
+    let qbase = row.as_ptr();
+    let xbase = x.as_ptr();
+    for b in 0..nb {
+        let base = b * Q8_0_BLOCK_BYTES;
+        let d = f16_to_f32(u16::from_le_bytes([row[base], row[base + 1]]));
+        let qptr = qbase.add(base + 2);
+        let xptr = xbase.add(b * QK8_0);
+        let mut sum = _mm256_setzero_ps();
+        let mut g = 0usize;
+        while g < QK8_0 {
+            // 8 int8 -> i32 -> f32, FMA with x
+            let q8 = _mm_loadl_epi64(qptr.add(g) as *const __m128i);
+            let qf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8));
+            let xf = _mm256_loadu_ps(xptr.add(g));
+            sum = _mm256_fmadd_ps(qf, xf, sum);
+            g += 8;
+        }
+        // horizontal sum of the 8 lanes
+        let lo = _mm256_castps256_ps128(sum);
+        let hi = _mm256_extractf128_ps::<1>(sum);
+        let s128 = _mm_add_ps(lo, hi);
+        let s64 = _mm_add_ps(s128, _mm_movehl_ps(s128, s128));
+        let s32 = _mm_add_ss(s64, _mm_shuffle_ps::<0x55>(s64, s64));
+        acc += d * _mm_cvtss_f32(s32);
+    }
+    acc
+}}
+
+/// Pick the fastest available Q8_0 dot for this CPU.
+#[inline]
+fn dot_q8_0_best(row: &[u8], x: &[f32], in_dim: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+            return unsafe { dot_q8_0_avx2(row, x, in_dim) };
+        }
+    }
+    dot_q8_0(row, x, in_dim)
+}
+
 /// Matrix-vector product `y = W · x` where `W` is a Q8_0 weight of shape
 /// `[in_dim, out_dim]` in ggml layout (row `j` is one contiguous output's
 /// weights). `y[j] = dot(row_j, x)`. Parallelized across output rows.
@@ -99,7 +148,7 @@ pub fn matmul_q8_0(w: &[u8], in_dim: usize, out_dim: usize, x: &[f32], y: &mut [
                 for (jj, yj) in ychunk.iter_mut().enumerate() {
                     let j = start + jj;
                     let row = &w[j * row_bytes..(j + 1) * row_bytes];
-                    *yj = dot_q8_0(row, x, in_dim);
+                    *yj = dot_q8_0_best(row, x, in_dim);
                 }
             });
         }
@@ -273,15 +322,25 @@ pub fn matmul(ty: GgmlType, w: &[u8], in_dim: usize, out_dim: usize, x: &[f32], 
             let w = &*w;
             let x = &*x;
             scope.spawn(move || {
-                let mut scratch = vec![0f32; in_dim];
-                for (jj, yj) in ychunk.iter_mut().enumerate() {
-                    let j = start + jj;
-                    dequant_row(ty, &w[j * rb..(j + 1) * rb], &mut scratch);
-                    let mut acc = 0f32;
-                    for i in 0..in_dim {
-                        acc += scratch[i] * x[i];
+                // Q8_0 (our models) has a fused dequant+dot that never
+                // materializes the row — avoids ~8x the weight traffic in a
+                // scratch buffer. Other types still dequant into scratch.
+                if ty == GgmlType::Q8_0 {
+                    for (jj, yj) in ychunk.iter_mut().enumerate() {
+                        let j = start + jj;
+                        *yj = dot_q8_0_best(&w[j * rb..(j + 1) * rb], x, in_dim);
                     }
-                    *yj = acc;
+                } else {
+                    let mut scratch = vec![0f32; in_dim];
+                    for (jj, yj) in ychunk.iter_mut().enumerate() {
+                        let j = start + jj;
+                        dequant_row(ty, &w[j * rb..(j + 1) * rb], &mut scratch);
+                        let mut acc = 0f32;
+                        for i in 0..in_dim {
+                            acc += scratch[i] * x[i];
+                        }
+                        *yj = acc;
+                    }
                 }
             });
         }
@@ -323,5 +382,30 @@ mod tests {
         let mut y = [0f32; 1];
         matmul_q8_0(&block, 32, 1, &x, &mut y);
         assert_eq!(y[0], (0..32).sum::<i32>() as f32);
+    }
+
+    #[test]
+    fn q8_0_simd_matches_reference() {
+        // Random-ish Q8_0 row + x; the SIMD/fused dot must match the
+        // dequant-then-flat-dot reference to rounding.
+        let in_dim = 32 * 40;
+        let nb = in_dim / 32;
+        let mut row = vec![0u8; nb * Q8_0_BLOCK_BYTES];
+        let mut s: u32 = 0x1234_5678;
+        let mut rng = || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+        for b in 0..nb {
+            let base = b * Q8_0_BLOCK_BYTES;
+            row[base..base + 2].copy_from_slice(&0x3a80u16.to_le_bytes()); // ~0.0156
+            for i in 0..32 {
+                row[base + 2 + i] = (rng() & 0xff) as u8;
+            }
+        }
+        let x: Vec<f32> = (0..in_dim).map(|_| (rng() % 1000) as f32 / 1000.0 - 0.5).collect();
+        let mut scratch = vec![0f32; in_dim];
+        dequant_q8_0(&row, &mut scratch);
+        let reference: f32 = scratch.iter().zip(&x).map(|(a, b)| a * b).sum();
+        let got = dot_q8_0_best(&row, &x, in_dim);
+        let rel = (got - reference).abs() / reference.abs().max(1e-3);
+        assert!(rel < 1e-3, "SIMD dot rel err {rel} (got {got}, ref {reference})");
     }
 }

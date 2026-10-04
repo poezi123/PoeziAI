@@ -254,6 +254,62 @@ fn spec_selftest(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
     }
 }
 
+/// Time a pure-CPU greedy generation (forces the CPU forward) and print the
+/// text + tok/s. Compare the text against `poezi gen` (GPU) to confirm the SIMD
+/// CPU path still produces correct output.
+fn cpugen(path: &str, prompt: &str, n: usize) -> ExitCode {
+    use std::time::Instant;
+    let gguf = match poezi_gguf::GgufFile::open(path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let tok = match poezi_model::Tokenizer::from_gguf(&gguf) {
+        Ok(t) => t, Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let model = match poezi_model::Model::load(&gguf) {
+        Ok(m) => m, Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let ids = tok.encode(prompt, tok.add_bos, true);
+    eprintln!("CPU greedy, {} prompt tokens, {n} new…", ids.len());
+    let t = Instant::now();
+    let out = model.greedy_cpu(&ids, n, None, tok.eos_id);
+    let s = t.elapsed().as_secs_f64();
+    println!("{}", tok.decode(&out));
+    println!("\n{} tok in {:.2}s = {:.2} tok/s (CPU)", out.len(), s, out.len() as f64 / s);
+    ExitCode::SUCCESS
+}
+
+/// Micro-benchmark the CPU matmul (the offload bottleneck) in isolation — no
+/// model file needed. Times the generic `matmul` on a synthetic Q8_0 and Q6_K
+/// weight of the given shape and reports throughput (weight GB/s) and GFLOP/s.
+fn cpumatbench(in_dim: usize, out_dim: usize, iters: usize) -> ExitCode {
+    use poezi_gguf::GgmlType;
+    use std::time::Instant;
+    let in_dim = in_dim / 256 * 256; // align to the k-quant super-block
+    let x: Vec<f32> = (0..in_dim).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+    let mut y = vec![0f32; out_dim];
+    let flops = 2.0 * in_dim as f64 * out_dim as f64;
+    println!("matmul {in_dim}x{out_dim}, {iters} iters, {} threads",
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+    for ty in [GgmlType::Q8_0, GgmlType::Q6K] {
+        let rb = poezi_tensor::row_bytes(ty, in_dim);
+        let w = vec![0x3cu8; rb * out_dim]; // arbitrary bytes; timing is value-independent
+        let bytes = (rb * out_dim) as f64;
+        // warm up
+        poezi_tensor::matmul(ty, &w, in_dim, out_dim, &x, &mut y);
+        let t = Instant::now();
+        for _ in 0..iters {
+            poezi_tensor::matmul(ty, &w, in_dim, out_dim, &x, &mut y);
+        }
+        let s = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "  {:?}: {:>7.2} ms/call   {:>6.1} GB/s   {:>6.1} GFLOP/s",
+            ty, s * 1e3, bytes / s / 1e9, flops / s / 1e9
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 /// Research (domain hypothesis): learn a hot neuron set from security/code
 /// prompts, then measure how well it covers OTHER security/code prompts vs
 /// generic text. If domain coverage >> generic coverage (and >> the ~39%
@@ -650,6 +706,21 @@ fn main() -> ExitCode {
                 .map(String::as_str)
                 .unwrap_or("Write a Rust function that reverses a linked list, then explain how it works step by step.");
             skew_probe(path, prompt)
+        }
+        Some("cpugen") => {
+            let (Some(path), Some(prompt)) = (args.get(1), args.get(2)) else {
+                eprintln!("usage: poezi cpugen <model.gguf> <prompt> [-n N]");
+                return ExitCode::FAILURE;
+            };
+            let n: usize = args.iter().position(|a| a == "-n")
+                .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(32);
+            cpugen(path, prompt, n)
+        }
+        Some("cpumatbench") => {
+            let in_dim: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3584);
+            let out_dim: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(18944);
+            let iters: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20);
+            cpumatbench(in_dim, out_dim, iters)
         }
         Some("domaintest") => {
             let Some(path) = args.get(1) else {
