@@ -155,7 +155,7 @@ In Rust implementiert (mit Ausnahme der zuvor geschriebenen Spec-Decode-Kernel),
   @row{AVX2-CPU-Matmul | Faktor 4 im Kernel (5 auf 19,5 GB\/s), Faktor 2 im CPU-Forward}
   @row{Whole-Layer-Offloading | verlustfrei, 15-GB-Modell läuft auf 12 GB}
   @row{Sparse CPU-FFN (opt-in) | plus 13 bis 24\% auf dem CPU-Pfad}
-  @row{Sparsity-aware Fine-Tuning | induziert g-Sparsität (35\% auf 21\%), Validierung negativ (siehe unten)}
+  @row{Sparsity-aware Fine-Tuning | widerlegt: macht die ausnutzbare Sparsität schlechter (siehe unten)}
 }
 
 Offloading-Durchsatz nach CPU-Anteil (7B, 40 Token):
@@ -180,7 +180,7 @@ Die zugrunde liegenden Verfahren sind publiziert. Neu sind ihre Kombination und 
   @item{Ein integrierter, gegen llama.cpp bit-identisch verifizierter Inferenz-Stack @bold{ohne externe Inferenzbibliothek}, der Speculative Decoding, auto-dimensioniertes Whole-Layer-Offloading und opt-in CPU-Sparsität auf einer 12-GB-Consumer-GPU unter der Vorgabe keiner eigenen Kernel für die Orchestrierung vereint.}
   @item{Batched, bit-identisches Quant-GEMM zur spekulativen Verifikation (Q8\_0\/Q4\_K\/Q6\_K), gemessen token-identisch zum Einzel-Token-Pfad.}
   @item{Empirisches Resultat: Für Qwen2.5-Coder ist der aktive FFN-Satz nicht domänenspezifisch (Differenz 3 Prozentpunkte); statisches Domänen-Offloading trägt nicht. Ein in dieser Form nicht publiziertes Negativresultat.}
-  @item{Offene Richtung mit negativem Zwischenergebnis: sparsity-aware Fine-Tuning senkte zwar den aktiven FFN-Anteil (35\% auf 21\% über 100 Schritte, Textprobe kohärent), aber die Validierung widerlegt den Nutzen: das trainierte Modell verträgt die ausnutzbare CATS-Sparsität schlechter als die Basis (keep 25\%: 62\% gegen 90\% Übereinstimmung). Ursache vermutlich, dass die Strafe auf der post-SwiGLU-Größe g saß, der ausnutzbare Schwellenwert aber auf silu(gate); dazu Overfitting auf 73 Beispielen. Korrigierter Versuch (Strafe direkt auf silu(gate)) steht aus.}
+  @item{Widerlegte Richtung: sparsity-aware Fine-Tuning per Regularizer. Die Hoyer-Strafe senkte zwar die gemessene Sparsität, doch die Validierung zeigt das Gegenteil des Erhofften: das trainierte Modell verträgt die ausnutzbare CATS-Maskierung @bold{schlechter} als die Basis. Bei keep 25\% fiel die Übereinstimmung auf 62\% (Strafe auf g) bzw. 56\% (Strafe auf silu(gate)) gegen 90\% der Basis. Beide Formulierungen widerlegt. Grund: ein niedriger Hoyer-Wert (global konzentriert) ist nicht dasselbe wie verlustfreie top-k-Maskierung, dazu Overfitting auf 73 Beispielen. Methodisch sauberer wäre mask-aware Training (die Sparse-FFN schon im Training anwenden), ungetestet und auf so kleinem Datensatz fraglich.}
 }
 
 @note{Kein algorithmischer Durchbruch. Der Beitrag liegt in der Integration, der bit-genauen Verifikation und den Messergebnissen für ein Regime (schwache GPU, langsame CPU, keine eigenen Kernel, enger Agent), das in der Literatur kaum abgedeckt ist.} 
@@ -239,7 +239,7 @@ Beim Offloading berechnet die GPU $x' = h_k(@dots h_1(x))$, überträgt den Zwis
 Die betrachteten Hebel sind publiziert. Die wenig untersuchte Lücke liegt im Regime, nicht in einer neuen Technik:
 
 @numbered{
-  @item{@bold{Schwache GPU, langsame CPU, keine eigenen Kernel.} Ob die Verfahren der Literatur unter reiner Orchestrierung auf einer 3060 netto gewinnen, ist offen.}
+  @item{@bold{Schwache GPU, langsame CPU und keine eigenen Kernel.} Ob die Verfahren der Literatur unter reiner Orchestrierung auf einer 3060 netto gewinnen ist offen.}
   @item{@bold{Einzelner, spezialisierter, fine-getunter Agent.} Die Domäne allein erzeugt keine ausnutzbare Struktur; sie müsste über sparsity-aware Fine-Tuning induziert werden.}
   @item{@bold{Gemessener kombinierter Stack} für dieses Gerät: Kompression, Sparsität und Spekulation zusammen, end-to-end.}
 }
@@ -254,7 +254,7 @@ Die betrachteten Hebel sind publiziert. Die wenig untersuchte Lücke liegt im Re
   @item{@bold{CPU-Matmul beschleunigen.} Grundlage des Offloadings. @italic{Umgesetzt: Faktor 4.}}
   @item{@bold{Whole-Layer-Offloading.} 15 GB auf 12 GB bei voller Qualität. @italic{Umgesetzt.}}
   @item{@bold{Sparsität auf dem CPU-Offload-Pfad.} @italic{Umgesetzt als opt-in.}}
-  @item{@bold{Sparsity-aware Fine-Tuning.} @italic{Induziert g-Sparsität, verbessert aber die ausnutzbare Sparsität nicht (Validierung negativ); korrigierter Ansatz: Strafe auf silu(gate).}}
+  @item{@bold{Sparsity-aware Fine-Tuning per Regularizer.} @italic{Widerlegt (beide Formulierungen: Strafe auf g und auf silu(gate) verschlechtern die Maskierungs-Toleranz). Offen bliebe nur mask-aware Training.}}
   @item{@bold{Verlustfreie Kompression} (DFloat11-Ansatz), falls die Kernel-Vorgabe gelockert wird.}
   @item{@bold{MoE-Pfad evaluieren.}}
 }
@@ -274,12 +274,12 @@ In einfachen Worten, ohne Fachbegriffe, was dieses Projekt gemessen und gebaut h
   @item{Sie schreibt rund 1,7-mal schneller und gibt garantiert denselben Text aus.}
   @item{Ein Modell, das zu groß für die Grafikkarte ist, läuft trotzdem in voller Qualität, nur langsamer.}
   @item{Die Berechnung auf dem Prozessor wurde viermal schneller.}
-  @item{Auf Wunsch spart sie Rechenarbeit, indem sie schwache Neuronen überspringt.}
+  @item{Spart Ressourcen, indem sie schwache Neuronen überspringt.}
 }
 
-@bold{Was ehrlich offen ist.} Keines dieser Verfahren ist neu erfunden; alle sind in der Fachwelt bekannt. Die naheliegende eigene Idee, das Modell auf sein Fachgebiet zu spezialisieren, damit es sparsamer rechnet, hat die Messung widerlegt. Eigen ist die vollständige, selbst gebaute und nachgeprüfte Umsetzung auf schwacher Hardware, die als offene Plattform für weitere Experimente dient; fremde, fertige Programme sind geschlossen und erlauben das nicht.
+@bold{Was offen ist.} Keines dieser Verfahren ist neu erfunden; alle sind bekannt. Die naheliegende eigene Idee, das Modell auf sein Fachgebiet zu spezialisieren, damit es sparsamer rechnet, hat die Messung widerlegt. Eigen ist die vollständige, selbst gebaute und nachgeprüfte Umsetzung auf schwacher Hardware, die als offene Plattform für weitere Experimente dient; fremde, fertige Programme sind geschlossen und erlauben das nicht.
 
-@bold{Nächster Schritt.} Die Struktur, die noch mehr Tempo bringen würde, ist im Modell natürlich nicht vorhanden. Sie lässt sich möglicherweise durch gezieltes Nachtrainieren erzeugen. Ob das gelingt, ist offen und wird gerade untersucht.
+@bold{Nächster Schritt.} Die Struktur, die noch mehr Tempo bringen würde, ist im Modell natürlich nicht vorhanden. Der Versuch, sie durch gezieltes Nachtrainieren zu erzeugen, ist in zwei Varianten gescheitert (das Modell wurde dadurch schlechter im Weglassen, nicht besser). Die naheliegende Idee ist damit ausgeschlossen; offen bliebe nur ein aufwendigeres Trainingsverfahren, dessen Nutzen auf dem kleinen Datensatz fraglich ist.
 
 @pagebreak
 @chapter{Quellen}

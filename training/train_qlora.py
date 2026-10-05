@@ -44,6 +44,8 @@ ap.add_argument("--max-steps", type=int, default=0, help="cap training steps (0 
 ap.add_argument("--maxlen", type=int, default=1024)
 ap.add_argument("--measure-sparsity", action="store_true", help="print FFN activation sparsity before & after")
 ap.add_argument("--sample", action="store_true", help="generate a short completion after training (quality check)")
+ap.add_argument("--sparse-target", choices=["g", "gate"], default="gate",
+                help="what the Hoyer penalty acts on: 'gate' = silu(gate_proj) (what the engine thresholds on, exploitable), 'g' = down_proj input")
 args = ap.parse_args()
 SPARSE = args.sparsity_l1 > 0.0
 # Keep gradient checkpointing on (7B QLoRA needs it to fit 12 GB). Non-reentrant
@@ -95,35 +97,45 @@ MAXLEN = args.maxlen
 # each MLP down_proj) via forward hooks, so we can both penalize and measure
 # their sparsity. The down_proj input is exactly g = silu(gate)·up — a neuron is
 # "inactive" when |g| is tiny, contributing ~nothing to the layer output.
-_ACT_L1 = []          # per-forward list of mean |g| (for the penalty)
+_ACT_L1 = []          # per-forward list of per-layer Hoyer ratios (the penalty)
 _MEASURE = {"on": False, "active": 0, "total": 0, "thresh": 0.01}
 
-def _down_proj_modules(m):
-    return [mod for name, mod in m.named_modules() if name.endswith("mlp.down_proj")]
+def _hoyer(t):
+    # Scale-invariant sparsity: L1/L2 per token vector, mean over tokens.
+    # Low = concentrated in few units. Range [1, sqrt(n)].
+    tf = t.float()
+    l1 = tf.abs().sum(dim=-1)
+    l2 = tf.pow(2).sum(dim=-1).sqrt() + 1e-6
+    return (l1 / l2).mean()
 
-def _hook(_mod, inp, _out):
-    g = inp[0]
-    if g is None:
+def _penalty_hook_gate(_mod, _inp, out):
+    # Penalize silu(gate_proj) — exactly what the engine's CATS FFN thresholds
+    # on, so the induced sparsity is exploitable at inference (the fix after the
+    # 'g' target did not transfer to the exploitable path).
+    _ACT_L1.append(_hoyer(out * torch.sigmoid(out)))
+
+def _penalty_hook_g(_mod, inp, _out):
+    if inp[0] is not None:
+        _ACT_L1.append(_hoyer(inp[0]))  # g = silu(gate)*up (down_proj input)
+
+def _measure_hook(_mod, inp, _out):
+    # g-based active-fraction probe (matches the Rust `poezi skew` metric).
+    if not _MEASURE["on"] or inp[0] is None:
         return
-    if _ACT_L1 is not None:
-        # Hoyer-style sparsity penalty: L1/L2 per token vector. Scale-invariant
-        # (unlike plain L1 it isn't fooled by uniform shrinkage), minimized when
-        # the activation is concentrated in few neurons -> drives relative
-        # sparsity up. Range [1, sqrt(n_ff)]; lower = sparser.
-        gf = g.float()
-        l1 = gf.abs().sum(dim=-1)
-        l2 = gf.pow(2).sum(dim=-1).sqrt() + 1e-6
-        _ACT_L1.append((l1 / l2).mean())
-    if _MEASURE["on"]:
-        with torch.no_grad():
-            gg = g.detach().float().abs()
-            mx = gg.amax(dim=-1, keepdim=True).clamp_min(1e-9)
-            _MEASURE["active"] += int((gg > _MEASURE["thresh"] * mx).sum().item())
-            _MEASURE["total"] += gg.numel()
+    with torch.no_grad():
+        gg = inp[0].detach().float().abs()
+        mx = gg.amax(dim=-1, keepdim=True).clamp_min(1e-9)
+        _MEASURE["active"] += int((gg > _MEASURE["thresh"] * mx).sum().item())
+        _MEASURE["total"] += gg.numel()
 
 if SPARSE or args.measure_sparsity:
-    for mod in _down_proj_modules(model):
-        mod.register_forward_hook(_hook)
+    for name, mod in model.named_modules():
+        if name.endswith("mlp.down_proj"):
+            mod.register_forward_hook(_measure_hook)
+            if SPARSE and args.sparse_target == "g":
+                mod.register_forward_hook(_penalty_hook_g)
+        if SPARSE and args.sparse_target == "gate" and name.endswith("mlp.gate_proj"):
+            mod.register_forward_hook(_penalty_hook_gate)
 
 def measure_sparsity(ds, n=8):
     """Mean fraction of FFN neurons active (|g| > 1% of per-token max) over a few
