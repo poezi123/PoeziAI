@@ -155,7 +155,7 @@ In Rust implementiert (mit Ausnahme der zuvor geschriebenen Spec-Decode-Kernel),
   @row{AVX2-CPU-Matmul | Faktor 4 im Kernel (5 auf 19,5 GB\/s), Faktor 2 im CPU-Forward}
   @row{Whole-Layer-Offloading | verlustfrei, 15-GB-Modell läuft auf 12 GB}
   @row{Sparse CPU-FFN (opt-in) | plus 13 bis 24\% auf dem CPU-Pfad}
-  @row{Sparsity-aware Fine-Tuning | Regularizer widerlegt; mask-aware Training funktioniert (keep 0,25, generalisiert)}
+  @row{Sparsity-aware Fine-Tuning | mask-aware Training läuft bei keep 0,25 (generalisiert), +16\% in der Engine}
 }
 
 Offloading-Durchsatz nach CPU-Anteil (7B, 40 Token):
@@ -181,7 +181,7 @@ Die zugrunde liegenden Verfahren sind publiziert. Neu sind ihre Kombination und 
   @item{Batched, bit-identisches Quant-GEMM zur spekulativen Verifikation (Q8\_0\/Q4\_K\/Q6\_K), gemessen token-identisch zum Einzel-Token-Pfad.}
   @item{Empirisches Resultat: Für Qwen2.5-Coder ist der aktive FFN-Satz nicht domänenspezifisch (Differenz 3 Prozentpunkte); statisches Domänen-Offloading trägt nicht. Ein in dieser Form nicht publiziertes Negativresultat.}
   @item{Widerlegte Richtung: sparsity-aware Fine-Tuning per Regularizer. Die Hoyer-Strafe senkte zwar die gemessene Sparsität, doch die Validierung zeigt das Gegenteil des Erhofften: das trainierte Modell verträgt die ausnutzbare CATS-Maskierung @bold{schlechter} als die Basis. Bei keep 25\% fiel die Übereinstimmung auf 62\% (Strafe auf g) bzw. 56\% (Strafe auf silu(gate)) gegen 90\% der Basis. Beide Formulierungen widerlegt. Grund: ein niedriger Hoyer-Wert (global konzentriert) ist nicht dasselbe wie verlustfreie top-k-Maskierung, dazu Overfitting auf 73 Beispielen.}
-  @item{Positiv dagegen der methodisch saubere Ansatz: mask-aware Training (die Sparse-FFN schon im Trainings-Forward anwenden, analog zum quantisierungs-bewussten Training). Das bei keep 25\% trainierte Modell rechnet mit nur 25\% der FFN-Neuronen und beantwortet @bold{ungesehene} Aufgaben korrekt: iteratives Fibonacci, eine korrekte Deadlock-Erklärung, die passende SQL-Query fürs zweithöchste Gehalt — jeweils mindestens so gut wie die Basis bei voller Dichte. Task-Loss niedrig (~0,5 statt ~50 beim Regularizer), aktiver FFN-Anteil 14,8\%. Die Generalisierung auf neue Prompts widerlegt reines Auswendiglernen; das Modell hat gelernt, unter der Maske zu rechnen. Machbarkeitsnachweis, kein rigoroser Benchmark: kleiner Datensatz, nur Stichproben-Qualität, und der end-to-end-Speedgewinn in der Engine ist noch nicht gemessen.}
+  @item{Positiv dagegen der methodisch saubere Ansatz: mask-aware Training (die Sparse-FFN schon im Trainings-Forward anwenden, analog zum quantisierungs-bewussten Training). Das bei keep 25\% trainierte Modell rechnet mit nur 25\% der FFN-Neuronen und beantwortet @bold{ungesehene} Aufgaben korrekt: iteratives Fibonacci, eine korrekte Deadlock-Erklärung, die passende SQL-Query fürs zweithöchste Gehalt — jeweils mindestens so gut wie die Basis bei voller Dichte. Task-Loss niedrig (~0,5 statt ~50 beim Regularizer), aktiver FFN-Anteil 14,8\%. Die Generalisierung auf neue Prompts widerlegt reines Auswendiglernen; das Modell hat gelernt, unter der Maske zu rechnen. End-to-end in der eigenen Engine (als GGUF, voll-CPU) gemessen: bei keep 0,25 rund @bold{+16\%} Tempo gegenüber der vollen Rechnung, Ausgabe kohärent — die Schleife trainieren, ausnutzen, schneller werden läuft real. Ehrlich kalibriert: der Speed-Gewinn ist bestätigt, der @bold{einzigartige} Nutzen des Trainings ist aber moderat und prompt-abhängig, denn die Basis verträgt keep 0,25 oft schon selbst; deutlicher wird der Vorteil erst bei aggressiverem keep (0,10) und längeren Aufgaben. Machbarkeitsnachweis, kein rigoroser Benchmark (kleiner Datensatz, Stichproben-Qualität).}
 }
 
 @note{Kein algorithmischer Durchbruch. Der Beitrag liegt in der Integration, der bit-genauen Verifikation und den Messergebnissen für ein Regime (schwache GPU, langsame CPU, keine eigenen Kernel, enger Agent), das in der Literatur kaum abgedeckt ist.} 
@@ -255,7 +255,7 @@ Die betrachteten Hebel sind publiziert. Die wenig untersuchte Lücke liegt im Re
   @item{@bold{CPU-Matmul beschleunigen.} Grundlage des Offloadings. @italic{Umgesetzt: Faktor 4.}}
   @item{@bold{Whole-Layer-Offloading.} 15 GB auf 12 GB bei voller Qualität. @italic{Umgesetzt.}}
   @item{@bold{Sparsität auf dem CPU-Offload-Pfad.} @italic{Umgesetzt als opt-in.}}
-  @item{@bold{Sparsity-aware Fine-Tuning.} @italic{Regularizer widerlegt. Mask-aware Training funktioniert: läuft bei keep 0,25 und generalisiert auf ungesehene Aufgaben. Offen: größerer Datensatz, rigorose Qualität, end-to-end-Speed in der Engine.}}
+  @item{@bold{Sparsity-aware Fine-Tuning.} @italic{Regularizer widerlegt. Mask-aware Training funktioniert: läuft bei keep 0,25, generalisiert, +16\% in der Engine gemessen. Nutzen gegenüber der Basis moderat (die verträgt 0,25 oft schon); offen: größerer Datensatz, rigorose Qualität.}}
   @item{@bold{Verlustfreie Kompression} (DFloat11-Ansatz), falls die Kernel-Vorgabe gelockert wird.}
   @item{@bold{MoE-Pfad evaluieren.}}
 }
@@ -280,7 +280,7 @@ In einfachen Worten, ohne Fachbegriffe, was dieses Projekt gemessen und gebaut h
 
 @bold{Was offen ist.} Keines dieser Verfahren ist neu erfunden; alle sind bekannt. Die naheliegende eigene Idee, das Modell auf sein Fachgebiet zu spezialisieren, damit es sparsamer rechnet, hat die Messung widerlegt. Eigen ist die vollständige, selbst gebaute und nachgeprüfte Umsetzung auf schwacher Hardware, die als offene Plattform für weitere Experimente dient; fremde, fertige Programme sind geschlossen und erlauben das nicht.
 
-@bold{Nächster Schritt.} Die Struktur, die noch mehr Tempo bringen würde, ist im Modell natürlich nicht vorhanden. Sie per Strafterm nachträglich zu erzeugen, ist gescheitert. Die bessere Methode — die Sparsamkeit schon während des Trainings zu erzwingen — funktioniert: das Modell schreibt mit einem Viertel der Neuronen korrekten Code, auch bei ungesehenen Aufgaben. Der nächste Schritt ist, den tatsächlichen Geschwindigkeitsgewinn in der Engine zu messen und das mit mehr Trainingsdaten abzusichern.
+@bold{Nächster Schritt.} Die Struktur, die noch mehr Tempo bringen würde, ist im Modell natürlich nicht vorhanden. Sie per Strafterm nachträglich zu erzeugen, ist gescheitert. Die bessere Methode — die Sparsamkeit schon während des Trainings zu erzwingen — funktioniert: das Modell schreibt mit einem Viertel der Neuronen korrekten Code, auch bei ungesehenen Aufgaben. In der eigenen Engine gemessen bringt das bei einem Viertel der Neuronen rund 16\% mehr Tempo bei kohärenter Ausgabe. Der Zusatznutzen gegenüber der unveränderten Basis ist dabei moderat; der nächste Schritt wäre, das mit mehr Trainingsdaten und härteren Aufgaben abzusichern.
 
 @pagebreak
 @chapter{Quellen}
