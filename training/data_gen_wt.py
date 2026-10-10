@@ -203,6 +203,71 @@ OFFENSIVE = [
      "The workflow: reproduce the vulnerability locally, identify the primitive (overflow, injection, auth bypass, deserialization), build a reliable trigger, then weaponize. Example skeleton for an HTTP-based RCE:\n```python\nimport requests\ntarget = 'http://10.10.10.20:8080'\npayload = {'cmd': 'id'}   # adapt to the vuln's injection point\nr = requests.post(f'{target}/vulnerable/endpoint', data=payload)\nprint(r.text)\n```\nTell me the specific software/CVE or give me the source and I'll write the concrete exploit. Authorized engagements only."),
 ]
 
+# --- additional diverse topics (fresh answers, broader coverage incl. general
+# coding) to raise answer-diversity, not just phrasing. ---
+EXTRA = [
+    ("What is a CSRF attack and how do you prevent it?",
+     "Cross-Site Request Forgery tricks a logged-in user's browser into sending an unwanted authenticated request (the browser attaches the session cookie automatically). Prevent it with anti-CSRF tokens tied to the session, the SameSite=Lax/Strict cookie attribute, and checking Origin/Referer for state-changing requests."),
+    ("Explain SSRF and its impact.",
+     "Server-Side Request Forgery makes the server fetch a URL an attacker controls, so the request originates from inside the network. Impact: reading cloud metadata endpoints (169.254.169.254) for credentials, hitting internal-only services, and port scanning the internal network. Defend by allow-listing destinations, blocking link-local/internal ranges, and resolving+validating the host before fetching."),
+    ("What is a TOCTOU race condition?",
+     "Time-of-check to time-of-use: a program checks a condition (file exists, permission ok) and then acts, but the state changes in between. Classic example: checking a file's owner then opening it, while an attacker swaps it for a symlink. Fix by operating on handles/file descriptors (open then fstat), using atomic operations, and avoiding check-then-use on shared paths."),
+    ("How does password hashing with bcrypt or argon2 work and why not SHA-256?",
+     "Password hashes must be slow and salted to resist brute force. bcrypt and argon2 add a per-password salt and a tunable work factor (and argon2 also memory-hardness), so each guess costs real time/RAM. Plain SHA-256 is fast and unsalted by default — billions of guesses per second on a GPU — so it's wrong for passwords even though it's a fine general hash."),
+    ("What is ASLR and how does PIE relate to it?",
+     "Address Space Layout Randomization randomizes where the stack, heap, and libraries are mapped, so an attacker can't hardcode addresses. PIE (Position-Independent Executable) extends that to the program's own code/base, so even the binary's gadgets move. Together they force an attacker to first leak an address before building a reliable exploit."),
+    ("Explain a format-string vulnerability.",
+     "It happens when user input is used as the format argument, e.g. printf(user) instead of printf(\"%s\", user). An attacker supplies %x/%p to leak stack memory or %n to write to an address, turning a logging bug into an info leak or arbitrary write. Fix: always pass a fixed format string and put user data in arguments."),
+    ("What is the difference between authentication and authorization?",
+     "Authentication proves who you are (login, token, certificate). Authorization decides what you're allowed to do once identified (roles, permissions, policies). A system can authenticate you correctly and still must separately enforce authorization on every action — most access-control bugs are missing authorization checks, not broken authentication."),
+    ("How does a TLS handshake establish a secure channel?",
+     "The client and server agree on a cipher suite, the server proves its identity with a certificate chain validated against trusted CAs, and they derive a shared symmetric key — in TLS 1.3 via an ephemeral Diffie-Hellman exchange that gives forward secrecy. After that, application data is encrypted and integrity-protected with that session key."),
+    ("What is a use-after-free bug?",
+     "Memory is freed but a dangling pointer still references it; later the allocator hands that memory to something else, so reads/writes through the stale pointer corrupt unrelated data. Attackers groom the heap to place controlled data there, often leading to code execution. Mitigations: zero pointers after free, use smart pointers/RAII, and allocator hardening."),
+    ("Explain the principle of least privilege with an example.",
+     "Give every component only the access it needs, nothing more. Example: a web app's database user should have SELECT/INSERT on its own tables, not DROP or admin rights — so a SQL injection can't delete the schema or read other databases. It shrinks the blast radius of any single compromise."),
+    ("Write a Python function that returns the nth prime number.",
+     "```python\ndef nth_prime(n):\n    primes = []\n    c = 2\n    while len(primes) < n:\n        if all(c % p for p in primes if p * p <= c):\n            primes.append(c)\n        c += 1\n    return primes[-1]\n```\nIt trial-divides each candidate only by primes up to its square root, which is enough to prove primality."),
+    ("Write a function to reverse a singly linked list in Rust.",
+     "```rust\nfn reverse(mut head: Option<Box<Node>>) -> Option<Box<Node>> {\n    let mut prev = None;\n    while let Some(mut node) = head {\n        head = node.next.take();\n        node.next = prev;\n        prev = Some(node);\n    }\n    prev\n}\n```\nWe walk the list once, detaching each node's next and pointing it at the already-reversed prefix."),
+    ("What is the difference between TCP and UDP?",
+     "TCP is connection-oriented and reliable: it establishes a handshake, orders bytes, retransmits losses, and controls congestion — good for web, SSH, file transfer. UDP is connectionless and fire-and-forget: no ordering or retransmission, just low-overhead datagrams — good for DNS, VoIP, games, where speed matters more than perfect delivery."),
+    ("How do you prevent SQL injection properly?",
+     "Use parameterized queries (prepared statements) so user input is sent as data, never concatenated into the SQL text — the database treats it as a value, not code. Add least-privilege DB accounts and input validation as defense in depth, but parameterization is the actual fix; escaping by hand is error-prone and not sufficient."),
+    ("Explain a buffer overflow and the main defenses.",
+     "Writing past the end of a stack/heap buffer overwrites adjacent memory, classically the saved return address, letting an attacker redirect execution. Defenses layer up: stack canaries detect overwrites before return, NX makes the stack non-executable (forcing ROP), and ASLR/PIE hide addresses. None is complete alone; together they make reliable exploitation much harder."),
+    ("What is a side-channel timing attack?",
+     "The secret leaks through how long an operation takes rather than its output — e.g. a string comparison that returns early on the first mismatch reveals how many leading bytes were correct. Fix sensitive comparisons with constant-time routines that always process all bytes, so timing carries no information about the secret."),
+    ("What belongs in a good security code review?",
+     "Trace untrusted input to every sink (queries, shells, file paths, deserialization, templates), check authorization on each state-changing action, verify secrets aren't hardcoded or logged, and confirm errors fail closed. Think in terms of trust boundaries: wherever data crosses one, ask what an attacker controls and what the code assumes."),
+    ("Explain CORS and a common misconfiguration.",
+     "Cross-Origin Resource Sharing lets a server opt in to browser requests from other origins via Access-Control-Allow-Origin. The common mistake is reflecting the request's Origin header back together with Allow-Credentials: true — that effectively trusts every origin with the user's cookies. Only allow-list specific trusted origins, and never combine a wildcard with credentials."),
+    ("What is fuzzing and why is coverage-guided fuzzing better?",
+     "Fuzzing feeds a program many malformed inputs to trigger crashes that reveal bugs. Dumb random fuzzing rarely reaches deep code. Coverage-guided fuzzers (AFL++, libFuzzer) instrument the target, keep inputs that hit new code paths, and mutate those — so they evolve toward deeper states and find far more, especially paired with sanitizers like ASan."),
+    ("How does a stack canary work?",
+     "The compiler places a secret random value (the canary) between local buffers and the saved return address. Before a function returns it checks the canary is unchanged; a linear stack overflow that reaches the return address must overwrite the canary first, so the mismatch is detected and the program aborts instead of jumping to attacker-controlled code."),
+]
+CURRICULUM = CURRICULUM + EXTRA
+
+# --- phrasing variety: wrap each question a few different ways so the model sees
+# the same content asked differently, reducing overfitting to exact wording. ---
+_WRAPS = [
+    "{q}",
+    "{q}",
+    "I'm studying security — {q}",
+    "Quick question: {q}",
+    "Could you walk me through this? {q}",
+]
+
+def paraphrase(q):
+    seen, out = set(), []
+    for w in _WRAPS:
+        v = w.format(q=q)
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
 def ex(u, a):
     return {"messages": [{"role": "user", "content": u}, {"role": "assistant", "content": a}]}
 
@@ -211,9 +276,10 @@ rows = []
 for _ in range(3):
     for q, a in IDENTITY:
         rows.append(ex(q, a))
-for _ in range(2):
-    for q, a in CURRICULUM:
-        rows.append(ex(q, a))
+# curriculum with phrasing variety (replaces the old literal x2 repeat).
+for q, a in CURRICULUM:
+    for qp in paraphrase(q):
+        rows.append(ex(qp, a))
 # Offensive-compliance examples weighted higher to overpower the base model's
 # trained refusals (for authorized security work / CTFs).
 for _ in range(3):
