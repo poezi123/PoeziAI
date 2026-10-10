@@ -23,7 +23,7 @@
   @item{Man kann die @bold{Hälfte} dieser Neuronen weglassen und bekommt @bold{exakt dasselbe} Ergebnis, Wort für Wort.}
   @item{Ein Modell, das zu groß für die Grafikkarte ist, läuft trotzdem in @bold{voller Qualität}, nur langsamer. Beispiel: ein 15-GB-Modell auf einer 12-GB-Karte.}
   @item{Schneller rechnen @bold{ohne jede Qualitätsänderung} ist möglich: das Modell schreibt 1,67-mal schneller und gibt garantiert denselben Text aus.}
-  @item{Der Versuch, dem Modell Sparsamkeit anzutrainieren, ist @bold{gescheitert} (in zwei Varianten geprüft): das trainierte Modell verträgt starkes Weglassen sogar schlechter als vorher. Ein sauberes Negativergebnis — die Idee trägt so nicht.}
+  @item{Dem Modell Sparsamkeit per Strafterm anzutrainieren, ist gescheitert. Aber die bessere Methode — die Sparsamkeit schon @bold{während des Trainings} erzwingen — zeigt ein @bold{erstes gutes Zeichen}: das so trainierte Modell schreibt auch mit nur einem Viertel der Neuronen sauberen Code. Noch nicht bewiesen (zu wenig Trainingsdaten), aber der erste tragfähige Hinweis.}
 }
 
 @chapter{Was davon funktioniert}

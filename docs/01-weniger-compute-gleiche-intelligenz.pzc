@@ -155,7 +155,7 @@ In Rust implementiert (mit Ausnahme der zuvor geschriebenen Spec-Decode-Kernel),
   @row{AVX2-CPU-Matmul | Faktor 4 im Kernel (5 auf 19,5 GB\/s), Faktor 2 im CPU-Forward}
   @row{Whole-Layer-Offloading | verlustfrei, 15-GB-Modell läuft auf 12 GB}
   @row{Sparse CPU-FFN (opt-in) | plus 13 bis 24\% auf dem CPU-Pfad}
-  @row{Sparsity-aware Fine-Tuning | widerlegt: macht die ausnutzbare Sparsität schlechter (siehe unten)}
+  @row{Sparsity-aware Fine-Tuning | Regularizer widerlegt; mask-aware Training erstes positives Signal (siehe unten)}
 }
 
 Offloading-Durchsatz nach CPU-Anteil (7B, 40 Token):
@@ -180,7 +180,8 @@ Die zugrunde liegenden Verfahren sind publiziert. Neu sind ihre Kombination und 
   @item{Ein integrierter, gegen llama.cpp bit-identisch verifizierter Inferenz-Stack @bold{ohne externe Inferenzbibliothek}, der Speculative Decoding, auto-dimensioniertes Whole-Layer-Offloading und opt-in CPU-Sparsität auf einer 12-GB-Consumer-GPU unter der Vorgabe keiner eigenen Kernel für die Orchestrierung vereint.}
   @item{Batched, bit-identisches Quant-GEMM zur spekulativen Verifikation (Q8\_0\/Q4\_K\/Q6\_K), gemessen token-identisch zum Einzel-Token-Pfad.}
   @item{Empirisches Resultat: Für Qwen2.5-Coder ist der aktive FFN-Satz nicht domänenspezifisch (Differenz 3 Prozentpunkte); statisches Domänen-Offloading trägt nicht. Ein in dieser Form nicht publiziertes Negativresultat.}
-  @item{Widerlegte Richtung: sparsity-aware Fine-Tuning per Regularizer. Die Hoyer-Strafe senkte zwar die gemessene Sparsität, doch die Validierung zeigt das Gegenteil des Erhofften: das trainierte Modell verträgt die ausnutzbare CATS-Maskierung @bold{schlechter} als die Basis. Bei keep 25\% fiel die Übereinstimmung auf 62\% (Strafe auf g) bzw. 56\% (Strafe auf silu(gate)) gegen 90\% der Basis. Beide Formulierungen widerlegt. Grund: ein niedriger Hoyer-Wert (global konzentriert) ist nicht dasselbe wie verlustfreie top-k-Maskierung, dazu Overfitting auf 73 Beispielen. Methodisch sauberer wäre mask-aware Training (die Sparse-FFN schon im Training anwenden), ungetestet und auf so kleinem Datensatz fraglich.}
+  @item{Widerlegte Richtung: sparsity-aware Fine-Tuning per Regularizer. Die Hoyer-Strafe senkte zwar die gemessene Sparsität, doch die Validierung zeigt das Gegenteil des Erhofften: das trainierte Modell verträgt die ausnutzbare CATS-Maskierung @bold{schlechter} als die Basis. Bei keep 25\% fiel die Übereinstimmung auf 62\% (Strafe auf g) bzw. 56\% (Strafe auf silu(gate)) gegen 90\% der Basis. Beide Formulierungen widerlegt. Grund: ein niedriger Hoyer-Wert (global konzentriert) ist nicht dasselbe wie verlustfreie top-k-Maskierung, dazu Overfitting auf 73 Beispielen.}
+  @item{Erstes positives Signal dagegen beim methodisch sauberen Ansatz: mask-aware Training (die Sparse-FFN schon im Trainings-Forward anwenden, analog zum quantisierungs-bewussten Training). Bei keep 25\% erzeugt das trainierte Modell kohärenten, korrekten Code, die Task-Loss bleibt niedrig (~0,5 statt ~50 beim Regularizer), der aktive FFN-Anteil sinkt auf 14,8\%, und die Ausgabe bleibt über keep 25\% bis 10\% stabil, wo die Basis einbricht. Der erste tragfähige Hinweis, dass ein Modell gezielt offload-tauglich gemacht werden kann. Noch nicht bewiesen: 73 Beispiele (Overfitting), keine Held-out-Qualitätsmessung.}
 }
 
 @note{Kein algorithmischer Durchbruch. Der Beitrag liegt in der Integration, der bit-genauen Verifikation und den Messergebnissen für ein Regime (schwache GPU, langsame CPU, keine eigenen Kernel, enger Agent), das in der Literatur kaum abgedeckt ist.} 
@@ -254,7 +255,7 @@ Die betrachteten Hebel sind publiziert. Die wenig untersuchte Lücke liegt im Re
   @item{@bold{CPU-Matmul beschleunigen.} Grundlage des Offloadings. @italic{Umgesetzt: Faktor 4.}}
   @item{@bold{Whole-Layer-Offloading.} 15 GB auf 12 GB bei voller Qualität. @italic{Umgesetzt.}}
   @item{@bold{Sparsität auf dem CPU-Offload-Pfad.} @italic{Umgesetzt als opt-in.}}
-  @item{@bold{Sparsity-aware Fine-Tuning per Regularizer.} @italic{Widerlegt (beide Formulierungen: Strafe auf g und auf silu(gate) verschlechtern die Maskierungs-Toleranz). Offen bliebe nur mask-aware Training.}}
+  @item{@bold{Sparsity-aware Fine-Tuning.} @italic{Regularizer widerlegt (beide Formulierungen). Mask-aware Training zeigt dagegen ein erstes positives Signal (kohärent bei keep 0,25, Aktiv-Anteil 14,8\%); Validierung mit größerem Datensatz und Held-out-Qualität offen.}}
   @item{@bold{Verlustfreie Kompression} (DFloat11-Ansatz), falls die Kernel-Vorgabe gelockert wird.}
   @item{@bold{MoE-Pfad evaluieren.}}
 }
@@ -279,7 +280,7 @@ In einfachen Worten, ohne Fachbegriffe, was dieses Projekt gemessen und gebaut h
 
 @bold{Was offen ist.} Keines dieser Verfahren ist neu erfunden; alle sind bekannt. Die naheliegende eigene Idee, das Modell auf sein Fachgebiet zu spezialisieren, damit es sparsamer rechnet, hat die Messung widerlegt. Eigen ist die vollständige, selbst gebaute und nachgeprüfte Umsetzung auf schwacher Hardware, die als offene Plattform für weitere Experimente dient; fremde, fertige Programme sind geschlossen und erlauben das nicht.
 
-@bold{Nächster Schritt.} Die Struktur, die noch mehr Tempo bringen würde, ist im Modell natürlich nicht vorhanden. Der Versuch, sie durch gezieltes Nachtrainieren zu erzeugen, ist in zwei Varianten gescheitert (das Modell wurde dadurch schlechter im Weglassen, nicht besser). Die naheliegende Idee ist damit ausgeschlossen; offen bliebe nur ein aufwendigeres Trainingsverfahren, dessen Nutzen auf dem kleinen Datensatz fraglich ist.
+@bold{Nächster Schritt.} Die Struktur, die noch mehr Tempo bringen würde, ist im Modell natürlich nicht vorhanden. Sie per Strafterm nachträglich zu erzeugen, ist gescheitert. Die bessere Methode — die Sparsamkeit schon während des Trainings zu erzwingen — zeigt ein erstes positives Signal: das Modell schreibt auch mit einem Viertel der Neuronen sauberen Code. Der nächste echte Schritt ist, das mit mehr Trainingsdaten und einer sauberen Qualitätsmessung zu bestätigen.
 
 @pagebreak
 @chapter{Quellen}
