@@ -151,7 +151,7 @@ In Rust implementiert (mit Ausnahme der zuvor geschriebenen Spec-Decode-Kernel),
 
 @table[header]{
   @row{Verfahren | Ergebnis}
-  @row{Speculative Decoding | verlustfrei, Faktor 1,67 auf Code\/Agent-Reuse}
+  @row{Speculative Decoding | verlustfrei, 1,67 bis 2,7x auf Reuse (Oracle-Dach 3,6x, ~74\% erreicht)}
   @row{AVX2-CPU-Matmul | Faktor 4 im Kernel (5 auf 19,5 GB\/s), Faktor 2 im CPU-Forward}
   @row{Whole-Layer-Offloading | verlustfrei, 15-GB-Modell läuft auf 12 GB}
   @row{Sparse CPU-FFN (opt-in) | plus 13 bis 24\% auf dem CPU-Pfad}
@@ -245,7 +245,7 @@ Die betrachteten Hebel sind publiziert. Die wenig untersuchte Lücke liegt im Re
   @item{@bold{Gemessener kombinierter Stack} für dieses Gerät: Kompression, Sparsität und Spekulation zusammen, end-to-end.}
 }
 
-@note{Ein algorithmischer Durchbruch ist nicht zu erwarten. Realistisch ist ein Beitrag auf System- und Empirie-Ebene im Low-End- und Single-Agent-Regime.}
+@note{Grundsatz, gemessen: Verlustfreie Rechenersparnis bei gleicher Modellgröße geht nur über Redundanz-Vermeidung (Spec-Decoding, KV-Reuse) und ist gedeckelt — hier bei ~3,6x (Oracle-Drafter), wovon der einfache Prompt-Lookup ~74\% holt. Größere Gewinne erfordern Verlust (Sparsität, Quantisierung) oder eine andere Architektur (MoE). Ein algorithmischer Durchbruch ist nicht zu erwarten; realistisch ist ein Beitrag auf System- und Empirie-Ebene im Low-End- und Single-Agent-Regime.}
 
 @chapter{Forschungsagenda}
 

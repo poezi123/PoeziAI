@@ -186,16 +186,26 @@ fn spec_selftest(path: &str, prompt: &str, n_predict: usize) -> ExitCode {
         let mut steps = 0usize;
         let mut accepted_total = 0usize;
         let mut policy = SpecPolicy::default();
+        // Oracle drafter (POEZI_SPEC_ORACLE=1): draft the TRUE continuation (the
+        // dense greedy tokens), i.e. a perfect drafter. Measures the ceiling of
+        // the lossless spec-decode mechanism (incl. overhead), independent of
+        // drafter quality.
+        let oracle = std::env::var("POEZI_SPEC_ORACLE").is_ok();
         let t = Instant::now();
         'gen: while gen.len() < n_predict {
             let tok0 = argmax(&last) as u32;
             if Some(tok0) == tok.eos_id {
                 break;
             }
-            let mut probe = ctx.clone();
-            probe.push(tok0);
-            let draft = prompt_lookup_draft(&probe, 3, 6);
-            let do_batch = !draft.is_empty() && policy.speculate();
+            let draft = if oracle {
+                let s = gen.len() + 1;
+                base_ids.get(s..(s + 6).min(base_ids.len())).map(|x| x.to_vec()).unwrap_or_default()
+            } else {
+                let mut probe = ctx.clone();
+                probe.push(tok0);
+                prompt_lookup_draft(&probe, 3, 6)
+            };
+            let do_batch = !draft.is_empty() && (oracle || policy.speculate());
             let to_emit: Vec<u32> = if !do_batch {
                 if !draft.is_empty() {
                     policy.skipped();
