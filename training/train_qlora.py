@@ -46,6 +46,8 @@ ap.add_argument("--measure-sparsity", action="store_true", help="print FFN activ
 ap.add_argument("--sample", action="store_true", help="generate a short completion after training (quality check)")
 ap.add_argument("--sparse-target", choices=["g", "gate"], default="gate",
                 help="what the Hoyer penalty acts on: 'gate' = silu(gate_proj) (what the engine thresholds on, exploitable), 'g' = down_proj input")
+ap.add_argument("--train-keep", type=float, default=1.0,
+                help="mask-aware training: apply the CATS sparse FFN (keep this fraction of neurons by |silu(gate)|) DURING training, so the model learns to work under masking. 1.0 = off")
 args = ap.parse_args()
 SPARSE = args.sparsity_l1 > 0.0
 # Keep gradient checkpointing on (7B QLoRA needs it to fit 12 GB). Non-reentrant
@@ -90,6 +92,27 @@ model = get_peft_model(
     ),
 )
 model.print_trainable_parameters()
+
+# Mask-aware training: run the CATS sparse FFN (keep top fraction by |silu(gate)|)
+# inside the forward during training, so the model learns to produce good outputs
+# UNDER the mask — the methodologically clean alternative to a proxy regularizer.
+if args.train_keep < 1.0:
+    _tk = args.train_keep
+
+    def _mask_forward(self, x):
+        a = self.act_fn(self.gate_proj(x))
+        n = a.shape[-1]
+        k = max(1, int(n * _tk + 0.999))
+        thr = a.abs().topk(k, dim=-1).values[..., -1:]
+        a = a * (a.abs() >= thr)  # drop low-|silu(gate)| neurons; grad flows through the kept ones
+        return self.down_proj(a * self.up_proj(x))
+
+    _patched = 0
+    for _mod in model.modules():
+        if _mod.__class__.__name__ == "Qwen2MLP":
+            _mod.forward = _mask_forward.__get__(_mod)
+            _patched += 1
+    print(f"[mask-aware] training with CATS keep={_tk} on {_patched} MLP layers")
 
 MAXLEN = args.maxlen
 
