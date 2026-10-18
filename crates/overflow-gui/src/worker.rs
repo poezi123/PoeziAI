@@ -19,6 +19,12 @@ use poezi_model::{Model, Tokenizer};
 pub enum ToWorker {
     User { text: String, perms: Perms, gen: GenCfg },
     Approve(bool),
+    /// OnlyChat: a plain chat completion over an assembled context (no tools,
+    /// fresh KV cache). `turns` is (is_user, text) oldest-first ending with the
+    /// new user message; `prelude` is an optional summary note.
+    ChatOnly { turns: Vec<(bool, String)>, prelude: Option<String>, gen: GenCfg },
+    /// OnlyChat: summarize the given text silently; replies with `Summary`.
+    Summarize { text: String, gen: GenCfg },
 }
 
 /// worker -> UI.
@@ -30,6 +36,8 @@ pub enum FromWorker {
     ToolResult(String),
     Approval { desc: String, outside: bool },
     Stats { tok_per_s: f32 },
+    /// OnlyChat: a summary produced by `Summarize`, to be stored by the UI.
+    Summary(String),
     Done,
     Error(String),
 }
@@ -69,17 +77,59 @@ fn run(
     let _ = tx_out.send(FromWorker::Ready);
 
     while let Ok(msg) = rx_in.recv() {
-        if let ToWorker::User { text, perms, gen } = msg {
-            cancel.store(false, Ordering::Relaxed); // clear any prior stop
-            let mut host = GuiHost { tx: tx_out, rx: rx_in, start: None, n: 0 };
-            // Up to 20 tool rounds so the agent can investigate autonomously
-            // without the user re-prompting after each step.
-            agent::run(&model, &tok, &mut cache, first_turn, &text, &perms, &gen, cancel, &mut host, 20);
-            first_turn = false;
-            let _ = tx_out.send(FromWorker::Done);
+        match msg {
+            ToWorker::User { text, perms, gen } => {
+                cancel.store(false, Ordering::Relaxed); // clear any prior stop
+                let mut host = GuiHost { tx: tx_out, rx: rx_in, start: None, n: 0 };
+                // Up to 20 tool rounds so the agent can investigate autonomously
+                // without the user re-prompting after each step.
+                agent::run(&model, &tok, &mut cache, first_turn, &text, &perms, &gen, cancel, &mut host, 20);
+                first_turn = false;
+                let _ = tx_out.send(FromWorker::Done);
+            }
+            ToWorker::ChatOnly { turns, prelude, gen } => {
+                cancel.store(false, Ordering::Relaxed);
+                // Fresh cache: OnlyChat rebuilds the context from the store each
+                // turn, so nothing from a previous turn must linger.
+                let mut chat_cache = model.new_cache();
+                let mut host = GuiHost { tx: tx_out, rx: rx_in, start: None, n: 0 };
+                agent::chat_plain(
+                    &model, &tok, &mut chat_cache, &turns, prelude.as_deref(), &gen, cancel, &mut host,
+                );
+                let _ = tx_out.send(FromWorker::Done);
+            }
+            ToWorker::Summarize { text, gen } => {
+                cancel.store(false, Ordering::Relaxed);
+                let mut chat_cache = model.new_cache();
+                let mut silent = SilentHost;
+                let prompt = format!(
+                    "Fasse das folgende Gespräch in wenigen Sätzen zusammen. Nenne die wichtigsten \
+                     Fakten, Entscheidungen und offenen Punkte, damit man später daran anknüpfen kann. \
+                     Keine Einleitung, nur die Zusammenfassung.\n\n{text}"
+                );
+                let mut g = gen.clone();
+                g.thinking = false;
+                g.max_tokens = g.max_tokens.min(400);
+                let summary = agent::chat_plain(
+                    &model, &tok, &mut chat_cache, &[(true, prompt)], None, &g, cancel, &mut silent,
+                );
+                let _ = tx_out.send(FromWorker::Summary(summary));
+                let _ = tx_out.send(FromWorker::Done);
+            }
+            ToWorker::Approve(_) => {}
         }
     }
     Ok(())
+}
+
+/// Discards all events — used when generating a summary we don't want streamed
+/// into the visible transcript.
+struct SilentHost;
+impl Host for SilentHost {
+    fn approve(&mut self, _call: &ToolCall, _outside: bool) -> bool {
+        false
+    }
+    fn event(&mut self, _ev: Event) {}
 }
 
 /// Bridges the agent core to the GUI channels.

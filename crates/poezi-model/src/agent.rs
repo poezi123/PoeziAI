@@ -359,6 +359,138 @@ pub fn run(
     }
 }
 
+/// Plain chat completion — no tools, no persistent KV across calls. The caller
+/// assembles the turns (`(is_user, text)`, oldest first, ending with the new
+/// user message) and passes a fresh `cache`; this feeds system + turns and
+/// streams one assistant answer, returning its full text. Used by the OnlyChat
+/// mode, where context is rebuilt from a stored chat each turn. The lossless
+/// prompt-lookup speculative decoding path applies here too (temp == 0).
+pub fn chat_plain(
+    model: &Model,
+    tok: &Tokenizer,
+    cache: &mut KvCache,
+    turns: &[(bool, String)],
+    prelude: Option<&str>,
+    gen: &GenCfg,
+    cancel: &AtomicBool,
+    host: &mut dyn Host,
+) -> String {
+    let mut last = Vec::new();
+    let mut ctx: Vec<u32> = Vec::new();
+    let feed = |text: &str, cache: &mut KvCache, last: &mut Vec<f32>, ctx: &mut Vec<u32>| {
+        for id in tok.encode(text, false, true) {
+            *last = model.forward(id, cache);
+            ctx.push(id);
+        }
+    };
+    let mut rng = Rng::new(0x9E3779B97F4A7C15);
+    let spec = gen.temp <= 0.0;
+
+    let mut sys = system_prompt(false, gen.thinking, gen.effort);
+    if let Some(p) = prelude {
+        sys.push_str("\n\n");
+        sys.push_str(p);
+    }
+    let mut prompt = format!("<|im_start|>system\n{sys}<|im_end|>\n");
+    for (is_user, text) in turns {
+        let role = if *is_user { "user" } else { "assistant" };
+        prompt.push_str(&format!("<|im_start|>{role}\n{text}<|im_end|>\n"));
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    feed(&prompt, cache, &mut last, &mut ctx);
+
+    let mut recent: Vec<u32> = Vec::new();
+    let mut policy = SpecPolicy::default();
+    let mut raw_all: Vec<u8> = Vec::new();
+    let mut pending = Vec::new();
+    let mut produced = 0usize;
+    'gen: loop {
+        if produced >= gen.max_tokens || cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let recent_set: std::collections::HashSet<u32> =
+            recent.iter().rev().take(gen.repeat_last_n).copied().collect();
+        let tok0 = sample(&last, gen, &recent_set, &mut rng);
+        if Some(tok0) == tok.eos_id {
+            break;
+        }
+        let p = cache.len;
+        let draft = if spec {
+            let mut probe = ctx.clone();
+            probe.push(tok0);
+            prompt_lookup_draft(&probe, SPEC_NGRAM, SPEC_DRAFT)
+        } else {
+            Vec::new()
+        };
+        let do_batch = !draft.is_empty() && policy.speculate();
+        let (to_emit, step_logits): (Vec<u32>, Vec<Vec<f32>>) = if !do_batch {
+            if !draft.is_empty() {
+                policy.skipped();
+            }
+            let l = model.forward(tok0, cache);
+            (vec![tok0], vec![l])
+        } else {
+            let batch: Vec<u32> = std::iter::once(tok0).chain(draft.iter().copied()).collect();
+            let lb = model.forward_batch(&batch, cache);
+            let mut rec = recent.clone();
+            rec.push(tok0);
+            let mut model_argmax = Vec::with_capacity(draft.len());
+            for &d in draft.iter() {
+                let rs: std::collections::HashSet<u32> =
+                    rec.iter().rev().take(gen.repeat_last_n).copied().collect();
+                let mt = sample(&lb[model_argmax.len()], gen, &rs, &mut rng);
+                model_argmax.push(mt);
+                if mt == d {
+                    rec.push(d);
+                } else {
+                    break;
+                }
+            }
+            let accepted = accepted_prefix(&draft, &model_argmax);
+            policy.record(accepted);
+            (batch[..=accepted].to_vec(), lb)
+        };
+
+        let mut emitted = 0usize;
+        let mut stop = false;
+        for &t in &to_emit {
+            if Some(t) == tok.eos_id {
+                stop = true;
+                break;
+            }
+            recent.push(t);
+            ctx.push(t);
+            tok.push_token_bytes(t, &mut raw_all);
+            tok.push_token_bytes(t, &mut pending);
+            if let Ok(s) = std::str::from_utf8(&pending) {
+                host.event(Event::Token(s));
+                pending.clear();
+            } else if let Some(valid) = valid_prefix(&pending) {
+                host.event(Event::Token(&valid));
+                let n = valid.len();
+                pending.drain(..n);
+            }
+            emitted += 1;
+            produced += 1;
+            if produced >= gen.max_tokens {
+                stop = true;
+                break;
+            }
+        }
+        if do_batch {
+            cache.truncate(p + emitted);
+        }
+        if emitted == 0 {
+            break;
+        }
+        last = step_logits[emitted - 1].clone();
+        if stop {
+            break 'gen;
+        }
+    }
+    String::from_utf8_lossy(&raw_all).into_owned()
+}
+
 /// (auto_allowed, path_is_outside_workspace).
 fn decide(call: &ToolCall, perms: &Perms) -> (bool, bool) {
     let cap = match call.name.as_str() {

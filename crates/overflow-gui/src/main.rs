@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chatdb;
 mod hw;
 mod trainer;
 mod worker;
@@ -23,8 +24,91 @@ use worker::{FromWorker, Handle, ToWorker};
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Chat,
+    OnlyChat,
     Learning,
     Docs,
+}
+
+/// Where streamed tokens from the worker should land. OnlyChat shares the same
+/// worker/model as Chat, so a turn tags its destination to route the stream.
+#[derive(PartialEq, Clone, Copy)]
+enum Stream {
+    Chat,
+    OnlyChat,
+}
+
+/// OnlyChat tab state: an open chat database (optional), its chat list, the
+/// active chat's transcript, and the new-chat / open-database inputs.
+struct OnlyChatState {
+    db: Option<chatdb::ChatDb>,
+    db_path: String,
+    passphrase: String,
+    encrypt_new: bool,
+    import_path: String,
+    status: String,
+    chats: Vec<chatdb::ChatMeta>,
+    active: Option<i64>,
+    active_mode: chatdb::CtxMode,
+    msgs: Vec<chatdb::ChatMsg>,
+    new_name: String,
+    new_mode: chatdb::CtxMode,
+    input: String,
+    stream_buf: String,
+    generating: bool,
+    summarizing: bool,
+    show_new: bool,
+}
+
+impl Default for OnlyChatState {
+    fn default() -> Self {
+        OnlyChatState {
+            db: None,
+            db_path: default_db_path(),
+            passphrase: String::new(),
+            encrypt_new: false,
+            import_path: String::new(),
+            status: String::new(),
+            chats: Vec::new(),
+            active: None,
+            active_mode: chatdb::CtxMode::LastN,
+            msgs: Vec::new(),
+            new_name: String::new(),
+            new_mode: chatdb::CtxMode::SummaryRetrieval,
+            input: String::new(),
+            stream_buf: String::new(),
+            generating: false,
+            summarizing: false,
+            show_new: false,
+        }
+    }
+}
+
+/// Drop any `<think>…</think>` block from a model answer before it is stored or
+/// shown in OnlyChat (the reasoning is internal, the stored turn is the reply).
+fn strip_think(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find("</think>") {
+            rest = &rest[start + end + "</think>".len()..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Default location for a new OnlyChat database (under the data dir).
+fn default_db_path() -> String {
+    data_models_dir()
+        .parent()
+        .map(|p| p.join("chats.sqlite"))
+        .unwrap_or_else(|| PathBuf::from("chats.sqlite"))
+        .display()
+        .to_string()
 }
 
 /// State for the Learning tab (drives the Python QLoRA pipeline).
@@ -266,6 +350,8 @@ struct OverflowApp {
     dl_url: String,
     gen: GenCfg,
     show_thinking: bool,
+    only: OnlyChatState,
+    stream: Stream,
 }
 
 impl OverflowApp {
@@ -295,6 +381,8 @@ impl OverflowApp {
             dl_url: String::new(),
             gen: GenCfg::default(),
             show_thinking: true,
+            only: OnlyChatState::default(),
+            stream: Stream::Chat,
         }
     }
 
@@ -425,6 +513,164 @@ impl OverflowApp {
         self.input.clear();
     }
 
+    // ---- OnlyChat helpers -------------------------------------------------
+
+    /// Reload the chat list and the active chat's transcript from the DB.
+    fn only_reload(&mut self) {
+        if let Some(db) = &self.only.db {
+            self.only.chats = db.list_chats();
+            if let Some(id) = self.only.active {
+                if !self.only.chats.iter().any(|c| c.id == id) {
+                    self.only.active = None;
+                }
+            }
+            if let Some(id) = self.only.active {
+                self.only.msgs = db.messages(id);
+                if let Some(meta) = self.only.chats.iter().find(|c| c.id == id) {
+                    self.only.active_mode = meta.mode;
+                }
+            } else {
+                self.only.msgs.clear();
+            }
+        }
+    }
+
+    fn only_open_db(&mut self) {
+        let path = PathBuf::from(self.only.db_path.trim());
+        if !path.exists() {
+            self.only.status = "Datei nicht gefunden".into();
+            return;
+        }
+        if !chatdb::ChatDb::is_chatdb(&path) {
+            self.only.status = "keine OnlyChat-Datenbank".into();
+            return;
+        }
+        let pass = (!self.only.passphrase.is_empty()).then(|| self.only.passphrase.clone());
+        let need_pass = chatdb::ChatDb::is_encrypted(&path);
+        if need_pass && pass.is_none() {
+            self.only.status = "Datenbank ist verschlüsselt — Passwort eingeben".into();
+            return;
+        }
+        match chatdb::ChatDb::open(&path, pass.as_deref()) {
+            Ok(db) => {
+                self.only.db = Some(db);
+                self.only.active = None;
+                self.only.status = format!("geöffnet: {}", path.display());
+                self.only_reload();
+            }
+            Err(e) => self.only.status = e,
+        }
+    }
+
+    fn only_create_db(&mut self) {
+        let path = PathBuf::from(self.only.db_path.trim());
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let pass = (self.only.encrypt_new && !self.only.passphrase.is_empty())
+            .then(|| self.only.passphrase.clone());
+        if self.only.encrypt_new && pass.is_none() {
+            self.only.status = "Für Verschlüsselung ein Passwort setzen".into();
+            return;
+        }
+        match chatdb::ChatDb::create(&path, pass.as_deref()) {
+            Ok(db) => {
+                self.only.db = Some(db);
+                self.only.status = format!("erstellt: {}", path.display());
+                self.only_reload();
+            }
+            Err(e) => self.only.status = e,
+        }
+    }
+
+    fn only_new_chat(&mut self) {
+        let name = {
+            let n = self.only.new_name.trim();
+            if n.is_empty() { "Neuer Chat".to_string() } else { n.to_string() }
+        };
+        let mode = self.only.new_mode;
+        if let Some(db) = &self.only.db {
+            match db.new_chat(&name, mode) {
+                Ok(id) => {
+                    self.only.active = Some(id);
+                    self.only.new_name.clear();
+                    self.only.show_new = false;
+                    self.only_reload();
+                }
+                Err(e) => self.only.status = e,
+            }
+        }
+    }
+
+    fn only_import(&mut self) {
+        let path = PathBuf::from(self.only.import_path.trim());
+        if !path.exists() {
+            self.only.status = "Import-Datei nicht gefunden".into();
+            return;
+        }
+        if let Some(db) = &self.only.db {
+            match db.import_chatgpt(&path) {
+                Ok(n) => {
+                    self.only.status = format!("{n} Chat(s) importiert");
+                    self.only_reload();
+                }
+                Err(e) => self.only.status = format!("Import fehlgeschlagen: {e}"),
+            }
+        }
+    }
+
+    fn only_send(&mut self) {
+        let text = self.only.input.trim().to_string();
+        if text.is_empty() || self.only.generating {
+            return;
+        }
+        let Some(handle) = &self.handle else {
+            self.only.status = "kein Modell geladen".into();
+            return;
+        };
+        let (Some(db), Some(id)) = (&self.only.db, self.only.active) else {
+            self.only.status = "keinen Chat ausgewählt".into();
+            return;
+        };
+        // Persist the user turn, then assemble the context for the model.
+        db.append(id, chatdb::Role::User, &text);
+        self.only.msgs = db.messages(id);
+        let mode = self.only.active_mode;
+        db.set_mode(id, mode);
+        let summary = db.summary(id).map(|(s, _)| s);
+        let (prelude, turns) = chatdb::assemble(&self.only.msgs, mode, summary.as_deref());
+        self.stream = Stream::OnlyChat;
+        self.only.stream_buf.clear();
+        self.only.generating = true;
+        handle.cancel.store(false, Ordering::Relaxed);
+        let _ = handle.tx.send(ToWorker::ChatOnly { turns, prelude, gen: self.gen.clone() });
+        self.only.input.clear();
+        self.status = Status::Generating;
+    }
+
+    fn only_summarize(&mut self) {
+        if self.only.summarizing || self.only.generating {
+            return;
+        }
+        let Some(handle) = &self.handle else { return };
+        let (Some(_db), Some(_id)) = (&self.only.db, self.only.active) else { return };
+        // Summarize everything older than the verbatim window.
+        let cut = self.only.msgs.len().saturating_sub(chatdb::LAST_N * 2);
+        if cut == 0 {
+            self.only.status = "noch nichts zu kürzen".into();
+            return;
+        }
+        let mut body = String::new();
+        for m in &self.only.msgs[..cut] {
+            let who = if m.role.is_user() { "User" } else { "AI" };
+            body.push_str(&format!("{who}: {}\n", m.text));
+        }
+        self.only.summarizing = true;
+        self.stream = Stream::Chat; // summary is silent; keep Chat routing idle
+        let _ = handle.tx.send(ToWorker::Summarize { text: body, gen: self.gen.clone() });
+        self.only.status = "fasse zusammen …".into();
+    }
+
     fn drain_events(&mut self) {
         let mut events = Vec::new();
         if let Some(handle) = &self.handle {
@@ -440,10 +686,14 @@ impl OverflowApp {
                     self.backend = b;
                 }
                 FromWorker::Token(s) => {
-                    self.raw_stream.push_str(&s);
-                    if let Some(last) = self.transcript.last_mut() {
-                        if matches!(last.role, Role::Assistant) {
-                            last.text.push_str(&s);
+                    if self.stream == Stream::OnlyChat {
+                        self.only.stream_buf.push_str(&s);
+                    } else {
+                        self.raw_stream.push_str(&s);
+                        if let Some(last) = self.transcript.last_mut() {
+                            if matches!(last.role, Role::Assistant) {
+                                last.text.push_str(&s);
+                            }
                         }
                     }
                     self.status = Status::Generating;
@@ -465,7 +715,29 @@ impl OverflowApp {
                     self.log(format!("[approval needed] {desc}{}", if outside { " (outside)" } else { "" }));
                     self.pending_approval = Some((desc, outside));
                 }
-                FromWorker::Done => self.status = Status::Ready,
+                FromWorker::Summary(s) => {
+                    let s = s.trim().to_string();
+                    if let (Some(db), Some(id)) = (&self.only.db, self.only.active) {
+                        let upto = self.only.msgs.len().saturating_sub(chatdb::LAST_N * 2) as i64;
+                        db.set_summary(id, &s, upto);
+                        self.only.status = "Zusammenfassung gespeichert".into();
+                    }
+                    self.only.summarizing = false;
+                }
+                FromWorker::Done => {
+                    self.status = Status::Ready;
+                    if self.stream == Stream::OnlyChat && self.only.generating {
+                        let text = std::mem::take(&mut self.only.stream_buf);
+                        let text = strip_think(&text);
+                        if let (Some(db), Some(id)) = (&self.only.db, self.only.active) {
+                            if !text.trim().is_empty() {
+                                db.append(id, chatdb::Role::Assistant, text.trim());
+                            }
+                        }
+                        self.only.generating = false;
+                        self.only_reload();
+                    }
+                }
                 FromWorker::Error(e) => {
                     self.log(format!("[error] {e}"));
                     self.status = Status::Error(e);
@@ -853,6 +1125,250 @@ impl OverflowApp {
             });
     }
 
+    /// OnlyChat tab: a persistent, token-saving chat over a SQLite store. The
+    /// model only ever sees the slice of history the chosen context mode feeds
+    /// it, so a huge imported chat stays runnable at a bounded cost.
+    fn onlychat_body(&mut self, ui: &mut egui::Ui) {
+        // ---- no database open yet: setup card ----
+        if self.only.db.is_none() {
+            let mut open_db = false;
+            let mut create_db = false;
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(16, 12)))
+                .show(ui, |ui| {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("OnlyChat").color(AMBER).size(26.0).strong());
+                        ui.label(egui::RichText::new("Persistenter Chat aus einer Datenbank — spart Kontext").color(MUTED).size(12.0));
+                    });
+                    ui.add_space(18.0);
+                    egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::same(16)).stroke(Stroke::new(1.0, LINE)).show(ui, |ui| {
+                        ui.set_max_width(560.0);
+                        section(ui, "DATENBANK");
+                        ui.label(egui::RichText::new("Pfad zu einer .sqlite-Datei (vorhanden öffnen oder neu anlegen):").color(FG).size(12.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.only.db_path).desired_width(f32::INFINITY).hint_text("…/chats.sqlite"));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.only.encrypt_new, egui::RichText::new("verschlüsseln (Argon2id)").color(FG).size(12.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.only.passphrase).password(true).desired_width(220.0).hint_text("Passwort"));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(egui::RichText::new("Öffnen").color(GREEN)).clicked() {
+                                open_db = true;
+                            }
+                            if ui.button(egui::RichText::new("Neu erstellen").color(AMBER)).clicked() {
+                                create_db = true;
+                            }
+                        });
+                        if !self.only.status.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new(&self.only.status).color(MUTED).size(11.5));
+                        }
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Große Chats gehören in eine Datenbank; kleine kannst du einfach im Chat-Tab führen.").color(MUTED).size(11.0));
+                    });
+                });
+            if open_db {
+                self.only_open_db();
+            }
+            if create_db {
+                self.only_create_db();
+            }
+            return;
+        }
+
+        // ---- left: chat list + database actions ----
+        let mut select: Option<i64> = None;
+        let mut delete: Option<i64> = None;
+        let mut new_chat = false;
+        let mut import = false;
+        let mut close_db = false;
+        egui::Panel::left("onlychat_list")
+            .resizable(false)
+            .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::same(12)).stroke(Stroke::new(1.0, LINE)))
+            .show(ui, |ui| {
+                ui.set_min_width(240.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("CHATS").color(AMBER).size(12.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(egui::RichText::new("schließen").color(MUTED).size(11.0)).clicked() {
+                            close_db = true;
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                if ui.button(egui::RichText::new("+ Neuer Chat").color(GREEN).size(12.0)).clicked() {
+                    self.only.show_new = !self.only.show_new;
+                }
+                if self.only.show_new {
+                    ui.add_space(4.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.only.new_name).desired_width(f32::INFINITY).hint_text("Name"));
+                    egui::ComboBox::from_id_salt("new_mode")
+                        .selected_text(self.only.new_mode.label())
+                        .show_ui(ui, |ui| {
+                            for m in [chatdb::CtxMode::Full, chatdb::CtxMode::LastN, chatdb::CtxMode::SummaryRetrieval] {
+                                ui.selectable_value(&mut self.only.new_mode, m, m.label());
+                            }
+                        });
+                    if ui.button(egui::RichText::new("anlegen").color(AMBER).size(12.0)).clicked() {
+                        new_chat = true;
+                    }
+                }
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 120.0).show(ui, |ui| {
+                    for c in &self.only.chats {
+                        let is_cur = self.only.active == Some(c.id);
+                        ui.horizontal(|ui| {
+                            let label = format!("{}  ({})", c.name, c.n_msgs);
+                            if ui.selectable_label(is_cur, egui::RichText::new(label).size(12.0).color(if is_cur { AMBER } else { FG })).clicked() {
+                                select = Some(c.id);
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(egui::RichText::new("✕").color(MUTED).size(10.0)).clicked() {
+                                    delete = Some(c.id);
+                                }
+                            });
+                        });
+                    }
+                });
+                ui.add_space(6.0);
+                section(ui, "IMPORT (ChatGPT)");
+                ui.add(egui::TextEdit::singleline(&mut self.only.import_path).desired_width(f32::INFINITY).hint_text("…/conversations.json"));
+                if ui.button(egui::RichText::new("importieren").color(CYAN).size(11.5)).clicked() {
+                    import = true;
+                }
+                if !self.only.status.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(&self.only.status).color(MUTED).size(11.0));
+                }
+            });
+
+        // ---- bottom composer ----
+        let mut send = false;
+        let can_send = self.handle.is_some() && !self.only.generating && self.only.active.is_some();
+        egui::Panel::bottom("onlychat_composer")
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(16, 12)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(">").color(AMBER).strong());
+                    if self.only.generating {
+                        if ui.button(egui::RichText::new("■ Stop").color(RED)).clicked() {
+                            if let Some(h) = &self.handle {
+                                h.cancel.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    let edit = egui::TextEdit::singleline(&mut self.only.input)
+                        .hint_text("Nachricht — Enter zum Senden")
+                        .desired_width(f32::INFINITY);
+                    let resp = ui.add_enabled(can_send, edit);
+                    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if entered && can_send {
+                        send = true;
+                        resp.request_focus();
+                    }
+                });
+            });
+
+        // ---- central: active transcript + per-chat context mode ----
+        let mut set_mode: Option<chatdb::CtxMode> = None;
+        let mut summarize = false;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(16, 12)))
+            .show(ui, |ui| {
+                if self.only.active.is_none() {
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("Wähle links einen Chat oder lege einen neuen an.").color(MUTED).size(13.0));
+                    });
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Kontext-Modus:").color(MUTED).size(11.5));
+                    let mut mode = self.only.active_mode;
+                    egui::ComboBox::from_id_salt("active_mode")
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            for m in [chatdb::CtxMode::Full, chatdb::CtxMode::LastN, chatdb::CtxMode::SummaryRetrieval] {
+                                ui.selectable_value(&mut mode, m, m.label());
+                            }
+                        });
+                    if mode != self.only.active_mode {
+                        set_mode = Some(mode);
+                    }
+                    if self.only.active_mode == chatdb::CtxMode::SummaryRetrieval {
+                        if ui.add_enabled(!self.only.summarizing, egui::Button::new(egui::RichText::new("Älteres zusammenfassen").color(CYAN).size(11.5))).clicked() {
+                            summarize = true;
+                        }
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                    for m in &self.only.msgs {
+                        if m.role.is_user() {
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("you ▸").color(AMBER).size(12.0).strong());
+                            ui.label(egui::RichText::new(&m.text).color(FG));
+                        } else {
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("overflow ▸").color(GREEN).size(12.0).strong());
+                            ui.label(egui::RichText::new(&m.text).color(FG));
+                        }
+                    }
+                    if self.only.generating {
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("overflow ▸").color(GREEN).size(12.0).strong());
+                        let mut body = strip_think(&self.only.stream_buf);
+                        body.push('▌');
+                        ui.label(egui::RichText::new(body).color(FG));
+                    }
+                    ui.add_space(8.0);
+                });
+            });
+
+        // ---- apply collected actions (outside the UI closures) ----
+        if close_db {
+            self.only.db = None;
+            self.only.active = None;
+            self.only.msgs.clear();
+            self.only.chats.clear();
+            self.only.status.clear();
+        }
+        if let Some(id) = delete {
+            if let Some(db) = &self.only.db {
+                db.delete_chat(id);
+            }
+            if self.only.active == Some(id) {
+                self.only.active = None;
+            }
+            self.only_reload();
+        }
+        if let Some(id) = select {
+            self.only.active = Some(id);
+            self.only_reload();
+        }
+        if new_chat {
+            self.only_new_chat();
+        }
+        if import {
+            self.only_import();
+        }
+        if let Some(mode) = set_mode {
+            self.only.active_mode = mode;
+            if let (Some(db), Some(id)) = (&self.only.db, self.only.active) {
+                db.set_mode(id, mode);
+            }
+            self.only_reload();
+        }
+        if summarize {
+            self.only_summarize();
+        }
+        if send {
+            self.only_send();
+        }
+    }
+
     /// Learning tab: drive the QLoRA pipeline (Python) from the GUI.
     fn learning_body(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
@@ -978,6 +1494,9 @@ impl eframe::App for OverflowApp {
                     if ui.selectable_label(self.tab == Tab::Chat, egui::RichText::new("Chat").size(13.0)).clicked() {
                         self.tab = Tab::Chat;
                     }
+                    if ui.selectable_label(self.tab == Tab::OnlyChat, egui::RichText::new("OnlyChat").size(13.0)).clicked() {
+                        self.tab = Tab::OnlyChat;
+                    }
                     if ui.selectable_label(self.tab == Tab::Learning, egui::RichText::new("Learning").size(13.0)).clicked() {
                         self.tab = Tab::Learning;
                     }
@@ -1019,6 +1538,7 @@ impl eframe::App for OverflowApp {
         self.show_settings(ui); // right-side panel (before the central area)
         match self.tab {
             Tab::Chat => self.chat_body(ui),
+            Tab::OnlyChat => self.onlychat_body(ui),
             Tab::Learning => self.learning_body(ui),
             Tab::Docs => docs_body(ui),
         }
