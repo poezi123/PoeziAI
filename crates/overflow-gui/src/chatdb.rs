@@ -161,7 +161,7 @@ impl ChatDb {
         Connection::open(path)
             .ok()
             .and_then(|c| {
-                c.query_row("SELECT value FROM meta WHERE key='enc'", [], |r| {
+                c.query_row("SELECT value FROM oc_meta WHERE key='enc'", [], |r| {
                     r.get::<_, i64>(0)
                 })
                 .optional()
@@ -172,41 +172,28 @@ impl ChatDb {
             .unwrap_or(false)
     }
 
-    /// True if the file already is an OnlyChat database (has our schema).
-    pub fn is_chatdb(path: &Path) -> bool {
-        Connection::open(path)
-            .ok()
-            .map(|c| {
-                c.query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'",
-                    [],
-                    |_| Ok(()),
-                )
-                .optional()
-                .ok()
-                .flatten()
-                .is_some()
-            })
-            .unwrap_or(false)
-    }
-
+    /// Create OnlyChat's own tables. They are namespaced with an `oc_` prefix so
+    /// the database file may already contain unrelated tables (an imported or
+    /// pre-existing SQLite file): we add our tables alongside whatever is there
+    /// and never touch, rename or read the user's own tables. This is why
+    /// pointing OnlyChat at an arbitrary `.sqlite` is lossless.
     fn schema(conn: &Connection) -> Result<(), String> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value BLOB);
-             CREATE TABLE IF NOT EXISTS chats (
+            "CREATE TABLE IF NOT EXISTS oc_meta (key TEXT PRIMARY KEY, value BLOB);
+             CREATE TABLE IF NOT EXISTS oc_chats (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  name TEXT NOT NULL,
                  created INTEGER NOT NULL,
                  mode INTEGER NOT NULL DEFAULT 1,
                  summary BLOB,
                  summary_upto INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS messages (
+             CREATE TABLE IF NOT EXISTS oc_messages (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  chat_id INTEGER NOT NULL,
                  role INTEGER NOT NULL,
                  ts INTEGER NOT NULL,
                  content BLOB NOT NULL);
-             CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(chat_id, id);",
+             CREATE INDEX IF NOT EXISTS idx_oc_msg_chat ON oc_messages(chat_id, id);",
         )
         .map_err(|e| format!("schema: {e}"))
     }
@@ -220,7 +207,7 @@ impl ChatDb {
         Self::schema(&conn)?;
         let crypto = match passphrase {
             None => {
-                conn.execute("INSERT INTO meta(key,value) VALUES('enc', 0)", [])
+                conn.execute("INSERT INTO oc_meta(key,value) VALUES('enc', 0)", [])
                     .map_err(|e| e.to_string())?;
                 Crypto::Plain
             }
@@ -238,11 +225,11 @@ impl ChatDb {
                     .map_err(|e| format!("seal verifier: {e}"))?;
                 let mut verifier = nonce.to_vec();
                 verifier.extend_from_slice(&ct);
-                conn.execute("INSERT INTO meta(key,value) VALUES('enc', 1)", [])
+                conn.execute("INSERT INTO oc_meta(key,value) VALUES('enc', 1)", [])
                     .map_err(|e| e.to_string())?;
-                conn.execute("INSERT INTO meta(key,value) VALUES('salt', ?1)", params![salt.to_vec()])
+                conn.execute("INSERT INTO oc_meta(key,value) VALUES('salt', ?1)", params![salt.to_vec()])
                     .map_err(|e| e.to_string())?;
-                conn.execute("INSERT INTO meta(key,value) VALUES('verifier', ?1)", params![verifier])
+                conn.execute("INSERT INTO oc_meta(key,value) VALUES('verifier', ?1)", params![verifier])
                     .map_err(|e| e.to_string())?;
                 Crypto::Sealed(Box::new(cipher))
             }
@@ -256,7 +243,7 @@ impl ChatDb {
         let conn = Connection::open(path).map_err(|e| format!("open: {e}"))?;
         Self::schema(&conn)?;
         let enc: i64 = conn
-            .query_row("SELECT value FROM meta WHERE key='enc'", [], |r| r.get(0))
+            .query_row("SELECT value FROM oc_meta WHERE key='enc'", [], |r| r.get(0))
             .optional()
             .map_err(|e| e.to_string())?
             .unwrap_or(0);
@@ -265,10 +252,10 @@ impl ChatDb {
         }
         let pw = passphrase.ok_or("Datenbank ist verschlüsselt — Passwort nötig")?;
         let salt: Vec<u8> = conn
-            .query_row("SELECT value FROM meta WHERE key='salt'", [], |r| r.get(0))
+            .query_row("SELECT value FROM oc_meta WHERE key='salt'", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         let verifier: Vec<u8> = conn
-            .query_row("SELECT value FROM meta WHERE key='verifier'", [], |r| r.get(0))
+            .query_row("SELECT value FROM oc_meta WHERE key='verifier'", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         let key = derive_key(pw, &salt)?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
@@ -287,8 +274,8 @@ impl ChatDb {
     pub fn list_chats(&self) -> Vec<ChatMeta> {
         let mut out = Vec::new();
         if let Ok(mut stmt) = self.conn.prepare(
-            "SELECT c.id, c.name, c.mode, (SELECT COUNT(*) FROM messages m WHERE m.chat_id=c.id)
-             FROM chats c ORDER BY c.id DESC",
+            "SELECT c.id, c.name, c.mode, (SELECT COUNT(*) FROM oc_messages m WHERE m.chat_id=c.id)
+             FROM oc_chats c ORDER BY c.id DESC",
         ) {
             let rows = stmt.query_map([], |r| {
                 Ok(ChatMeta {
@@ -308,7 +295,7 @@ impl ChatDb {
     pub fn new_chat(&self, name: &str, mode: CtxMode) -> Result<i64, String> {
         self.conn
             .execute(
-                "INSERT INTO chats(name, created, mode) VALUES(?1, ?2, ?3)",
+                "INSERT INTO oc_chats(name, created, mode) VALUES(?1, ?2, ?3)",
                 params![name, now(), mode.to_i32()],
             )
             .map_err(|e| e.to_string())?;
@@ -316,19 +303,19 @@ impl ChatDb {
     }
 
     pub fn delete_chat(&self, id: i64) {
-        let _ = self.conn.execute("DELETE FROM messages WHERE chat_id=?1", params![id]);
-        let _ = self.conn.execute("DELETE FROM chats WHERE id=?1", params![id]);
+        let _ = self.conn.execute("DELETE FROM oc_messages WHERE chat_id=?1", params![id]);
+        let _ = self.conn.execute("DELETE FROM oc_chats WHERE id=?1", params![id]);
     }
 
     pub fn set_mode(&self, id: i64, mode: CtxMode) {
         let _ = self
             .conn
-            .execute("UPDATE chats SET mode=?1 WHERE id=?2", params![mode.to_i32(), id]);
+            .execute("UPDATE oc_chats SET mode=?1 WHERE id=?2", params![mode.to_i32(), id]);
     }
 
     pub fn append(&self, chat_id: i64, role: Role, text: &str) {
         let _ = self.conn.execute(
-            "INSERT INTO messages(chat_id, role, ts, content) VALUES(?1, ?2, ?3, ?4)",
+            "INSERT INTO oc_messages(chat_id, role, ts, content) VALUES(?1, ?2, ?3, ?4)",
             params![chat_id, role.to_i32(), now(), self.crypto.seal(text)],
         );
     }
@@ -337,7 +324,7 @@ impl ChatDb {
         let mut out = Vec::new();
         if let Ok(mut stmt) = self
             .conn
-            .prepare("SELECT role, content FROM messages WHERE chat_id=?1 ORDER BY id")
+            .prepare("SELECT role, content FROM oc_messages WHERE chat_id=?1 ORDER BY id")
         {
             let rows = stmt.query_map(params![chat_id], |r| {
                 let role: i32 = r.get(0)?;
@@ -356,7 +343,7 @@ impl ChatDb {
     pub fn summary(&self, chat_id: i64) -> Option<(String, i64)> {
         self.conn
             .query_row(
-                "SELECT summary, summary_upto FROM chats WHERE id=?1",
+                "SELECT summary, summary_upto FROM oc_chats WHERE id=?1",
                 params![chat_id],
                 |r| {
                     let blob: Option<Vec<u8>> = r.get(0)?;
@@ -372,7 +359,7 @@ impl ChatDb {
 
     pub fn set_summary(&self, chat_id: i64, text: &str, upto: i64) {
         let _ = self.conn.execute(
-            "UPDATE chats SET summary=?1, summary_upto=?2 WHERE id=?3",
+            "UPDATE oc_chats SET summary=?1, summary_upto=?2 WHERE id=?3",
             params![self.crypto.seal(text), upto, chat_id],
         );
     }
@@ -576,6 +563,38 @@ mod tests {
         assert_eq!(msgs[1].text, "antwort");
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&jp).ok();
+    }
+
+    #[test]
+    fn coexists_with_foreign_schema() {
+        // A pre-existing SQLite file with its own, differently-shaped `messages`
+        // and `chats` tables (the reported crash: no column `chat_id`). Opening
+        // it must succeed, leave the foreign data untouched, and still work.
+        let path = tmp("foreign");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT);
+                 INSERT INTO messages(body) VALUES('users own row');
+                 CREATE TABLE chats (foo TEXT);
+                 INSERT INTO chats(foo) VALUES('bar');",
+            )
+            .unwrap();
+        }
+        // Open via OnlyChat: adds oc_* tables alongside, no collision.
+        let db = ChatDb::open(&path, None).unwrap();
+        let id = db.new_chat("neu", CtxMode::LastN).unwrap();
+        db.append(id, Role::User, "hallo");
+        assert_eq!(db.messages(id)[0].text, "hallo");
+        drop(db);
+        // The user's original tables and rows are intact and unmodified.
+        let c = Connection::open(&path).unwrap();
+        let body: String =
+            c.query_row("SELECT body FROM messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(body, "users own row");
+        let foo: String = c.query_row("SELECT foo FROM chats", [], |r| r.get(0)).unwrap();
+        assert_eq!(foo, "bar");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

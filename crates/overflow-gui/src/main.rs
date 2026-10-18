@@ -541,10 +541,8 @@ impl OverflowApp {
             self.only.status = "Datei nicht gefunden".into();
             return;
         }
-        if !chatdb::ChatDb::is_chatdb(&path) {
-            self.only.status = "keine OnlyChat-Datenbank".into();
-            return;
-        }
+        // Any existing SQLite file is allowed: OnlyChat adds its own `oc_` tables
+        // alongside whatever is already there, without touching foreign tables.
         let pass = (!self.only.passphrase.is_empty()).then(|| self.only.passphrase.clone());
         let need_pass = chatdb::ChatDb::is_encrypted(&path);
         if need_pass && pass.is_none() {
