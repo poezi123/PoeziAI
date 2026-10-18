@@ -365,7 +365,9 @@ impl ChatDb {
     }
 
     /// Import an OpenAI/ChatGPT `conversations.json` export: each conversation
-    /// becomes a chat. Returns the number of chats imported.
+    /// becomes a chat. Returns the number of chats imported. (Kept for reuse;
+    /// the GUI currently imports existing data via `import_foreign` instead.)
+    #[allow(dead_code)]
     pub fn import_chatgpt(&self, json_path: &Path) -> Result<usize, String> {
         let bytes = std::fs::read(json_path).map_err(|e| format!("read: {e}"))?;
         let root: serde_json::Value =
@@ -390,10 +392,174 @@ impl ChatDb {
         }
         Ok(imported)
     }
+
+    /// Whether this database is encrypted at rest.
+    pub fn encrypted(&self) -> bool {
+        matches!(self.crypto, Crypto::Sealed(_))
+    }
+
+    pub fn rename_chat(&self, id: i64, name: &str) {
+        let _ = self
+            .conn
+            .execute("UPDATE oc_chats SET name=?1 WHERE id=?2", params![name, id]);
+    }
+
+    /// Read the database's own (non-`oc_`, non-`sqlite_`) tables and turn each
+    /// into a chat, so the AI can see and continue from data that was already in
+    /// the file. Heuristic and schema-agnostic: the most text-like column is the
+    /// message content, a role/author/sender column (if any) sets the speaker
+    /// else roles alternate, and rows are ordered by an id/time-like column or
+    /// `rowid`. Foreign tables are only read, never modified. Returns how many
+    /// tables yielded at least one message.
+    pub fn import_foreign(&self) -> Result<usize, String> {
+        let tables: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' \
+                     AND name NOT LIKE 'oc\\_%' ESCAPE '\\' \
+                     AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+        let lc = |s: &str| s.to_lowercase();
+        let quote = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
+        let mut imported = 0usize;
+        for table in tables {
+            let cols: Vec<(String, String)> = {
+                let mut stmt = match self.conn.prepare(&format!("PRAGMA table_info({})", quote(&table))) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)));
+                match rows {
+                    Ok(rows) => rows.flatten().collect(),
+                    Err(_) => continue,
+                }
+            };
+            if cols.is_empty() {
+                continue;
+            }
+            let content_col = cols
+                .iter()
+                .map(|(n, _)| n.clone())
+                .find(|n| {
+                    ["content", "text", "message", "body", "msg", "value", "data", "prompt", "response"]
+                        .contains(&lc(n).as_str())
+                })
+                .or_else(|| {
+                    cols.iter()
+                        .find(|(_, t)| lc(t).contains("text") || lc(t).contains("char") || lc(t).contains("clob"))
+                        .map(|(n, _)| n.clone())
+                })
+                .or_else(|| cols.first().map(|(n, _)| n.clone()));
+            let Some(content_col) = content_col else { continue };
+            let role_col = cols.iter().map(|(n, _)| n.clone()).find(|n| {
+                ["role", "author", "sender", "speaker", "is_user", "from", "who", "type"]
+                    .contains(&lc(n).as_str())
+            });
+            let order_col = cols
+                .iter()
+                .map(|(n, _)| n.clone())
+                .find(|n| {
+                    [
+                        "id", "created", "created_at", "timestamp", "ts", "time", "date",
+                        "create_time", "idx", "seq", "position",
+                    ]
+                    .contains(&lc(n).as_str())
+                })
+                .unwrap_or_else(|| "rowid".to_string());
+
+            let sql = match &role_col {
+                Some(rc) => format!(
+                    "SELECT {}, {} FROM {} ORDER BY {}",
+                    quote(rc), quote(&content_col), quote(&table), quote(&order_col)
+                ),
+                None => format!(
+                    "SELECT {} FROM {} ORDER BY {}",
+                    quote(&content_col), quote(&table), quote(&order_col)
+                ),
+            };
+            let has_role = role_col.is_some();
+            let mut stmt = match self.conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rows = stmt.query_map([], |r| {
+                if has_role {
+                    Ok((Some(value_to_string(r.get_ref(0)?)), value_to_string(r.get_ref(1)?)))
+                } else {
+                    Ok((None, value_to_string(r.get_ref(0)?)))
+                }
+            });
+            let Ok(rows) = rows else { continue };
+            let collected: Vec<(Option<String>, String)> = rows.flatten().collect();
+
+            let mut created: Option<i64> = None;
+            let mut alt_user = true;
+            let mut appended = 0usize;
+            for (role_val, content) in collected {
+                if content.trim().is_empty() {
+                    continue;
+                }
+                let role = match role_val.as_deref().map(str::to_lowercase) {
+                    Some(s) if s.contains("user") || s.contains("human") || s == "you" || s == "1" => {
+                        Role::User
+                    }
+                    Some(s)
+                        if s.contains("assist")
+                            || s.contains("ai")
+                            || s.contains("bot")
+                            || s.contains("gpt")
+                            || s.contains("system")
+                            || s == "0" =>
+                    {
+                        Role::Assistant
+                    }
+                    _ => {
+                        let r = if alt_user { Role::User } else { Role::Assistant };
+                        alt_user = !alt_user;
+                        r
+                    }
+                };
+                let cid = match created {
+                    Some(c) => c,
+                    None => {
+                        let c = self.new_chat(&format!("[DB] {table}"), CtxMode::SummaryRetrieval)?;
+                        created = Some(c);
+                        c
+                    }
+                };
+                self.append(cid, role, &content);
+                appended += 1;
+            }
+            if appended > 0 {
+                imported += 1;
+            }
+        }
+        Ok(imported)
+    }
+}
+
+/// Render a SQLite value as display text (for reading foreign tables).
+fn value_to_string(v: rusqlite::types::ValueRef) -> String {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => String::new(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(f) => f.to_string(),
+        ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+        ValueRef::Blob(_) => String::new(),
+    }
 }
 
 /// Pull an ordered user/assistant transcript out of one ChatGPT conversation
 /// node map (ordered by `create_time`).
+#[allow(dead_code)]
 fn extract_turns(convo: &serde_json::Value) -> Vec<(Role, String)> {
     let mut nodes: Vec<(f64, Role, String)> = Vec::new();
     if let Some(map) = convo.get("mapping").and_then(|m| m.as_object()) {
@@ -594,6 +760,31 @@ mod tests {
         assert_eq!(body, "users own row");
         let foo: String = c.query_row("SELECT foo FROM chats", [], |r| r.get(0)).unwrap();
         assert_eq!(foo, "bar");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn import_foreign_reads_user_table() {
+        let path = tmp("fimport");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE conversation (id INTEGER PRIMARY KEY, role TEXT, content TEXT);
+                 INSERT INTO conversation(role,content) VALUES('user','frage eins');
+                 INSERT INTO conversation(role,content) VALUES('assistant','antwort eins');",
+            )
+            .unwrap();
+        }
+        let db = ChatDb::open(&path, None).unwrap();
+        let n = db.import_foreign().unwrap();
+        assert_eq!(n, 1);
+        let chats = db.list_chats();
+        assert_eq!(chats.len(), 1);
+        let msgs = db.messages(chats[0].id);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].text, "frage eins");
+        assert!(msgs[0].role == Role::User);
+        assert!(msgs[1].role == Role::Assistant);
         std::fs::remove_file(&path).ok();
     }
 

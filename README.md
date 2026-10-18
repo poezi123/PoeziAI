@@ -109,9 +109,13 @@ of in the context window. The model only ever sees the slice of history that
 the chosen *context mode* feeds it, so a very long chat — including a large
 ChatGPT export you want to continue locally — stays runnable at a bounded cost.
 
-- **A chat database.** One SQLite file holds many chats; the AI reads from it
-  and writes each turn back. You point OnlyChat at an existing `.sqlite` file or
-  let it create one.
+- **A chat database, chosen per chat.** When you create a chat you pick which
+  SQLite database it lives in, or create a new file for it — different chats can
+  live in different files. The AI reads from the file and writes each turn back.
+- **Reads data that is already there.** Open an existing `.sqlite` and OnlyChat
+  reads its own tables into chats so the AI can continue from that content; its
+  tables are only read, never modified (OnlyChat keeps its own `oc_`-prefixed
+  tables alongside).
 - **Optional encryption.** A database can be encrypted at rest: the key is
   derived from a passphrase with **Argon2id** and every message is sealed with
   XChaCha20-Poly1305. The schema stays queryable; only the content is
@@ -122,8 +126,10 @@ ChatGPT export you want to continue locally — stays runnable at a bounded cost
   - *Zusammenfassung + Abruf* — a stored summary of the old part plus the
     passages that match the current question, plus the last turns (constant cost,
     keeps the gist of a huge chat).
-- **ChatGPT import.** Point it at a `conversations.json` export and each
-  conversation becomes a chat you can continue offline.
+- **Live token count.** The dev panel shows how many tokens the whole chat holds
+  versus how many the chosen context mode actually feeds the model.
+- **Manage chats.** A gear menu per chat renames or deletes it (deleting asks
+  whether to remove the database file too).
 
 ## Research
 

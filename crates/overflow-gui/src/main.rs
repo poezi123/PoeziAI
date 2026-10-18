@@ -39,46 +39,85 @@ enum Stream {
 
 /// OnlyChat tab state: an open chat database (optional), its chat list, the
 /// active chat's transcript, and the new-chat / open-database inputs.
+/// One open chat database (its file path + handle). Many may be open at once;
+/// each chat belongs to exactly one, chosen when the chat is created.
+struct OpenDb {
+    path: String,
+    db: chatdb::ChatDb,
+}
+
+/// Which database a new chat should go into.
+#[derive(Clone, PartialEq)]
+enum DbPick {
+    /// An already-open database, by index into `dbs`.
+    Existing(usize),
+    /// A brand-new database file (path + optional encryption).
+    NewFile,
+}
+
 struct OnlyChatState {
-    db: Option<chatdb::ChatDb>,
-    db_path: String,
-    passphrase: String,
-    encrypt_new: bool,
-    import_path: String,
+    /// All currently open databases. A chat lives in exactly one of them.
+    dbs: Vec<OpenDb>,
     status: String,
-    chats: Vec<chatdb::ChatMeta>,
-    active: Option<i64>,
+    /// Flattened chat list across all open dbs: (db index, chat meta).
+    chats: Vec<(usize, chatdb::ChatMeta)>,
+    /// Active chat as (db index, chat id).
+    active: Option<(usize, i64)>,
     active_mode: chatdb::CtxMode,
     msgs: Vec<chatdb::ChatMsg>,
-    new_name: String,
-    new_mode: chatdb::CtxMode,
     input: String,
     stream_buf: String,
     generating: bool,
     summarizing: bool,
+    /// Token counts for the active chat: whole chat vs. what the context mode
+    /// actually feeds the model (shown in the dev panel).
+    tok_full: Option<usize>,
+    tok_ctx: Option<usize>,
+    /// Chat being renamed: (db index, chat id, name buffer).
+    rename: Option<(usize, i64, String)>,
+    /// Chat pending delete confirmation: (db index, chat id).
+    confirm_delete: Option<(usize, i64)>,
+    // new-chat form
     show_new: bool,
+    new_name: String,
+    new_mode: chatdb::CtxMode,
+    new_db_pick: DbPick,
+    new_file_path: String,
+    new_file_encrypt: bool,
+    new_file_pass: String,
+    // open-existing-database form
+    show_open: bool,
+    open_path: String,
+    open_pass: String,
 }
 
 impl Default for OnlyChatState {
     fn default() -> Self {
         OnlyChatState {
-            db: None,
-            db_path: default_db_path(),
-            passphrase: String::new(),
-            encrypt_new: false,
-            import_path: String::new(),
+            dbs: Vec::new(),
             status: String::new(),
             chats: Vec::new(),
             active: None,
             active_mode: chatdb::CtxMode::LastN,
             msgs: Vec::new(),
-            new_name: String::new(),
-            new_mode: chatdb::CtxMode::SummaryRetrieval,
             input: String::new(),
             stream_buf: String::new(),
             generating: false,
             summarizing: false,
+            tok_full: None,
+            tok_ctx: None,
+            rename: None,
+            confirm_delete: None,
             show_new: false,
+            new_name: String::new(),
+            new_mode: chatdb::CtxMode::SummaryRetrieval,
+            new_db_pick: DbPick::NewFile,
+            new_file_path: default_db_path(),
+            new_file_encrypt: false,
+            new_file_pass: String::new(),
+            show_open: false,
+            open_path: default_db_path(),
+            open_pass: String::new(),
         }
     }
 }
@@ -111,6 +150,15 @@ fn default_db_path() -> String {
         .to_string()
 }
 
+/// Short display name for a database path (its file name).
+fn db_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
 /// State for the Learning tab (drives the Python QLoRA pipeline).
 /// Pre-made datasets you can pick in the Learning tab: (label, jsonl path, generator script).
 /// The first is the default — OVERFLOW's strong infosec-professor set.
@@ -127,6 +175,11 @@ struct LearnState {
     loss: Option<f32>,
     step: Option<(u32, u32)>,
     status: String,
+    /// Base label of the running task (e.g. "download 7B"), without the live
+    /// percentage that gets appended to `status`.
+    task: String,
+    /// Download progress in percent, when the task reports one.
+    pct: Option<f32>,
 }
 
 impl Default for LearnState {
@@ -139,6 +192,8 @@ impl Default for LearnState {
             loss: None,
             step: None,
             status: "idle".into(),
+            task: String::new(),
+            pct: None,
         }
     }
 }
@@ -415,7 +470,14 @@ impl OverflowApp {
         self.start(
             label,
             "curl",
-            vec!["-L".into(), "--fail".into(), "-o".into(), out.display().to_string(), url.to_string()],
+            vec![
+                "-L".into(),
+                "--fail".into(),
+                "--progress-bar".into(), // emit a parseable progress meter (redrawn with \r)
+                "-o".into(),
+                out.display().to_string(),
+                url.to_string(),
+            ],
         );
     }
 
@@ -452,6 +514,8 @@ impl OverflowApp {
         )];
         self.log(format!("$ {label}"));
         self.learn.status = format!("running: {label}");
+        self.learn.task = label.to_string();
+        self.learn.pct = None;
         self.learn.loss = None;
         self.learn.step = None;
         self.trainer = Some(trainer::run(program, args, envs, Self::cwd()));
@@ -463,13 +527,30 @@ impl OverflowApp {
             while let Ok(msg) = t.rx.try_recv() {
                 match msg {
                     trainer::TrainerMsg::Line(l) => {
-                        if let Some(loss) = trainer::parse_loss(&l) {
-                            self.learn.loss = Some(loss);
+                        if trainer::is_progress(&l) {
+                            // A download/progress meter: update the percentage and
+                            // collapse consecutive meter lines into one that
+                            // redraws in place, exactly like a terminal.
+                            if let Some(pct) = trainer::parse_percent(&l) {
+                                self.learn.pct = Some(pct);
+                                self.learn.status = format!("running: {} — {pct:.0}%", self.learn.task);
+                            }
+                            if self.console.last().map(|p| trainer::is_progress(p)).unwrap_or(false) {
+                                if let Some(last) = self.console.last_mut() {
+                                    *last = l;
+                                }
+                            } else {
+                                self.console.push(l);
+                            }
+                        } else {
+                            if let Some(loss) = trainer::parse_loss(&l) {
+                                self.learn.loss = Some(loss);
+                            }
+                            if let Some(p) = trainer::parse_progress(&l) {
+                                self.learn.step = Some(p);
+                            }
+                            self.console.push(l);
                         }
-                        if let Some(p) = trainer::parse_progress(&l) {
-                            self.learn.step = Some(p);
-                        }
-                        self.console.push(l);
                     }
                     trainer::TrainerMsg::Done(ok) => done = Some(ok),
                 }
@@ -516,68 +597,100 @@ impl OverflowApp {
     // ---- OnlyChat helpers -------------------------------------------------
 
     /// Reload the chat list and the active chat's transcript from the DB.
+    /// Rebuild the flattened chat list from all open databases and reload the
+    /// active chat's transcript, then refresh its token counts.
     fn only_reload(&mut self) {
-        if let Some(db) = &self.only.db {
-            self.only.chats = db.list_chats();
-            if let Some(id) = self.only.active {
-                if !self.only.chats.iter().any(|c| c.id == id) {
-                    self.only.active = None;
-                }
-            }
-            if let Some(id) = self.only.active {
-                self.only.msgs = db.messages(id);
-                if let Some(meta) = self.only.chats.iter().find(|c| c.id == id) {
-                    self.only.active_mode = meta.mode;
-                }
-            } else {
-                self.only.msgs.clear();
+        let mut chats = Vec::new();
+        for (i, od) in self.only.dbs.iter().enumerate() {
+            for meta in od.db.list_chats() {
+                chats.push((i, meta));
             }
         }
-    }
-
-    fn only_open_db(&mut self) {
-        let path = PathBuf::from(self.only.db_path.trim());
-        if !path.exists() {
-            self.only.status = "Datei nicht gefunden".into();
-            return;
-        }
-        // Any existing SQLite file is allowed: OnlyChat adds its own `oc_` tables
-        // alongside whatever is already there, without touching foreign tables.
-        let pass = (!self.only.passphrase.is_empty()).then(|| self.only.passphrase.clone());
-        let need_pass = chatdb::ChatDb::is_encrypted(&path);
-        if need_pass && pass.is_none() {
-            self.only.status = "Datenbank ist verschlüsselt — Passwort eingeben".into();
-            return;
-        }
-        match chatdb::ChatDb::open(&path, pass.as_deref()) {
-            Ok(db) => {
-                self.only.db = Some(db);
+        self.only.chats = chats;
+        // Drop the active selection if its chat no longer exists.
+        if let Some((di, id)) = self.only.active {
+            if !self.only.chats.iter().any(|(i, m)| *i == di && m.id == id) {
                 self.only.active = None;
-                self.only.status = format!("geöffnet: {}", path.display());
-                self.only_reload();
             }
-            Err(e) => self.only.status = e,
+        }
+        if let Some((di, id)) = self.only.active {
+            self.only.msgs = self.only.dbs[di].db.messages(id);
+            if let Some((_, meta)) = self.only.chats.iter().find(|(i, m)| *i == di && m.id == id) {
+                self.only.active_mode = meta.mode;
+            }
+        } else {
+            self.only.msgs.clear();
+            self.only.tok_full = None;
+            self.only.tok_ctx = None;
+        }
+        self.only_request_tokens();
+    }
+
+    /// Add a database to the open set (deduped by path). `create` makes a new
+    /// file; otherwise an existing file is opened. Returns its index in `dbs`.
+    fn only_add_db(
+        &mut self,
+        raw_path: &str,
+        pass: Option<String>,
+        create: bool,
+        encrypt: bool,
+    ) -> Option<usize> {
+        let path = PathBuf::from(raw_path.trim());
+        if raw_path.trim().is_empty() {
+            self.only.status = "Pfad fehlt".into();
+            return None;
+        }
+        // Already open? reuse it.
+        if let Some(i) = self.only.dbs.iter().position(|d| d.path == path.display().to_string()) {
+            return Some(i);
+        }
+        let result = if create {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let pass = (encrypt).then(|| pass.clone().unwrap_or_default());
+            if encrypt && pass.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
+                self.only.status = "Für Verschlüsselung ein Passwort setzen".into();
+                return None;
+            }
+            chatdb::ChatDb::create(&path, pass.as_deref())
+        } else {
+            if !path.exists() {
+                self.only.status = "Datei nicht gefunden".into();
+                return None;
+            }
+            if chatdb::ChatDb::is_encrypted(&path) && pass.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
+                self.only.status = "Datenbank ist verschlüsselt — Passwort eingeben".into();
+                return None;
+            }
+            chatdb::ChatDb::open(&path, pass.as_deref())
+        };
+        match result {
+            Ok(db) => {
+                // Opening an existing file with data but no OnlyChat chats yet:
+                // read its own tables into chats so the AI sees that content.
+                // (Creating a fresh file has nothing to import.)
+                if !create && db.list_chats().is_empty() {
+                    let _ = db.import_foreign();
+                }
+                self.only.dbs.push(OpenDb { path: path.display().to_string(), db });
+                self.only.status = format!("{}: {}", if create { "erstellt" } else { "geöffnet" }, path.display());
+                self.only_reload();
+                Some(self.only.dbs.len() - 1)
+            }
+            Err(e) => {
+                self.only.status = e;
+                None
+            }
         }
     }
 
-    fn only_create_db(&mut self) {
-        let path = PathBuf::from(self.only.db_path.trim());
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let pass = (self.only.encrypt_new && !self.only.passphrase.is_empty())
-            .then(|| self.only.passphrase.clone());
-        if self.only.encrypt_new && pass.is_none() {
-            self.only.status = "Für Verschlüsselung ein Passwort setzen".into();
-            return;
-        }
-        match chatdb::ChatDb::create(&path, pass.as_deref()) {
-            Ok(db) => {
-                self.only.db = Some(db);
-                self.only.status = format!("erstellt: {}", path.display());
-                self.only_reload();
-            }
-            Err(e) => self.only.status = e,
+    fn only_open_existing(&mut self) {
+        let path = self.only.open_path.clone();
+        let pass = (!self.only.open_pass.is_empty()).then(|| self.only.open_pass.clone());
+        if self.only_add_db(&path, pass, false, false).is_some() {
+            self.only.show_open = false;
+            self.only.open_pass.clear();
         }
     }
 
@@ -587,34 +700,71 @@ impl OverflowApp {
             if n.is_empty() { "Neuer Chat".to_string() } else { n.to_string() }
         };
         let mode = self.only.new_mode;
-        if let Some(db) = &self.only.db {
-            match db.new_chat(&name, mode) {
-                Ok(id) => {
-                    self.only.active = Some(id);
-                    self.only.new_name.clear();
-                    self.only.show_new = false;
-                    self.only_reload();
+        // Resolve the target database from the picker.
+        let di = match self.only.new_db_pick.clone() {
+            DbPick::Existing(i) if i < self.only.dbs.len() => i,
+            _ => {
+                let path = self.only.new_file_path.clone();
+                let pass = (!self.only.new_file_pass.is_empty()).then(|| self.only.new_file_pass.clone());
+                let encrypt = self.only.new_file_encrypt;
+                match self.only_add_db(&path, pass, true, encrypt) {
+                    Some(i) => i,
+                    None => return,
                 }
-                Err(e) => self.only.status = e,
             }
+        };
+        match self.only.dbs[di].db.new_chat(&name, mode) {
+            Ok(id) => {
+                self.only.active = Some((di, id));
+                self.only.new_name.clear();
+                self.only.new_file_pass.clear();
+                self.only.show_new = false;
+                self.only_reload();
+            }
+            Err(e) => self.only.status = e,
         }
     }
 
-    fn only_import(&mut self) {
-        let path = PathBuf::from(self.only.import_path.trim());
-        if !path.exists() {
-            self.only.status = "Import-Datei nicht gefunden".into();
+    fn only_rename_chat(&mut self, di: usize, id: i64, name: &str) {
+        if di < self.only.dbs.len() {
+            self.only.dbs[di].db.rename_chat(id, name);
+        }
+        self.only_reload();
+    }
+
+    /// Delete a chat. With `delete_file`, the whole database file is removed
+    /// (closing it first) — which also removes any other chats it holds.
+    fn only_delete_chat(&mut self, di: usize, id: i64, delete_file: bool) {
+        if di >= self.only.dbs.len() {
             return;
         }
-        if let Some(db) = &self.only.db {
-            match db.import_chatgpt(&path) {
-                Ok(n) => {
-                    self.only.status = format!("{n} Chat(s) importiert");
-                    self.only_reload();
-                }
-                Err(e) => self.only.status = format!("Import fehlgeschlagen: {e}"),
+        if delete_file {
+            let path = self.only.dbs[di].path.clone();
+            self.only.dbs.remove(di); // drop closes the connection
+            let _ = std::fs::remove_file(&path);
+            self.only.active = None;
+        } else {
+            self.only.dbs[di].db.delete_chat(id);
+            if self.only.active == Some((di, id)) {
+                self.only.active = None;
             }
         }
+        self.only_reload();
+    }
+
+    /// Ask the worker to count tokens for the active chat: the whole history vs.
+    /// what the current context mode would actually feed the model.
+    fn only_request_tokens(&mut self) {
+        let (Some(handle), Some((di, id))) = (&self.handle, self.only.active) else { return };
+        let full: String = self.only.msgs.iter().map(|m| m.text.clone()).collect::<Vec<_>>().join("\n");
+        let summary = self.only.dbs[di].db.summary(id).map(|(s, _)| s);
+        let (prelude, turns) = chatdb::assemble(&self.only.msgs, self.only.active_mode, summary.as_deref());
+        let mut ctx = prelude.unwrap_or_default();
+        for (_, t) in &turns {
+            ctx.push('\n');
+            ctx.push_str(t);
+        }
+        let _ = handle.tx.send(ToWorker::CountTokens { full, ctx });
     }
 
     fn only_send(&mut self) {
@@ -626,10 +776,11 @@ impl OverflowApp {
             self.only.status = "kein Modell geladen".into();
             return;
         };
-        let (Some(db), Some(id)) = (&self.only.db, self.only.active) else {
+        let Some((di, id)) = self.only.active else {
             self.only.status = "keinen Chat ausgewählt".into();
             return;
         };
+        let db = &self.only.dbs[di].db;
         // Persist the user turn, then assemble the context for the model.
         db.append(id, chatdb::Role::User, &text);
         self.only.msgs = db.messages(id);
@@ -644,6 +795,7 @@ impl OverflowApp {
         let _ = handle.tx.send(ToWorker::ChatOnly { turns, prelude, gen: self.gen.clone() });
         self.only.input.clear();
         self.status = Status::Generating;
+        self.only_request_tokens();
     }
 
     fn only_summarize(&mut self) {
@@ -651,7 +803,9 @@ impl OverflowApp {
             return;
         }
         let Some(handle) = &self.handle else { return };
-        let (Some(_db), Some(_id)) = (&self.only.db, self.only.active) else { return };
+        if self.only.active.is_none() {
+            return;
+        }
         // Summarize everything older than the verbatim window.
         let cut = self.only.msgs.len().saturating_sub(chatdb::LAST_N * 2);
         if cut == 0 {
@@ -715,21 +869,26 @@ impl OverflowApp {
                 }
                 FromWorker::Summary(s) => {
                     let s = s.trim().to_string();
-                    if let (Some(db), Some(id)) = (&self.only.db, self.only.active) {
+                    if let Some((di, id)) = self.only.active {
                         let upto = self.only.msgs.len().saturating_sub(chatdb::LAST_N * 2) as i64;
-                        db.set_summary(id, &s, upto);
+                        self.only.dbs[di].db.set_summary(id, &s, upto);
                         self.only.status = "Zusammenfassung gespeichert".into();
                     }
                     self.only.summarizing = false;
+                    self.only_request_tokens();
+                }
+                FromWorker::OnlyChatTokens { full, ctx } => {
+                    self.only.tok_full = Some(full);
+                    self.only.tok_ctx = Some(ctx);
                 }
                 FromWorker::Done => {
                     self.status = Status::Ready;
                     if self.stream == Stream::OnlyChat && self.only.generating {
                         let text = std::mem::take(&mut self.only.stream_buf);
                         let text = strip_think(&text);
-                        if let (Some(db), Some(id)) = (&self.only.db, self.only.active) {
+                        if let Some((di, id)) = self.only.active {
                             if !text.trim().is_empty() {
-                                db.append(id, chatdb::Role::Assistant, text.trim());
+                                self.only.dbs[di].db.append(id, chatdb::Role::Assistant, text.trim());
                             }
                         }
                         self.only.generating = false;
@@ -950,6 +1109,14 @@ impl OverflowApp {
                 section(ui, "DEV · METRICS");
                 ui.label(egui::RichText::new(format!("backend   {}", self.backend)).color(GREEN).size(12.0));
                 ui.label(egui::RichText::new(format!("speed     {:.1} tok/s", self.tok_per_s)).color(FG).size(12.0));
+                if self.tab == Tab::OnlyChat {
+                    if let Some(full) = self.only.tok_full {
+                        ui.label(egui::RichText::new(format!("chat      {full} Token")).color(CYAN).size(12.0));
+                    }
+                    if let Some(ctx) = self.only.tok_ctx {
+                        ui.label(egui::RichText::new(format!("context   {ctx} Token (Modus: {})", self.only.active_mode.label())).color(CYAN).size(12.0));
+                    }
+                }
                 if let Some(l) = self.learn.loss {
                     ui.label(egui::RichText::new(format!("loss      {l:.4}")).color(AMBER).size(12.0));
                 }
@@ -1127,120 +1294,202 @@ impl OverflowApp {
     /// model only ever sees the slice of history the chosen context mode feeds
     /// it, so a huge imported chat stays runnable at a bounded cost.
     fn onlychat_body(&mut self, ui: &mut egui::Ui) {
-        // ---- no database open yet: setup card ----
-        if self.only.db.is_none() {
-            let mut open_db = false;
-            let mut create_db = false;
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(16, 12)))
-                .show(ui, |ui| {
-                    ui.add_space(20.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("OnlyChat").color(AMBER).size(26.0).strong());
-                        ui.label(egui::RichText::new("Persistenter Chat aus einer Datenbank — spart Kontext").color(MUTED).size(12.0));
-                    });
-                    ui.add_space(18.0);
-                    egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::same(16)).stroke(Stroke::new(1.0, LINE)).show(ui, |ui| {
-                        ui.set_max_width(560.0);
-                        section(ui, "DATENBANK");
-                        ui.label(egui::RichText::new("Pfad zu einer .sqlite-Datei (vorhanden öffnen oder neu anlegen):").color(FG).size(12.0));
-                        ui.add(egui::TextEdit::singleline(&mut self.only.db_path).desired_width(f32::INFINITY).hint_text("…/chats.sqlite"));
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.only.encrypt_new, egui::RichText::new("verschlüsseln (Argon2id)").color(FG).size(12.0));
-                            ui.add(egui::TextEdit::singleline(&mut self.only.passphrase).password(true).desired_width(220.0).hint_text("Passwort"));
-                        });
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            if ui.button(egui::RichText::new("Öffnen").color(GREEN)).clicked() {
-                                open_db = true;
-                            }
-                            if ui.button(egui::RichText::new("Neu erstellen").color(AMBER)).clicked() {
-                                create_db = true;
-                            }
-                        });
-                        if !self.only.status.is_empty() {
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new(&self.only.status).color(MUTED).size(11.5));
-                        }
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Große Chats gehören in eine Datenbank; kleine kannst du einfach im Chat-Tab führen.").color(MUTED).size(11.0));
-                    });
-                });
-            if open_db {
-                self.only_open_db();
-            }
-            if create_db {
-                self.only_create_db();
-            }
-            return;
-        }
-
-        // ---- left: chat list + database actions ----
-        let mut select: Option<i64> = None;
-        let mut delete: Option<i64> = None;
+        // ---- left: databases + chat list + actions ----
+        let mut select: Option<(usize, i64)> = None;
+        let mut menu_rename: Option<(usize, i64, String)> = None;
+        let mut menu_delete: Option<(usize, i64)> = None;
         let mut new_chat = false;
-        let mut import = false;
-        let mut close_db = false;
+        let mut open_db = false;
+        let mut close_db: Option<usize> = None;
+        let mut do_rename: Option<(usize, i64, String)> = None;
+        let mut cancel_rename = false;
+        let mut do_delete: Option<(usize, i64, bool)> = None;
+        let mut cancel_delete = false;
         egui::Panel::left("onlychat_list")
             .resizable(false)
             .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::same(12)).stroke(Stroke::new(1.0, LINE)))
             .show(ui, |ui| {
-                ui.set_min_width(240.0);
+                ui.set_min_width(260.0);
+                ui.label(egui::RichText::new("ONLYCHAT").color(AMBER).size(13.0).strong());
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("CHATS").color(AMBER).size(12.0).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("schließen").color(MUTED).size(11.0)).clicked() {
-                            close_db = true;
+                    if ui.button(egui::RichText::new("+ Neuer Chat").color(GREEN).size(12.0)).clicked() {
+                        self.only.show_new = !self.only.show_new;
+                        self.only.show_open = false;
+                    }
+                    if ui.button(egui::RichText::new("DB öffnen").color(CYAN).size(12.0)).clicked() {
+                        self.only.show_open = !self.only.show_open;
+                        self.only.show_new = false;
+                    }
+                });
+
+                // -- open an existing database (so its chats show up) --
+                if self.only.show_open {
+                    egui::Frame::NONE.fill(SURFACE).inner_margin(egui::Margin::same(8)).stroke(Stroke::new(1.0, LINE)).show(ui, |ui| {
+                        ui.label(egui::RichText::new("vorhandene .sqlite öffnen").color(FG).size(11.5));
+                        ui.add(egui::TextEdit::singleline(&mut self.only.open_path).desired_width(f32::INFINITY).hint_text("…/memory.sqlite3"));
+                        ui.add(egui::TextEdit::singleline(&mut self.only.open_pass).password(true).desired_width(f32::INFINITY).hint_text("Passwort (falls verschlüsselt)"));
+                        if ui.button(egui::RichText::new("öffnen").color(GREEN).size(11.5)).clicked() {
+                            open_db = true;
                         }
                     });
-                });
-                ui.add_space(4.0);
-                if ui.button(egui::RichText::new("+ Neuer Chat").color(GREEN).size(12.0)).clicked() {
-                    self.only.show_new = !self.only.show_new;
                 }
+
+                // -- new chat: name, mode, and WHICH database it goes into --
                 if self.only.show_new {
-                    ui.add_space(4.0);
-                    ui.add(egui::TextEdit::singleline(&mut self.only.new_name).desired_width(f32::INFINITY).hint_text("Name"));
-                    egui::ComboBox::from_id_salt("new_mode")
-                        .selected_text(self.only.new_mode.label())
-                        .show_ui(ui, |ui| {
-                            for m in [chatdb::CtxMode::Full, chatdb::CtxMode::LastN, chatdb::CtxMode::SummaryRetrieval] {
-                                ui.selectable_value(&mut self.only.new_mode, m, m.label());
-                            }
-                        });
-                    if ui.button(egui::RichText::new("anlegen").color(AMBER).size(12.0)).clicked() {
-                        new_chat = true;
-                    }
-                }
-                ui.add_space(8.0);
-                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 120.0).show(ui, |ui| {
-                    for c in &self.only.chats {
-                        let is_cur = self.only.active == Some(c.id);
+                    egui::Frame::NONE.fill(SURFACE).inner_margin(egui::Margin::same(8)).stroke(Stroke::new(1.0, LINE)).show(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.only.new_name).desired_width(f32::INFINITY).hint_text("Name"));
                         ui.horizontal(|ui| {
-                            let label = format!("{}  ({})", c.name, c.n_msgs);
+                            ui.label(egui::RichText::new("Modus").color(MUTED).size(11.0));
+                            egui::ComboBox::from_id_salt("new_mode")
+                                .selected_text(self.only.new_mode.label())
+                                .show_ui(ui, |ui| {
+                                    for m in [chatdb::CtxMode::Full, chatdb::CtxMode::LastN, chatdb::CtxMode::SummaryRetrieval] {
+                                        ui.selectable_value(&mut self.only.new_mode, m, m.label());
+                                    }
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("DB").color(MUTED).size(11.0));
+                            let sel_label = match &self.only.new_db_pick {
+                                DbPick::Existing(i) => self.only.dbs.get(*i).map(|d| db_name(&d.path)).unwrap_or_else(|| "?".into()),
+                                DbPick::NewFile => "＋ neue Datei…".to_string(),
+                            };
+                            egui::ComboBox::from_id_salt("new_db_pick")
+                                .selected_text(sel_label)
+                                .show_ui(ui, |ui| {
+                                    for (i, od) in self.only.dbs.iter().enumerate() {
+                                        ui.selectable_value(&mut self.only.new_db_pick, DbPick::Existing(i), db_name(&od.path));
+                                    }
+                                    ui.selectable_value(&mut self.only.new_db_pick, DbPick::NewFile, "＋ neue Datei…");
+                                });
+                        });
+                        if self.only.new_db_pick == DbPick::NewFile {
+                            ui.add(egui::TextEdit::singleline(&mut self.only.new_file_path).desired_width(f32::INFINITY).hint_text("…/chats.sqlite"));
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.only.new_file_encrypt, egui::RichText::new("verschlüsseln").color(FG).size(11.0));
+                                if self.only.new_file_encrypt {
+                                    ui.add(egui::TextEdit::singleline(&mut self.only.new_file_pass).password(true).desired_width(140.0).hint_text("Passwort"));
+                                }
+                            });
+                        }
+                        if ui.button(egui::RichText::new("anlegen").color(AMBER).size(12.0)).clicked() {
+                            new_chat = true;
+                        }
+                    });
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                // -- chat list across all open databases --
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 150.0).show(ui, |ui| {
+                    if self.only.chats.is_empty() {
+                        ui.label(egui::RichText::new("noch keine Chats — lege einen an oder öffne eine DB").color(MUTED).size(11.0));
+                    }
+                    let multi = self.only.dbs.len() > 1;
+                    for (di, meta) in &self.only.chats {
+                        let is_cur = self.only.active == Some((*di, meta.id));
+                        ui.horizontal(|ui| {
+                            let label = format!("{}  ({})", meta.name, meta.n_msgs);
                             if ui.selectable_label(is_cur, egui::RichText::new(label).size(12.0).color(if is_cur { AMBER } else { FG })).clicked() {
-                                select = Some(c.id);
+                                select = Some((*di, meta.id));
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button(egui::RichText::new("✕").color(MUTED).size(10.0)).clicked() {
-                                    delete = Some(c.id);
+                                // Gear menu: rename / delete (and more).
+                                ui.menu_button(egui::RichText::new("⚙").color(MUTED).size(12.0), |ui| {
+                                    if ui.button("Umbenennen").clicked() {
+                                        menu_rename = Some((*di, meta.id, meta.name.clone()));
+                                    }
+                                    if ui.button(egui::RichText::new("Löschen").color(RED)).clicked() {
+                                        menu_delete = Some((*di, meta.id));
+                                    }
+                                });
+                            });
+                        });
+                        if multi {
+                            ui.label(egui::RichText::new(format!("   {}", db_name(&self.only.dbs[*di].path))).color(MUTED).size(9.5));
+                        }
+                    }
+                });
+                if !self.only.dbs.is_empty() {
+                    ui.add_space(6.0);
+                    section(ui, "OFFENE DBs");
+                    for (i, od) in self.only.dbs.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let enc = if od.db.encrypted() { "🔒 " } else { "" };
+                            ui.label(egui::RichText::new(format!("{enc}{}", db_name(&od.path))).color(FG).size(10.5));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(egui::RichText::new("schließen").color(MUTED).size(9.5)).clicked() {
+                                    close_db = Some(i);
                                 }
                             });
                         });
                     }
-                });
-                ui.add_space(6.0);
-                section(ui, "IMPORT (ChatGPT)");
-                ui.add(egui::TextEdit::singleline(&mut self.only.import_path).desired_width(f32::INFINITY).hint_text("…/conversations.json"));
-                if ui.button(egui::RichText::new("importieren").color(CYAN).size(11.5)).clicked() {
-                    import = true;
                 }
                 if !self.only.status.is_empty() {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new(&self.only.status).color(MUTED).size(11.0));
                 }
             });
+
+        // ---- rename dialog ----
+        if self.only.rename.is_some() {
+            egui::Panel::bottom("oc_rename")
+                .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, LINE)))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Chat umbenennen").color(AMBER).strong());
+                    ui.add_space(4.0);
+                    let mut save = false;
+                    if let Some((_, _, buf)) = self.only.rename.as_mut() {
+                        let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(320.0));
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            save = true;
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(egui::RichText::new("Speichern").color(GREEN)).clicked() {
+                            save = true;
+                        }
+                        if ui.button(egui::RichText::new("Abbrechen").color(MUTED)).clicked() {
+                            cancel_rename = true;
+                        }
+                    });
+                    if save {
+                        if let Some((d, i, b)) = &self.only.rename {
+                            if !b.trim().is_empty() {
+                                do_rename = Some((*d, *i, b.trim().to_string()));
+                            }
+                        }
+                    }
+                });
+        }
+
+        // ---- delete confirmation ----
+        if let Some((di, id)) = self.only.confirm_delete {
+            let fname = self.only.dbs.get(di).map(|d| db_name(&d.path)).unwrap_or_default();
+            let others = self.only.chats.iter().filter(|(i, _)| *i == di).count().saturating_sub(1);
+            egui::Panel::bottom("oc_delete")
+                .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, RED)))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("Chat löschen").color(RED).strong());
+                    ui.label(egui::RichText::new(format!("Datenbankdatei: {fname}")).color(MUTED).size(11.5));
+                    if others > 0 {
+                        ui.label(egui::RichText::new(format!("Achtung: die Datei enthält noch {others} weitere Chat(s) — beim Mitlöschen gehen die auch verloren.")).color(AMBER).size(11.0));
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(egui::RichText::new("Nur diesen Chat").color(FG)).clicked() {
+                            do_delete = Some((di, id, false));
+                        }
+                        if ui.button(egui::RichText::new("Chat + Datenbankdatei").color(RED)).clicked() {
+                            do_delete = Some((di, id, true));
+                        }
+                        if ui.button(egui::RichText::new("Abbrechen").color(MUTED)).clicked() {
+                            cancel_delete = true;
+                        }
+                    });
+                });
+        }
 
         // ---- bottom composer ----
         let mut send = false;
@@ -1300,6 +1549,11 @@ impl OverflowApp {
                             summarize = true;
                         }
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let (Some(full), Some(ctx)) = (self.only.tok_full, self.only.tok_ctx) {
+                            ui.label(egui::RichText::new(format!("Kontext {ctx} / {full} Token")).color(MUTED).size(11.0));
+                        }
+                    });
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
@@ -1326,36 +1580,47 @@ impl OverflowApp {
             });
 
         // ---- apply collected actions (outside the UI closures) ----
-        if close_db {
-            self.only.db = None;
-            self.only.active = None;
-            self.only.msgs.clear();
-            self.only.chats.clear();
-            self.only.status.clear();
-        }
-        if let Some(id) = delete {
-            if let Some(db) = &self.only.db {
-                db.delete_chat(id);
+        if let Some(di) = close_db {
+            if di < self.only.dbs.len() {
+                self.only.dbs.remove(di);
             }
-            if self.only.active == Some(id) {
-                self.only.active = None;
-            }
+            self.only.active = None; // indices shift; simplest is to reselect
             self.only_reload();
         }
-        if let Some(id) = select {
-            self.only.active = Some(id);
+        if let Some(r) = menu_rename {
+            self.only.rename = Some(r);
+        }
+        if let Some(d) = menu_delete {
+            self.only.confirm_delete = Some(d);
+        }
+        if let Some((di, id, name)) = do_rename {
+            self.only_rename_chat(di, id, &name);
+            self.only.rename = None;
+        }
+        if cancel_rename {
+            self.only.rename = None;
+        }
+        if let Some((di, id, file)) = do_delete {
+            self.only_delete_chat(di, id, file);
+            self.only.confirm_delete = None;
+        }
+        if cancel_delete {
+            self.only.confirm_delete = None;
+        }
+        if let Some(sel) = select {
+            self.only.active = Some(sel);
             self.only_reload();
+        }
+        if open_db {
+            self.only_open_existing();
         }
         if new_chat {
             self.only_new_chat();
         }
-        if import {
-            self.only_import();
-        }
         if let Some(mode) = set_mode {
             self.only.active_mode = mode;
-            if let (Some(db), Some(id)) = (&self.only.db, self.only.active) {
-                db.set_mode(id, mode);
+            if let Some((di, id)) = self.only.active {
+                self.only.dbs[di].db.set_mode(id, mode);
             }
             self.only_reload();
         }

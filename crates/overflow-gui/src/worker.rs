@@ -25,6 +25,9 @@ pub enum ToWorker {
     ChatOnly { turns: Vec<(bool, String)>, prelude: Option<String>, gen: GenCfg },
     /// OnlyChat: summarize the given text silently; replies with `Summary`.
     Summarize { text: String, gen: GenCfg },
+    /// OnlyChat: count tokens in the whole chat and in the context a turn would
+    /// actually feed; replies with `OnlyChatTokens`.
+    CountTokens { full: String, ctx: String },
 }
 
 /// worker -> UI.
@@ -38,6 +41,8 @@ pub enum FromWorker {
     Stats { tok_per_s: f32 },
     /// OnlyChat: a summary produced by `Summarize`, to be stored by the UI.
     Summary(String),
+    /// OnlyChat: (whole-chat tokens, context tokens) for the active chat.
+    OnlyChatTokens { full: usize, ctx: usize },
     Done,
     Error(String),
 }
@@ -115,6 +120,13 @@ fn run(
                 );
                 let _ = tx_out.send(FromWorker::Summary(summary));
                 let _ = tx_out.send(FromWorker::Done);
+            }
+            ToWorker::CountTokens { full, ctx } => {
+                // encode(text, add_bos=false, special=true) mirrors how the
+                // agent feeds text, so the count matches what the model sees.
+                let full = tok.encode(&full, false, true).len();
+                let ctx = tok.encode(&ctx, false, true).len();
+                let _ = tx_out.send(FromWorker::OnlyChatTokens { full, ctx });
             }
             ToWorker::Approve(_) => {}
         }

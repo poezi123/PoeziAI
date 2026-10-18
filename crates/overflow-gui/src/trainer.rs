@@ -4,10 +4,10 @@
 //! `training/` and shows progress live. stdout and stderr are read on background
 //! threads and sent line by line over a channel.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 pub enum TrainerMsg {
@@ -44,20 +44,12 @@ pub fn run(
                 let tx2 = tx.clone();
                 let h1 = out.map(|o| {
                     let tx = tx2.clone();
-                    thread::spawn(move || {
-                        for l in BufReader::new(o).lines().map_while(Result::ok) {
-                            let _ = tx.send(TrainerMsg::Line(l));
-                        }
-                    })
+                    thread::spawn(move || stream_lines(o, &tx))
                 });
                 let tx3 = tx.clone();
                 let h2 = err.map(|e| {
                     let tx = tx3.clone();
-                    thread::spawn(move || {
-                        for l in BufReader::new(e).lines().map_while(Result::ok) {
-                            let _ = tx.send(TrainerMsg::Line(l));
-                        }
-                    })
+                    thread::spawn(move || stream_lines(e, &tx))
                 });
                 let status = child.wait();
                 if let Some(h) = h1 {
@@ -77,6 +69,53 @@ pub fn run(
     Trainer { rx }
 }
 
+/// Read a child stream and emit one `Line` per terminal line, breaking on BOTH
+/// `\n` and `\r`. Tools like `curl` redraw their progress meter in place with
+/// `\r` (no newline), so a plain line reader would show nothing until the end —
+/// splitting on `\r` too lets each progress update reach the UI live.
+fn stream_lines(reader: impl Read, tx: &Sender<TrainerMsg>) {
+    let mut br = BufReader::new(reader);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match br.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                let b = byte[0];
+                if b == b'\n' || b == b'\r' {
+                    if !buf.is_empty() {
+                        let _ = tx.send(TrainerMsg::Line(String::from_utf8_lossy(&buf).into_owned()));
+                        buf.clear();
+                    }
+                } else {
+                    buf.push(b);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if !buf.is_empty() {
+        let _ = tx.send(TrainerMsg::Line(String::from_utf8_lossy(&buf).into_owned()));
+    }
+}
+
+/// True if a line looks like a download/progress meter (curl `-#` bar or its
+/// default table) — used to collapse repeated updates into one in-place line.
+pub fn is_progress(line: &str) -> bool {
+    line.contains('%') && (line.contains('#') || line.contains("Dload") || line.contains("Xferd"))
+}
+
+/// Pull a percentage (e.g. `38.2%`) out of a progress line.
+pub fn parse_percent(line: &str) -> Option<f32> {
+    let i = line.rfind('%')?;
+    let head = &line[..i];
+    let start = head
+        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    head[start..].parse().ok()
+}
+
 /// Pull `{'loss': 0.42, ...}` out of a transformers log line.
 pub fn parse_loss(line: &str) -> Option<f32> {
     let i = line.find("'loss':")?;
@@ -84,6 +123,25 @@ pub fn parse_loss(line: &str) -> Option<f32> {
     let rest = rest.trim_start().trim_start_matches(['\'', '"']);
     let end = rest.find(['\'', '"', ',', '}']).unwrap_or(rest.len());
     rest[..end].trim().parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_from_curl_bar() {
+        assert_eq!(parse_percent("######                    38.2%"), Some(38.2));
+        assert_eq!(parse_percent("#################### 100.0%"), Some(100.0));
+        assert_eq!(parse_percent("no percent here"), None);
+    }
+
+    #[test]
+    fn progress_detection() {
+        assert!(is_progress("####   12.0%"));
+        assert!(is_progress("  % Total    Dload  Upload   5.0%"));
+        assert!(!is_progress("{'loss': 0.2, 'epoch': 1.0}"));
+    }
 }
 
 /// Pull `(step, total)` out of a tqdm-style ` 12/30 ` fragment.
