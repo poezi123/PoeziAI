@@ -312,6 +312,30 @@ fn model_out_name(base: &str) -> String {
     format!("overflow-{tail}-q8_0.gguf")
 }
 
+/// HF bases already downloaded into the local cache, as repo ids
+/// (e.g. "Qwen/Qwen2.5-Coder-7B-Instruct"). Picking one of these trains with
+/// no download — the QLoRA pipeline reuses the cached snapshot. `hub` is the
+/// `training/hf-cache/hub` dir. GGUF files in the model folder are NOT listed:
+/// they are inference-only and cannot be fine-tuned (QLoRA needs the HF base).
+fn installed_bases(hub: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(hub) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(rest) = name.strip_prefix("models--") else { continue };
+            // needs a real (non-empty) snapshot to be usable
+            let has_snap = std::fs::read_dir(e.path().join("snapshots"))
+                .map(|r| r.flatten().any(|s| s.path().is_dir()))
+                .unwrap_or(false);
+            if has_snap {
+                out.push(rest.replace("--", "/"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 // --- OVERFLOW palette ---
 const BG: Color32 = Color32::from_rgb(0x07, 0x0b, 0x0d);
 const PANEL: Color32 = Color32::from_rgb(0x0d, 0x13, 0x16);
@@ -2062,14 +2086,33 @@ impl OverflowApp {
                 egui::Grid::new("learncfg").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                     ui.label(egui::RichText::new("base model").color(MUTED).size(12.0));
                     ui.horizontal(|ui| {
+                        let installed = installed_bases(&Self::cwd().join("training/hf-cache/hub"));
                         egui::ComboBox::from_id_salt("base_pick").width(300.0).selected_text(self.learn.base.clone()).show_ui(ui, |ui| {
+                            // Already-installed bases first — these train with no download.
+                            if !installed.is_empty() {
+                                ui.label(egui::RichText::new("installed · no download").color(GREEN).size(10.5));
+                                for b in &installed {
+                                    if ui.selectable_label(&self.learn.base == b, format!("✓ {b}")).clicked() {
+                                        self.learn.base = b.clone();
+                                        self.learn.out_name = model_out_name(b);
+                                    }
+                                }
+                                ui.separator();
+                                ui.label(egui::RichText::new("download").color(MUTED).size(10.5));
+                            }
                             for b in BASES {
+                                if installed.iter().any(|i| i == *b) {
+                                    continue; // already shown above
+                                }
                                 if ui.selectable_label(self.learn.base == *b, *b).clicked() {
                                     self.learn.base = (*b).into();
                                     self.learn.out_name = model_out_name(b);
                                 }
                             }
                         });
+                        if installed.iter().any(|i| i == &self.learn.base) {
+                            ui.label(egui::RichText::new("installed").color(GREEN).size(11.0));
+                        }
                     });
                     ui.end_row();
                     ui.label(egui::RichText::new("dataset").color(MUTED).size(12.0));
@@ -2090,6 +2133,10 @@ impl OverflowApp {
                     ui.add(egui::TextEdit::singleline(&mut self.learn.epochs).desired_width(80.0));
                     ui.end_row();
                 });
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(
+                    "Installed bases train with no download. GGUF models in the model folder are inference-only — fine-tuning starts from the HF base."
+                ).color(MUTED).size(10.5));
 
                 ui.add_space(10.0);
                 section(ui, "PIPELINE");
@@ -2350,6 +2397,7 @@ fn docs_body(ui: &mut egui::Ui) {
                     "",
                     "# 2. Train.",
                     "Learning tab: set base, dataset, epochs -> Train. Watch the loss fall.",
+                    "Bases you already downloaded show as 'installed - no download'; pick one to train without re-fetching.",
                     "",
                     "# 3. Export + load.",
                     "Merge + export GGUF, then Load trained model. Done — it's now your model.",
