@@ -28,15 +28,27 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use poezi_model::agent::GenCfg;
+use poezi_model::agent::{GenCfg, Perms};
 use rand::RngCore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 
+use crate::hw::HwStats;
 use crate::worker::ToWorker;
 
 /// Shared access to the current worker's inbox (None while no model is loaded).
 pub type Bridge = Arc<Mutex<Option<Sender<ToWorker>>>>;
+
+/// Settings the phone can see and change: the agent permissions and the
+/// generation knobs. Shared with the GUI so a change from either side sticks.
+pub struct SrvCfg {
+    pub perms: Perms,
+    pub gen: GenCfg,
+}
+pub type SharedCfg = Arc<Mutex<SrvCfg>>;
+
+/// Live hardware snapshot the phone reads to show PC load.
+pub type SharedHw = Arc<Mutex<HwStats>>;
 
 /// Largest request body we accept (the chat JSON). Anything bigger is refused
 /// before it is buffered, so a bogus Content-Length can't exhaust memory.
@@ -53,7 +65,7 @@ pub struct ServerHandle {
 
 /// Start the HTTPS server. Binds the Tailscale IP (fallback: localhost) on port
 /// 443, then 8443 if 443 needs privileges. A self-signed cert covers that IP.
-pub fn start(bridge: Bridge, gen: GenCfg) -> Result<ServerHandle, String> {
+pub fn start(bridge: Bridge, cfg: SharedCfg, hw: SharedHw) -> Result<ServerHandle, String> {
     // Install the ring crypto provider once (ignore error if already set).
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ip = tailscale_ip().unwrap_or_else(|| "127.0.0.1".to_string());
@@ -79,7 +91,8 @@ pub fn start(bridge: Bridge, gen: GenCfg) -> Result<ServerHandle, String> {
                 }
                 inflight.fetch_add(1, Ordering::Relaxed);
                 let bridge = bridge.clone();
-                let gen = gen.clone();
+                let cfg = cfg.clone();
+                let hw = hw.clone();
                 let tls = tls.clone();
                 let token = token.clone();
                 let inflight2 = inflight.clone();
@@ -89,7 +102,7 @@ pub fn start(bridge: Bridge, gen: GenCfg) -> Result<ServerHandle, String> {
                     let _ = tcp.set_write_timeout(Some(Duration::from_secs(30)));
                     if let Ok(mut conn) = rustls::ServerConnection::new(tls) {
                         let mut s = rustls::Stream::new(&mut conn, &mut tcp);
-                        let _ = handle_conn(&mut s, &bridge, &gen, &token);
+                        let _ = handle_conn(&mut s, &bridge, &cfg, &hw, &token);
                     }
                     inflight2.fetch_sub(1, Ordering::Relaxed);
                 });
@@ -160,7 +173,8 @@ fn tailscale_ip() -> Option<String> {
 fn handle_conn<S: Read + Write>(
     stream: &mut S,
     bridge: &Bridge,
-    gen: &GenCfg,
+    cfg: &SharedCfg,
+    hw: &SharedHw,
     token: &str,
 ) -> std::io::Result<()> {
     let mut buf = Vec::new();
@@ -214,28 +228,123 @@ fn handle_conn<S: Read + Write>(
         }
     }
 
+    // Every API route is token-gated (constant-time). The page itself (GET /)
+    // is public; it carries no secret and can't do anything without the token.
+    let authed = bearer.as_deref().map(|t| ct_eq(t.as_bytes(), token.as_bytes())).unwrap_or(false);
+    let deny = |stream: &mut S| -> std::io::Result<()> {
+        let msg = serde_json::json!({
+            "error": "Not allowed — open the address shown in OVERFLOW (the one with #k=...)."
+        })
+        .to_string();
+        respond(stream, 401, "application/json", msg.as_bytes())
+    };
+
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => respond(stream, 200, "text/html; charset=utf-8", PAGE.as_bytes()),
         ("POST", "/api/chat") => {
-            // Gate the actual model call on the token (constant-time check).
-            let ok = bearer.as_deref().map(|t| ct_eq(t.as_bytes(), token.as_bytes())).unwrap_or(false);
-            if !ok {
-                let msg = serde_json::json!({
-                    "reply": "Not allowed — open the address shown in OVERFLOW (the one with #k=...)."
-                })
-                .to_string();
-                return respond(stream, 401, "application/json", msg.as_bytes());
+            if !authed {
+                return deny(stream);
             }
-            let reply = run_chat(&body, bridge, gen);
+            let reply = run_chat(&body, bridge, cfg);
             let json = serde_json::json!({ "reply": reply }).to_string();
             respond(stream, 200, "application/json", json.as_bytes())
+        }
+        ("GET", "/api/stats") => {
+            if !authed {
+                return deny(stream);
+            }
+            respond(stream, 200, "application/json", stats_json(hw).as_bytes())
+        }
+        ("GET", "/api/settings") => {
+            if !authed {
+                return deny(stream);
+            }
+            respond(stream, 200, "application/json", settings_json(cfg).as_bytes())
+        }
+        ("POST", "/api/settings") => {
+            if !authed {
+                return deny(stream);
+            }
+            apply_settings(&body, cfg);
+            respond(stream, 200, "application/json", settings_json(cfg).as_bytes())
         }
         _ => respond(stream, 404, "text/plain", b"not found"),
     }
 }
 
+/// Current permissions + generation settings as JSON (for the phone's panel).
+fn settings_json(cfg: &SharedCfg) -> String {
+    let g = cfg.lock().unwrap();
+    serde_json::json!({
+        "perms": {
+            "sandbox": g.perms.sandbox,
+            "fs_read": g.perms.fs_read,
+            "fs_write": g.perms.fs_write,
+            "shell": g.perms.shell,
+            "network": g.perms.network,
+            "confirm_outside": g.perms.confirm_outside,
+            "workspace": g.perms.workspace.display().to_string(),
+        },
+        "gen": {
+            "thinking": g.gen.thinking,
+            "effort": g.gen.effort,
+            "temp": g.gen.temp,
+            "top_p": g.gen.top_p,
+            "top_k": g.gen.top_k,
+            "max_tokens": g.gen.max_tokens,
+            "repeat_penalty": g.gen.repeat_penalty,
+            "repeat_last_n": g.gen.repeat_last_n,
+        }
+    })
+    .to_string()
+}
+
+/// Apply a settings update from the phone (any missing field is left as-is).
+fn apply_settings(body: &[u8], cfg: &SharedCfg) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else { return };
+    let mut g = cfg.lock().unwrap();
+    if let Some(p) = v.get("perms") {
+        let b = |k: &str, cur: bool| p.get(k).and_then(|x| x.as_bool()).unwrap_or(cur);
+        g.perms.sandbox = b("sandbox", g.perms.sandbox);
+        g.perms.fs_read = b("fs_read", g.perms.fs_read);
+        g.perms.fs_write = b("fs_write", g.perms.fs_write);
+        g.perms.shell = b("shell", g.perms.shell);
+        g.perms.network = b("network", g.perms.network);
+        g.perms.confirm_outside = b("confirm_outside", g.perms.confirm_outside);
+        if let Some(w) = p.get("workspace").and_then(|x| x.as_str()) {
+            if !w.trim().is_empty() {
+                g.perms.workspace = std::path::PathBuf::from(w);
+            }
+        }
+    }
+    if let Some(gn) = v.get("gen") {
+        if let Some(x) = gn.get("thinking").and_then(|x| x.as_bool()) { g.gen.thinking = x; }
+        if let Some(x) = gn.get("effort").and_then(|x| x.as_u64()) { g.gen.effort = x as u8; }
+        if let Some(x) = gn.get("temp").and_then(|x| x.as_f64()) { g.gen.temp = x as f32; }
+        if let Some(x) = gn.get("top_p").and_then(|x| x.as_f64()) { g.gen.top_p = x as f32; }
+        if let Some(x) = gn.get("top_k").and_then(|x| x.as_u64()) { g.gen.top_k = x as usize; }
+        if let Some(x) = gn.get("max_tokens").and_then(|x| x.as_u64()) { g.gen.max_tokens = x as usize; }
+        if let Some(x) = gn.get("repeat_penalty").and_then(|x| x.as_f64()) { g.gen.repeat_penalty = x as f32; }
+        if let Some(x) = gn.get("repeat_last_n").and_then(|x| x.as_u64()) { g.gen.repeat_last_n = x as usize; }
+    }
+}
+
+/// Live PC load as JSON.
+fn stats_json(hw: &SharedHw) -> String {
+    let h = hw.lock().map(|g| *g).unwrap_or_default();
+    serde_json::json!({
+        "cpu": h.cpu_pct,
+        "mem_used": h.mem_used_gb,
+        "mem_total": h.mem_total_gb,
+        "gpu": h.gpu_pct,
+        "vram_used": h.vram_used_mb,
+        "vram_total": h.vram_total_mb,
+    })
+    .to_string()
+}
+
 /// Parse {messages:[{role,content}]}, run one turn through the worker, return text.
-fn run_chat(body: &[u8], bridge: &Bridge, gen: &GenCfg) -> String {
+fn run_chat(body: &[u8], bridge: &Bridge, cfg: &SharedCfg) -> String {
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return "Error: bad request".to_string(),
@@ -258,8 +367,12 @@ fn run_chat(body: &[u8], bridge: &Bridge, gen: &GenCfg) -> String {
     let Some(tx) = tx else {
         return "No model loaded — load one in OVERFLOW.".to_string();
     };
+    let (perms, gen) = {
+        let g = cfg.lock().unwrap();
+        (g.perms.clone(), g.gen.clone())
+    };
     let (rtx, rrx) = channel::<String>();
-    if tx.send(ToWorker::ServerChat { turns, gen: gen.clone(), reply: rtx }).is_err() {
+    if tx.send(ToWorker::ServerChat { turns, perms, gen, reply: rtx }).is_err() {
         return "Can't reach the model.".to_string();
     }
     match rrx.recv_timeout(Duration::from_secs(600)) {
@@ -314,34 +427,109 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// fragment (`#k=...`) and sends it as a Bearer header; the fragment itself is
 /// never transmitted to the server by the browser.
 const PAGE: &str = r#"<!doctype html>
-<html lang="de"><head>
+<html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OVERFLOW</title>
 <style>
   :root{--bg:#070b0d;--panel:#0d1316;--fg:#d7e0dd;--muted:#6f8481;--amber:#f5b94d;--green:#4df0a0;--line:#1c2a2b}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif;display:flex;flex-direction:column;height:100dvh}
-  header{padding:12px 16px;border-bottom:1px solid var(--line);color:var(--amber);font-weight:700;letter-spacing:1px}
+  header{padding:12px 16px;border-bottom:1px solid var(--line);color:var(--amber);font-weight:700;letter-spacing:1px;display:flex;justify-content:space-between;align-items:center}
+  #gear{background:none;border:0;color:var(--amber);font-size:22px;padding:0 4px;cursor:pointer}
   #log{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
   .msg{max-width:85%;padding:10px 12px;border-radius:12px;white-space:pre-wrap;line-height:1.4}
   .you{align-self:flex-end;background:#15303a;border:1px solid var(--line)}
   .ai{align-self:flex-start;background:var(--panel);border:1px solid var(--line)}
   .who{font-size:11px;color:var(--muted);margin-bottom:3px}
   form{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line)}
-  input{flex:1;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--fg);font-size:16px}
+  #t{flex:1;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--fg);font-size:16px}
   button{padding:12px 16px;border-radius:10px;border:0;background:var(--amber);color:#0b0b0b;font-weight:700}
   button:disabled{opacity:.5}
+  #panel{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;z-index:9}
+  #panel.open{display:block}
+  #sheet{position:absolute;right:0;top:0;bottom:0;width:min(420px,92vw);background:var(--bg);border-left:1px solid var(--line);padding:16px;overflow-y:auto}
+  #sheet h2{color:var(--amber);font-size:14px;margin:18px 0 8px;letter-spacing:.5px}
+  #sheet h2:first-child{margin-top:0}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;font-size:14px}
+  .row label{color:var(--fg)}
+  .hint{color:var(--muted);font-size:12px;margin:2px 0 6px}
+  .bar{height:7px;border-radius:4px;background:var(--panel);overflow:hidden;flex:1;margin-left:10px}
+  .bar>span{display:block;height:100%;background:var(--green)}
+  .row input[type=range]{flex:1}
+  .row .val{min-width:46px;text-align:right;color:var(--amber);font-variant-numeric:tabular-nums}
+  #sheet input[type=text]{width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--fg);font-size:14px}
+  #sheet select{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:5px}
+  #save{width:100%;margin-top:16px}
+  .close{background:none;border:1px solid var(--line);color:var(--muted);float:right;padding:6px 10px;font-weight:400}
 </style></head><body>
-<header>OVERFLOW · remote</header>
+<header><span>OVERFLOW · remote</span><button id="gear" title="Settings">&#9881;</button></header>
 <div id="log"></div>
 <form id="f"><input id="t" placeholder="Message…" autocomplete="off"><button id="b">Send</button></form>
+
+<div id="panel"><div id="sheet">
+  <button class="close" id="close">close</button>
+  <h2>PC load</h2>
+  <div class="row"><label>CPU</label><div class="bar"><span id="bcpu"></span></div><div class="val" id="vcpu">–</div></div>
+  <div class="row"><label>RAM</label><div class="bar"><span id="bram"></span></div><div class="val" id="vram">–</div></div>
+  <div class="row"><label>GPU</label><div class="bar"><span id="bgpu"></span></div><div class="val" id="vgpu">–</div></div>
+  <div class="row"><label>VRAM</label><div class="bar"><span id="bvr"></span></div><div class="val" id="vvr">–</div></div>
+
+  <h2>Permissions</h2>
+  <div class="hint">Tools only work when safe mode is OFF. These let the AI act on this PC &mdash; be careful.</div>
+  <div class="row"><label>Safe mode (no tools)</label><input type="checkbox" id="p_sandbox"></div>
+  <div class="row"><label>Read files</label><input type="checkbox" id="p_fs_read"></div>
+  <div class="row"><label>Write files</label><input type="checkbox" id="p_fs_write"></div>
+  <div class="row"><label>Run commands</label><input type="checkbox" id="p_shell"></div>
+  <div class="row"><label>Internet</label><input type="checkbox" id="p_network"></div>
+  <div class="row"><label>Confirm outside workspace</label><input type="checkbox" id="p_confirm"></div>
+  <div class="hint">Working folder:</div>
+  <input type="text" id="p_ws" placeholder="/home/you/project">
+
+  <h2>More settings</h2>
+  <div class="row"><label>Thinking mode</label><input type="checkbox" id="g_think"></div>
+  <div class="row"><label>How hard it thinks</label><select id="g_effort"><option value="0">low</option><option value="1">medium</option><option value="2">high</option></select></div>
+  <div class="row"><label>Randomness</label><input type="range" id="g_temp" min="0" max="1.5" step="0.05"><div class="val" id="g_temp_v"></div></div>
+  <div class="row"><label>top-p</label><input type="range" id="g_topp" min="0.1" max="1" step="0.05"><div class="val" id="g_topp_v"></div></div>
+  <div class="row"><label>top-k</label><input type="range" id="g_topk" min="1" max="200" step="1"><div class="val" id="g_topk_v"></div></div>
+  <div class="row"><label>Longest answer</label><input type="range" id="g_max" min="32" max="8192" step="32"><div class="val" id="g_max_v"></div></div>
+  <div class="row"><label>Stop repeating</label><input type="range" id="g_rep" min="1" max="2" step="0.05"><div class="val" id="g_rep_v"></div></div>
+  <div class="row"><label>How far back</label><input type="range" id="g_rln" min="16" max="1024" step="16"><div class="val" id="g_rln_v"></div></div>
+
+  <button id="save">Save settings</button>
+</div></div>
+
 <script>
 const log=document.getElementById('log'),f=document.getElementById('f'),t=document.getElementById('t'),b=document.getElementById('b');
 const msgs=[];
 const TOKEN=(new URLSearchParams(location.hash.slice(1)).get('k'))||'';
+const H={'content-type':'application/json','authorization':'Bearer '+TOKEN};
+const $=id=>document.getElementById(id);
 function add(role,text){const d=document.createElement('div');d.className='msg '+(role==='user'?'you':'ai');d.innerHTML='<div class="who">'+(role==='user'?'you':'overflow')+'</div>';d.appendChild(document.createTextNode(text));log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-if(!TOKEN){add('assistant','No access key in the link. Open the address that OVERFLOW shows in the Server tab (…/#k=…).');b.disabled=true;t.disabled=true;}
-f.onsubmit=async e=>{e.preventDefault();const text=t.value.trim();if(!text)return;t.value='';add('user',text);msgs.push({role:'user',content:text});b.disabled=true;const d=add('assistant','…');try{const r=await fetch('/api/chat',{method:'POST',headers:{'content-type':'application/json','authorization':'Bearer '+TOKEN},body:JSON.stringify({messages:msgs})});const j=await r.json();d.removeChild(d.lastChild);d.appendChild(document.createTextNode(j.reply||'(empty)'));msgs.push({role:'assistant',content:j.reply||''});}catch(err){d.appendChild(document.createTextNode(' Error: '+err));}b.disabled=false;log.scrollTop=log.scrollHeight;};
+if(!TOKEN){add('assistant','No access key in the link. Open the address that OVERFLOW shows in the Server tab (…/#k=…).');b.disabled=true;t.disabled=true;$('gear').disabled=true;}
+f.onsubmit=async e=>{e.preventDefault();const text=t.value.trim();if(!text)return;t.value='';add('user',text);msgs.push({role:'user',content:text});b.disabled=true;const d=add('assistant','…');try{const r=await fetch('/api/chat',{method:'POST',headers:H,body:JSON.stringify({messages:msgs})});const j=await r.json();d.removeChild(d.lastChild);d.appendChild(document.createTextNode(j.reply||'(empty)'));msgs.push({role:'assistant',content:j.reply||''});}catch(err){d.appendChild(document.createTextNode(' Error: '+err));}b.disabled=false;log.scrollTop=log.scrollHeight;};
+
+// ---- settings panel ----
+const panel=$('panel');let statsTimer=null;
+function setBar(bar,val,txt){const v=Math.max(0,Math.min(100,val||0));$(bar).style.width=v+'%';}
+async function pollStats(){try{const r=await fetch('/api/stats',{headers:H});const s=await r.json();
+  $('bcpu').style.width=(s.cpu||0)+'%';$('vcpu').textContent=Math.round(s.cpu||0)+'%';
+  const mp=s.mem_total? (s.mem_used/s.mem_total*100):0;$('bram').style.width=mp+'%';$('vram').textContent=(s.mem_used||0).toFixed(1)+'/'+(s.mem_total||0).toFixed(1)+' GB';
+  if(s.gpu==null){$('vgpu').textContent='n/a';}else{$('bgpu').style.width=s.gpu+'%';$('vgpu').textContent=Math.round(s.gpu)+'%';}
+  if(s.vram_total==null){$('vvr').textContent='n/a';}else{$('bvr').style.width=(s.vram_used/s.vram_total*100)+'%';$('vvr').textContent=Math.round(s.vram_used)+'/'+Math.round(s.vram_total)+' MB';}
+}catch(e){}}
+function bindRange(id){const el=$(id),out=$(id+'_v');const upd=()=>out.textContent=el.value;el.oninput=upd;return upd;}
+const ranges=['g_temp','g_topp','g_topk','g_max','g_rep','g_rln'].map(bindRange);
+async function loadSettings(){try{const r=await fetch('/api/settings',{headers:H});const j=await r.json();const p=j.perms,g=j.gen;
+  $('p_sandbox').checked=p.sandbox;$('p_fs_read').checked=p.fs_read;$('p_fs_write').checked=p.fs_write;$('p_shell').checked=p.shell;$('p_network').checked=p.network;$('p_confirm').checked=p.confirm_outside;$('p_ws').value=p.workspace||'';
+  $('g_think').checked=g.thinking;$('g_effort').value=g.effort;$('g_temp').value=g.temp;$('g_topp').value=g.top_p;$('g_topk').value=g.top_k;$('g_max').value=g.max_tokens;$('g_rep').value=g.repeat_penalty;$('g_rln').value=g.repeat_last_n;
+  ranges.forEach(u=>u());
+}catch(e){}}
+$('gear').onclick=()=>{panel.classList.add('open');loadSettings();pollStats();statsTimer=setInterval(pollStats,2000);};
+function closePanel(){panel.classList.remove('open');if(statsTimer){clearInterval(statsTimer);statsTimer=null;}}
+$('close').onclick=closePanel;
+panel.onclick=e=>{if(e.target===panel)closePanel();};
+$('save').onclick=async()=>{const body={perms:{sandbox:$('p_sandbox').checked,fs_read:$('p_fs_read').checked,fs_write:$('p_fs_write').checked,shell:$('p_shell').checked,network:$('p_network').checked,confirm_outside:$('p_confirm').checked,workspace:$('p_ws').value},gen:{thinking:$('g_think').checked,effort:+$('g_effort').value,temp:+$('g_temp').value,top_p:+$('g_topp').value,top_k:+$('g_topk').value,max_tokens:+$('g_max').value,repeat_penalty:+$('g_rep').value,repeat_last_n:+$('g_rln').value}};
+  $('save').textContent='Saving…';try{await fetch('/api/settings',{method:'POST',headers:H,body:JSON.stringify(body)});$('save').textContent='Saved ✓';setTimeout(()=>$('save').textContent='Save settings',1200);}catch(e){$('save').textContent='Error';}};
 </script></body></html>"#;
 
 #[cfg(test)]

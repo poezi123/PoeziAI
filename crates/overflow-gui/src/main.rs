@@ -14,11 +14,13 @@ mod worker;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::{Color32, FontFamily, Pos2, Sense, Stroke, Vec2};
+use poezi_gguf::GgufFile;
 use poezi_model::agent::GenCfg;
+use poezi_model::{LoadOpts, MemEstimate};
 
 use worker::{FromWorker, Handle, ToWorker};
 
@@ -36,14 +38,20 @@ enum Tab {
 struct ServerState {
     handle: Option<server::ServerHandle>,
     bridge: server::Bridge,
+    /// Permissions + generation settings shared with the running server, so the
+    /// phone's gear panel can read and change them live.
+    cfg: server::SharedCfg,
     status: String,
 }
 
 impl Default for ServerState {
     fn default() -> Self {
+        let p = Permissions::default();
+        let perms = worker::perms(p.sandbox, p.fs_read, p.fs_write, p.shell, p.network, &p.workspace, p.confirm_outside);
         ServerState {
             handle: None,
             bridge: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cfg: std::sync::Arc::new(std::sync::Mutex::new(server::SrvCfg { perms, gen: GenCfg::default() })),
             status: String::new(),
         }
     }
@@ -157,7 +165,14 @@ fn strip_think(s: &str) -> String {
         }
     }
     out.push_str(rest);
-    out.trim().to_string()
+    // Some fine-tunes wrap the reply in <answer>…</answer>; show just the text.
+    out.replace("<answer>", "").replace("</answer>", "").trim().to_string()
+}
+
+/// Drop `<answer>…</answer>` wrapper tags a fine-tune may emit, keeping the text
+/// inside. Returns the cleaned reply, trimmed.
+fn strip_answer_tags(s: &str) -> String {
+    s.replace("<answer>", "").replace("</answer>", "").trim().to_string()
 }
 
 /// Percent-encode a query string for a URL.
@@ -175,30 +190,32 @@ fn url_encode(s: &str) -> String {
 
 /// Very small HTML→text: drop tags/scripts, decode a few entities, collapse
 /// whitespace. Good enough to feed search snippets to the model.
+///
+/// Walks the string by chars (never by raw byte offsets) so non-ASCII text in
+/// the page can't land us on a non-char boundary — tag names are ASCII, so the
+/// script/style checks use a case-insensitive compare on the remaining slice.
 fn html_to_text(html: &str) -> String {
     let mut out = String::new();
     let mut in_tag = false;
     let mut skip_depth = 0i32;
-    let lower = html.to_lowercase();
-    let mut i = 0;
-    let bytes = html.as_bytes();
-    while i < bytes.len() {
-        if lower[i..].starts_with("<script") || lower[i..].starts_with("<style") {
-            skip_depth += 1;
-        }
-        if lower[i..].starts_with("</script") || lower[i..].starts_with("</style") {
-            skip_depth = (skip_depth - 1).max(0);
-        }
-        let c = bytes[i] as char;
-        if c == '<' {
+    for (i, ch) in html.char_indices() {
+        if ch == '<' {
+            let head = &html[i..];
+            let ci = |p: &str| {
+                head.len() >= p.len() && head.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+            };
+            if ci("<script") || ci("<style") {
+                skip_depth += 1;
+            } else if ci("</script") || ci("</style") {
+                skip_depth = (skip_depth - 1).max(0);
+            }
             in_tag = true;
-        } else if c == '>' {
+        } else if ch == '>' {
             in_tag = false;
             out.push(' ');
         } else if !in_tag && skip_depth == 0 {
-            out.push(c);
+            out.push(ch);
         }
-        i += 1;
     }
     let out = out
         .replace("&amp;", "&")
@@ -535,6 +552,15 @@ enum Status {
     Error(String),
 }
 
+/// Token-limit presets offered in the load panel (KV-cache capacity). More
+/// tokens = longer memory, but more VRAM/RAM.
+const CTX_CHOICES: [usize; 6] = [1024, 2048, 4096, 8192, 16384, 32768];
+
+/// Human-readable bytes as GB (1 GB = 2^30).
+fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
+}
+
 enum Role {
     User,
     Assistant,
@@ -606,7 +632,17 @@ struct OverflowApp {
     dl_sel: usize,
     gen: GenCfg,
     show_thinking: bool,
+    /// Detected GPU name (from nvidia-smi), shown in Details; None if no GPU.
+    gpu_name: Option<String>,
+    /// A model chosen in the list but not loaded yet (shown in the load panel).
+    pending_model: Option<PathBuf>,
+    /// VRAM estimate for `pending_model`, read from its GGUF header.
+    mem: Option<MemEstimate>,
+    /// Chosen token limit (KV-cache capacity) for the next load.
+    n_ctx: usize,
     gen_tokens: u32,
+    /// When the current model load started (for load progress + ETA).
+    load_start: Option<Instant>,
     only: OnlyChatState,
     stream: Stream,
     server: ServerState,
@@ -617,14 +653,17 @@ struct OverflowApp {
 
 impl OverflowApp {
     fn new(model_path: Option<PathBuf>) -> Self {
-        let (handle, current_model, status) = match model_path {
-            Some(p) => (Some(worker::spawn(p.clone())), Some(p.display().to_string()), Status::Loading),
-            None => (None, None, Status::NoModel),
+        let gpu_name = hw::gpu_name();
+        // No auto-load: a model given on the command line is pre-selected in the
+        // load panel, but the user picks the token limit and device, then loads.
+        let (pending_model, mem) = match &model_path {
+            Some(p) => (Some(p.clone()), GgufFile::open(p).ok().and_then(|g| poezi_model::estimate_mem(&g))),
+            None => (None, None),
         };
-        let app = OverflowApp {
-            handle,
-            current_model,
-            status,
+        let mut app = OverflowApp {
+            handle: None,
+            current_model: None,
+            status: Status::NoModel,
             transcript: Vec::new(),
             input: String::new(),
             settings_open: false,
@@ -637,12 +676,17 @@ impl OverflowApp {
             dev: false,
             console: Vec::new(),
             raw_stream: String::new(),
+            load_start: None,
             learn: LearnState::default(),
             trainer: None,
             dl_url: String::new(),
             dl_sel: 1,
             gen: GenCfg::default(),
             show_thinking: true,
+            gpu_name,
+            pending_model,
+            mem,
+            n_ctx: 4096,
             gen_tokens: 0,
             only: OnlyChatState::default(),
             stream: Stream::Chat,
@@ -650,6 +694,9 @@ impl OverflowApp {
             research_rx: None,
             research_query: String::new(),
         };
+        if app.pending_model.is_some() {
+            app.log("pick a token limit and a device below, then press Load");
+        }
         app.sync_server_bridge();
         app
     }
@@ -669,7 +716,21 @@ impl OverflowApp {
             return;
         }
         self.sync_server_bridge();
-        match server::start(self.server.bridge.clone(), self.gen.clone()) {
+        // Seed the server's shared settings from the GUI's current permissions
+        // and generation knobs; the phone can change them afterwards.
+        if let Ok(mut c) = self.server.cfg.lock() {
+            c.perms = worker::perms(
+                self.perms.sandbox,
+                self.perms.fs_read,
+                self.perms.fs_write,
+                self.perms.shell,
+                self.perms.network,
+                &self.perms.workspace,
+                self.perms.confirm_outside,
+            );
+            c.gen = self.gen.clone();
+        }
+        match server::start(self.server.bridge.clone(), self.server.cfg.clone(), self.hw.clone()) {
             Ok(h) => {
                 // The URL (with its secret token) is shown separately as a
                 // selectable field, not folded into the status line.
@@ -680,17 +741,154 @@ impl OverflowApp {
         }
     }
 
-    /// Load a model (respawns the worker). Frees any previous one first.
-    fn load_model(&mut self, path: PathBuf) {
+    /// Load a model with explicit options (respawns the worker). Frees any
+    /// previous one first.
+    fn load_model(&mut self, path: PathBuf, opts: LoadOpts) {
         self.handle = None; // drop old worker -> frees its model/VRAM
-        self.log(format!("loading model {}", path.display()));
-        self.handle = Some(worker::spawn(path.clone()));
+        self.load_start = Some(Instant::now());
+        let where_ = match opts.gpu_layers {
+            Some(0) => "CPU".to_string(),
+            Some(n) => format!("GPU ({n} layers)"),
+            None => "GPU (auto)".to_string(),
+        };
+        self.log(format!("loading {} · {} tokens · {}", path.display(), opts.n_ctx, where_));
+        self.handle = Some(worker::spawn(path.clone(), opts));
         self.current_model = Some(path.display().to_string());
+        self.pending_model = None;
         self.status = Status::Loading;
         self.backend = "…".into();
         self.transcript.clear();
         self.sync_server_bridge();
         self.tab = Tab::Chat;
+    }
+
+    /// Select a model (does not load it): compute its memory estimate and show
+    /// the load panel so the user can pick a token limit and device.
+    fn select_model(&mut self, path: PathBuf) {
+        self.mem = GgufFile::open(&path).ok().and_then(|g| poezi_model::estimate_mem(&g));
+        self.pending_model = Some(path);
+    }
+
+    /// Turn the current choices (pending model, token limit, device) into load
+    /// options and start loading.
+    fn load_pending(&mut self, gpu_layers: Option<usize>) {
+        if let Some(p) = self.pending_model.clone() {
+            self.load_model(p, LoadOpts { n_ctx: self.n_ctx, gpu_layers });
+        }
+    }
+
+    /// The load panel: pick a token limit, see what it costs in VRAM (and how
+    /// much spills to RAM), then load on GPU, split, or CPU.
+    fn load_panel(&mut self, ui: &mut egui::Ui) {
+        let busy = self.trainer.is_some();
+        let has_gpu = self.gpu_name.is_some();
+        ui.add_space(8.0);
+        let name = self
+            .pending_model
+            .as_ref()
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()))
+            .unwrap_or("model")
+            .to_string();
+        ui.label(egui::RichText::new(format!("Set up: {name}")).color(AMBER).size(12.0).strong());
+
+        // `Some(gpu_layers)` means "start loading with this split"; collected here
+        // and acted on after the UI so we don't borrow self inside the widgets.
+        let mut action: Option<Option<usize>> = None;
+
+        let Some(mem) = self.mem else {
+            ui.label(egui::RichText::new("Can't read this file's size — you can still load it.").color(MUTED).size(10.5));
+            ui.horizontal(|ui| {
+                if has_gpu && ui.add_enabled(!busy, egui::Button::new("Load on GPU")).clicked() {
+                    action = Some(None);
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Load on CPU")).clicked() {
+                    action = Some(Some(0));
+                }
+            });
+            if let Some(a) = action {
+                self.load_pending(a);
+            }
+            return;
+        };
+
+        // Token limit: one selectable row per choice, each showing its cost.
+        ui.label(egui::RichText::new("Token limit — how much the AI can keep in mind at once:").color(MUTED).size(11.0));
+        let mut chosen = self.n_ctx;
+        for &c in &CTX_CHOICES {
+            let lbl = format!("{}k tokens", c / 1024);
+            let need = mem.vram_full(c);
+            let (txt, col) = match (mem.fits_full(c), mem.gpu_layers_fit(c)) {
+                (Some(true), _) => (format!("{lbl}  ·  {} VRAM  ✓ fits on GPU", gb(need)), GREEN),
+                (Some(false), Some(0)) => {
+                    (format!("{lbl}  ·  needs {} — won't fit, runs on CPU", gb(need)), RED)
+                }
+                (Some(false), Some(k)) => (
+                    format!("{lbl}  ·  needs {} → {k}/{} on GPU, rest in RAM (slower)", gb(need), mem.n_layer),
+                    AMBER,
+                ),
+                _ => (format!("{lbl}  ·  about {} VRAM", gb(need)), MUTED),
+            };
+            ui.selectable_value(&mut chosen, c, egui::RichText::new(txt).color(col).size(11.0));
+        }
+        self.n_ctx = chosen;
+
+        let n_ctx = self.n_ctx;
+        let fits = mem.fits_full(n_ctx);
+        let fit_layers = mem.gpu_layers_fit(n_ctx);
+        if let Some(free) = mem.free_vram {
+            ui.label(egui::RichText::new(format!("Free VRAM now: {}", gb(free))).color(MUTED).size(10.5));
+        }
+
+        ui.add_space(4.0);
+        // Device buttons adapt to whether the model fits.
+        match (has_gpu, fits, fit_layers) {
+            (false, _, _) => {
+                ui.label(egui::RichText::new("No NVIDIA GPU found — this runs on the CPU.").color(MUTED).size(10.5));
+                if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Load on CPU").color(GREEN))).clicked() {
+                    action = Some(Some(0));
+                }
+            }
+            (true, Some(true), _) | (true, None, _) => {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Load on GPU").color(GREEN))).clicked() {
+                        action = Some(Some(mem.n_layer));
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new("CPU instead")).clicked() {
+                        action = Some(Some(0));
+                    }
+                });
+            }
+            (true, Some(false), Some(k)) => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "This doesn't fully fit in VRAM at {n_ctx} tokens. Put the rest in RAM, or pick a smaller token limit."
+                    ))
+                    .color(AMBER)
+                    .size(10.5),
+                );
+                ui.horizontal(|ui| {
+                    if k > 0
+                        && ui
+                            .add_enabled(!busy, egui::Button::new(egui::RichText::new(format!("GPU + RAM ({k}/{} on GPU)", mem.n_layer)).color(AMBER)))
+                            .clicked()
+                    {
+                        action = Some(Some(k));
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("CPU only").color(GREEN))).clicked() {
+                        action = Some(Some(0));
+                    }
+                });
+            }
+            (true, Some(false), None) => {
+                if ui.add_enabled(!busy, egui::Button::new("Load on CPU")).clicked() {
+                    action = Some(Some(0));
+                }
+            }
+        }
+
+        if let Some(a) = action {
+            self.load_pending(a);
+        }
     }
 
     /// Unload the current model and free its memory.
@@ -880,10 +1078,21 @@ impl OverflowApp {
             let text = match out {
                 Ok(o) if o.status.success() => {
                     let t = html_to_text(&String::from_utf8_lossy(&o.stdout));
-                    t.chars().take(2000).collect()
+                    // Drop DuckDuckGo's region/time-filter nav so the model sees
+                    // the actual hits: they start right after "Past Year".
+                    let t = match t.find("Past Year") {
+                        Some(p) => t[p + "Past Year".len()..].trim().to_string(),
+                        None => t,
+                    };
+                    let t: String = t.chars().take(2500).collect();
+                    if t.trim().is_empty() {
+                        "(web search returned nothing usable)".to_string()
+                    } else {
+                        t
+                    }
                 }
                 Ok(o) => format!("(web search failed: curl exit {:?})", o.status.code()),
-                Err(e) => format!("(web search failed: {e})"),
+                Err(e) => format!("(web search failed: {e} — is curl installed?)"),
             };
             let _ = tx.send(text);
         });
@@ -1085,6 +1294,15 @@ impl OverflowApp {
 
     /// Ask the worker to count tokens for the active chat: the whole history vs.
     /// what the current context mode would actually feed the model.
+    /// Search every open database for knowledge relevant to `query` and merge
+    /// the hits, so it doesn't matter which DB the active chat lives in. The
+    /// char budget is split across the open DBs.
+    fn memory_over_dbs(dbs: &[OpenDb], query: &str) -> Option<String> {
+        let budget = (8000 / dbs.len().max(1)).max(3000);
+        let parts: Vec<String> = dbs.iter().filter_map(|od| od.db.memory_context(query, budget)).collect();
+        if parts.is_empty() { None } else { Some(parts.join("\n")) }
+    }
+
     fn only_request_tokens(&mut self) {
         let (Some(handle), Some((di, id))) = (&self.handle, self.only.active) else { return };
         let full: String = self.only.msgs.iter().map(|m| m.text.clone()).collect::<Vec<_>>().join("\n");
@@ -1092,7 +1310,7 @@ impl OverflowApp {
         let summary = db.summary(id).map(|(s, _)| s);
         let query = self.only.msgs.last().map(|m| m.text.clone()).unwrap_or_default();
         let (asm, turns) = chatdb::assemble(&self.only.msgs, self.only.active_mode, summary.as_deref());
-        let mut ctx = compose_prelude(db.memory_context(&query, 8000), asm);
+        let mut ctx = compose_prelude(Self::memory_over_dbs(&self.only.dbs, &query), asm);
         for (_, t) in &turns {
             ctx.push('\n');
             ctx.push_str(t);
@@ -1121,7 +1339,7 @@ impl OverflowApp {
         db.set_mode(id, mode);
         let summary = db.summary(id).map(|(s, _)| s);
         let (asm, turns) = chatdb::assemble(&self.only.msgs, mode, summary.as_deref());
-        let mem = db.memory_context(&text, 8000);
+        let mem = Self::memory_over_dbs(&self.only.dbs, &text);
         let prelude = Some(compose_prelude(mem, asm));
         self.stream = Stream::OnlyChat;
         self.only.stream_buf.clear();
@@ -1168,10 +1386,32 @@ impl OverflowApp {
         }
         for ev in events {
             match ev {
-                FromWorker::Ready => self.status = Status::Ready,
+                FromWorker::Ready => {
+                    if let Some(t0) = self.load_start.take() {
+                        self.log(format!("[load] done in {:.1}s", t0.elapsed().as_secs_f32()));
+                    }
+                    self.status = Status::Ready;
+                }
+                FromWorker::LoadProgress { done, total } => {
+                    // Show how much is loaded and roughly how long is left.
+                    let gb = |b: u64| b as f32 / 1_073_741_824.0;
+                    let pct = if total > 0 { done as f32 / total as f32 * 100.0 } else { 0.0 };
+                    let eta = self.load_start.map(|t0| {
+                        let el = t0.elapsed().as_secs_f32();
+                        if done > 0 { el * (total.saturating_sub(done)) as f32 / done as f32 } else { 0.0 }
+                    });
+                    let eta_s = match eta {
+                        Some(s) if s >= 1.0 => format!(", ~{s:.0}s left"),
+                        _ => String::new(),
+                    };
+                    self.log(format!("[load] {pct:.0}%  ({:.1}/{:.1} GB){eta_s}", gb(done), gb(total)));
+                }
                 FromWorker::Backend(b) => {
                     self.log(format!("[backend] {b}"));
                     self.backend = b;
+                }
+                FromWorker::Note(n) => {
+                    self.log(format!("[note] {n}"));
                 }
                 FromWorker::Token(s) => {
                     if self.stream == Stream::OnlyChat {
@@ -1281,16 +1521,26 @@ impl OverflowApp {
                 if models.is_empty() {
                     ui.label(egui::RichText::new("No models yet").color(MUTED).size(11.0));
                 }
-                let mut to_load: Option<PathBuf> = None;
+                let mut to_select: Option<PathBuf> = None;
                 for m in &models {
                     let name = m.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    let is_cur = current.as_deref() == Some(m.display().to_string().as_str());
-                    if ui.selectable_label(is_cur, egui::RichText::new(name).size(11.5).color(if is_cur { AMBER } else { FG })).clicked() {
-                        to_load = Some(m.clone());
+                    let md = m.display().to_string();
+                    let is_cur = current.as_deref() == Some(md.as_str());
+                    let is_pending = self.pending_model.as_ref().map(|p| p.display().to_string()) == Some(md);
+                    let col = if is_cur { GREEN } else if is_pending { AMBER } else { FG };
+                    let mark = if is_cur { "● " } else { "" };
+                    if ui.selectable_label(is_pending, egui::RichText::new(format!("{mark}{name}")).size(11.5).color(col)).clicked() {
+                        to_select = Some(m.clone());
                     }
                 }
-                if let Some(p) = to_load {
-                    self.load_model(p);
+                if let Some(p) = to_select {
+                    self.select_model(p);
+                }
+
+                // ---- load panel: token limit + fit + device (shown once a model
+                // is picked but not yet loaded) ----
+                if self.pending_model.is_some() {
+                    self.load_panel(ui);
                 }
                 ui.add_space(4.0);
                 if ui.add_enabled(self.handle.is_some(), egui::Button::new("Unload model (free up memory)")).clicked() {
@@ -1342,7 +1592,7 @@ impl OverflowApp {
                 meter(ui, "CPU", hw.proc_cpu_pct / 100.0, format!("{:.0}%", hw.proc_cpu_pct), GREEN);
                 let rssf = if hw.mem_total_gb > 0.0 { hw.proc_rss_gb / hw.mem_total_gb } else { 0.0 };
                 meter(ui, "RAM", rssf, format!("{:.2} GB", hw.proc_rss_gb), AMBER);
-                let bcol = if self.backend == "GPU" { GREEN } else { MUTED };
+                let bcol = if self.backend.starts_with("GPU") { GREEN } else { MUTED };
                 ui.label(
                     egui::RichText::new(format!("running on: {}", self.backend))
                         .color(bcol)
@@ -1354,6 +1604,9 @@ impl OverflowApp {
                 meter(ui, "CPU", hw.cpu_pct / 100.0, format!("{:.0}%", hw.cpu_pct), GREEN);
                 let memf = if hw.mem_total_gb > 0.0 { hw.mem_used_gb / hw.mem_total_gb } else { 0.0 };
                 meter(ui, "RAM", memf, format!("{:.1} / {:.1} GB", hw.mem_used_gb, hw.mem_total_gb), AMBER);
+                if let Some(name) = &self.gpu_name {
+                    ui.label(egui::RichText::new(name).color(FG).size(11.0));
+                }
                 match (hw.gpu_pct, hw.vram_used_mb, hw.vram_total_mb) {
                     (Some(g), Some(vu), Some(vt)) => {
                         meter(ui, "GPU", g / 100.0, format!("{g:.0}%"), GREEN);
@@ -1483,7 +1736,17 @@ impl OverflowApp {
             .show(ui, |ui| {
                 ui.set_min_width(340.0);
                 section(ui, "Live info");
-                ui.label(egui::RichText::new(format!("runs on   {}", self.backend)).color(GREEN).size(12.0));
+                let bcol = if self.backend.starts_with("GPU") { GREEN } else { AMBER };
+                ui.label(egui::RichText::new(format!("runs on   {}", self.backend)).color(bcol).size(12.0));
+                // What hardware OVERFLOW detected at startup.
+                ui.label(
+                    egui::RichText::new(format!(
+                        "hardware  {}",
+                        self.gpu_name.as_deref().unwrap_or("no NVIDIA GPU (CPU only)")
+                    ))
+                    .color(MUTED)
+                    .size(11.0),
+                );
                 let generating = matches!(self.status, Status::Generating);
                 // Live speed + token count while the model is producing output.
                 let spd = egui::RichText::new(format!("speed     {:.1} tok/s", self.tok_per_s))
@@ -1672,7 +1935,7 @@ impl OverflowApp {
                                             });
                                         }
                                     }
-                                    let mut body = answer.to_string();
+                                    let mut body = strip_answer_tags(answer);
                                     if active {
                                         body.push('▌');
                                     }
@@ -2186,7 +2449,10 @@ impl OverflowApp {
                         self.start_env("train + build", "bash", vec!["training/build_overflow_wt.sh".into()], envs);
                     }
                     if ui.add_enabled(!busy, egui::Button::new("3 · Load the new model")).clicked() {
-                        self.load_model(Self::cwd().join("models").join(&self.learn.out_name));
+                        // Select it and jump to Settings so the user picks the
+                        // token limit and device in the load panel.
+                        self.select_model(Self::cwd().join("models").join(&self.learn.out_name));
+                        self.settings_open = true;
                     }
                 });
                 ui.add_space(4.0);

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use poezi_gguf::GgufFile;
 use poezi_model::agent::{self, Event, GenCfg, Host, Perms, ToolCall};
-use poezi_model::{Model, Tokenizer};
+use poezi_model::{LoadOpts, Model, Tokenizer};
 
 /// UI -> worker.
 pub enum ToWorker {
@@ -28,20 +28,25 @@ pub enum ToWorker {
     /// OnlyChat: count tokens in the whole chat and in the context a turn would
     /// actually feed; replies with `OnlyChatTokens`.
     CountTokens { full: String, ctx: String },
-    /// Server mode: a plain chat turn from the web UI; the full reply is sent
+    /// Server mode: a chat turn from the web UI. When `perms` grant tools the
+    /// agent runs with them; otherwise it's a plain chat. The full reply is sent
     /// back on `reply` (no GUI streaming).
-    ServerChat { turns: Vec<(bool, String)>, gen: GenCfg, reply: Sender<String> },
+    ServerChat { turns: Vec<(bool, String)>, perms: Perms, gen: GenCfg, reply: Sender<String> },
 }
 
 /// worker -> UI.
 pub enum FromWorker {
     Ready,
     Backend(String),
+    /// A one-off informational line for the Log (e.g. why the GPU was skipped).
+    Note(String),
     Token(String),
     ToolCall(String),
     ToolResult(String),
     Approval { desc: String, outside: bool },
     Stats { tok_per_s: f32, produced: u32 },
+    /// Model loading: bytes streamed into VRAM so far, out of the total.
+    LoadProgress { done: u64, total: u64 },
     /// OnlyChat: a summary produced by `Summarize`, to be stored by the UI.
     Summary(String),
     /// OnlyChat: (whole-chat tokens, context tokens) for the active chat.
@@ -56,13 +61,13 @@ pub struct Handle {
     pub cancel: Arc<AtomicBool>,
 }
 
-pub fn spawn(model_path: PathBuf) -> Handle {
+pub fn spawn(model_path: PathBuf, opts: LoadOpts) -> Handle {
     let (tx_in, rx_in) = std::sync::mpsc::channel();
     let (tx_out, rx_out) = std::sync::mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_worker = Arc::clone(&cancel);
     thread::spawn(move || {
-        if let Err(e) = run(model_path, &rx_in, &tx_out, &cancel_worker) {
+        if let Err(e) = run(model_path, opts, &rx_in, &tx_out, &cancel_worker) {
             let _ = tx_out.send(FromWorker::Error(e));
         }
     });
@@ -71,17 +76,32 @@ pub fn spawn(model_path: PathBuf) -> Handle {
 
 fn run(
     path: PathBuf,
+    opts: LoadOpts,
     rx_in: &Receiver<ToWorker>,
     tx_out: &Sender<FromWorker>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let gguf = GgufFile::open(&path).map_err(|e| format!("open model: {e}"))?;
     let tok = Tokenizer::from_gguf(&gguf).map_err(|e| format!("tokenizer: {e}"))?;
-    let model = Model::load(&gguf).map_err(|e| format!("load model: {e}"))?;
+    let model = Model::load_with_opts(&gguf, opts, &mut |p| {
+        let _ = tx_out.send(FromWorker::LoadProgress { done: p.done_bytes, total: p.total_bytes });
+    })
+    .map_err(|e| format!("load model: {e}"))?;
     let mut cache = model.new_cache();
     let mut first_turn = true;
 
-    let _ = tx_out.send(FromWorker::Backend(model.backend().to_string()));
+    // Friendly backend label with the layer split so the UI can show exactly
+    // what was chosen (all on GPU, a GPU/CPU split, or pure CPU).
+    let label = match model.backend() {
+        "GPU" => format!("GPU ({} layers)", model.n_layers()),
+        "GPU+CPU" => format!("GPU+CPU ({}/{} layers on GPU)", model.gpu_layers(), model.n_layers()),
+        _ => "CPU".to_string(),
+    };
+    let _ = tx_out.send(FromWorker::Backend(label));
+    // If a GPU was wanted but failed, tell the user why it is on the CPU.
+    if let Some(e) = model.gpu_error() {
+        let _ = tx_out.send(FromWorker::Note(format!("GPU not available — {e}; running on CPU")));
+    }
     let _ = tx_out.send(FromWorker::Ready);
 
     while let Ok(msg) = rx_in.recv() {
@@ -131,17 +151,56 @@ fn run(
                 let ctx = tok.encode(&ctx, false, true).len();
                 let _ = tx_out.send(FromWorker::OnlyChatTokens { full, ctx });
             }
-            ToWorker::ServerChat { turns, gen, reply } => {
+            ToWorker::ServerChat { turns, perms, gen, reply } => {
                 cancel.store(false, Ordering::Relaxed);
+                let tools = !perms.sandbox
+                    && (perms.fs_read || perms.fs_write || perms.shell || perms.network);
                 let mut c = model.new_cache();
-                let mut silent = SilentHost;
-                let out = agent::chat_plain(&model, &tok, &mut c, &turns, None, &gen, cancel, &mut silent);
-                let _ = reply.send(out);
+                if tools {
+                    // Run the full tool-using agent over the conversation. The
+                    // earlier turns are fed as context, then the newest question.
+                    let (last_user, history) = match turns.split_last() {
+                        Some((l, h)) => (l.1.clone(), h),
+                        None => (String::new(), &[][..]),
+                    };
+                    let mut query = String::new();
+                    for (is_user, t) in history {
+                        query.push_str(if *is_user { "User: " } else { "Assistant: " });
+                        query.push_str(t);
+                        query.push('\n');
+                    }
+                    query.push_str(&last_user);
+                    // The phone set these permissions deliberately, so tool calls
+                    // they allow are auto-approved (no interactive prompt here).
+                    let mut host = ServerCollect { out: String::new() };
+                    agent::run(&model, &tok, &mut c, true, &query, &perms, &gen, cancel, &mut host, 20);
+                    let _ = reply.send(host.out);
+                } else {
+                    let mut silent = SilentHost;
+                    let out = agent::chat_plain(&model, &tok, &mut c, &turns, None, &gen, cancel, &mut silent);
+                    let _ = reply.send(out);
+                }
             }
             ToWorker::Approve(_) => {}
         }
     }
     Ok(())
+}
+
+/// Server-mode host: collects the visible answer text (token stream) and
+/// auto-approves tool calls the phone's permissions allow.
+struct ServerCollect {
+    out: String,
+}
+impl Host for ServerCollect {
+    fn approve(&mut self, _call: &ToolCall, _outside: bool) -> bool {
+        true
+    }
+    fn event(&mut self, ev: Event) {
+        if let Event::Token(s) = ev {
+            self.out.push_str(&s);
+        }
+    }
 }
 
 /// Discards all events — used when generating a summary we don't want streamed

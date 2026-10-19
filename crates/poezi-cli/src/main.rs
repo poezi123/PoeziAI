@@ -295,6 +295,72 @@ fn ffnquality(path: &str, n: usize) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// A/B benchmark of the CATS sparse FFN: for the dense baseline and each keep
+/// fraction, measure BOTH speed (CPU tok/s over the same work) and quality
+/// (top1-agreement with the dense output). The honest answer to "does skipping
+/// neurons actually save compute, and at what cost".
+///
+/// All on the CPU path, because that is the only place the sparse FFN exists —
+/// the GPU always runs dense. Generation ignores EOS so every row does exactly
+/// `n` tokens of work and the timings are comparable.
+fn ffnbench(path: &str, prompt: &str, n: usize) -> ExitCode {
+    use std::time::Instant;
+    let gguf = match poezi_gguf::GgufFile::open(path) {
+        Ok(f) => f, Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let tok = match poezi_model::Tokenizer::from_gguf(&gguf) {
+        Ok(t) => t, Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    // CPU-only benchmark: skip the GPU entirely (gpu_layers = 0) so we don't try
+    // to load CUDA, and so the sparse CPU FFN path is actually exercised.
+    let opts = poezi_model::LoadOpts { n_ctx: 4096, gpu_layers: Some(0) };
+    let mut model = match poezi_model::Model::load_with_opts(&gguf, opts, &mut |_| {}) {
+        Ok(m) => m, Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+    };
+    let ids = tok.encode(prompt, tok.add_bos, true);
+    eprintln!("CPU sparse-FFN benchmark: {} prompt tokens, {n} new per row…\n", ids.len());
+
+    // Warm-up: one dense forward faults every weight into the OS page cache, so
+    // the dense row below isn't unfairly penalised for the cold disk read that
+    // the later (warm) sparse rows would otherwise skip. Makes the speedups honest.
+    model.set_ffn_keep(1.0);
+    eprintln!("warming the page cache (one dense pass)…");
+    let _ = model.greedy_cpu(&ids, 1, None, None);
+
+    // Dense reference: time it and keep its output as the quality yardstick.
+    let t = Instant::now();
+    let dense = model.greedy_cpu(&ids, n, None, None);
+    let dense_s = t.elapsed().as_secs_f64();
+    let nd = dense.len().max(1);
+    let dense_tps = dense.len() as f64 / dense_s;
+
+    println!("keep%   tok/s    speedup   top1-agreement   note");
+    println!("100%   {dense_tps:>6.2}    1.00x    {nd:>3}/{nd:<3} (100%)   dense (baseline)");
+    for &keep in &[0.75f32, 0.5, 0.25] {
+        model.set_ffn_keep(keep);
+        // Speed: same work (n tokens, EOS ignored), realistic CATS path.
+        let t = Instant::now();
+        let out = model.greedy_cpu(&ids, n, None, None);
+        let s = t.elapsed().as_secs_f64();
+        let tps = out.len() as f64 / s;
+        // Quality: how often the sparse path's argmax matches the dense output.
+        let agree = model.teacher_forced_agreement(&ids, &dense, None);
+        println!(
+            "{:>3.0}%   {tps:>6.2}    {:>4.2}x    {agree:>3}/{nd:<3} ({:.0}%)",
+            keep * 100.0,
+            tps / dense_tps,
+            agree as f64 / nd as f64 * 100.0,
+        );
+    }
+    println!(
+        "\nspeedup > 1.00x means the sparse FFN is genuinely faster on CPU.\n\
+         top1-agreement = share of positions where sparse argmax == dense argmax.\n\
+         Note: the gate projection is still computed in full; only the up-projection\n\
+         is masked, so the ceiling is well under 2x. GPU is unaffected (always dense)."
+    );
+    ExitCode::SUCCESS
+}
+
 /// Time a pure-CPU greedy generation (forces the CPU forward) and print the
 /// text + tok/s. Compare the text against `poezi gen` (GPU) to confirm the SIMD
 /// CPU path still produces correct output.
@@ -765,6 +831,20 @@ fn main() -> ExitCode {
             let n: usize = args.iter().position(|a| a == "-n")
                 .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(48);
             ffnquality(path, n)
+        }
+        Some("ffnbench") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: poezi ffnbench <model.gguf> [prompt] [-n N]");
+                return ExitCode::FAILURE;
+            };
+            let prompt = args
+                .get(2)
+                .filter(|s| !s.starts_with('-'))
+                .map(String::as_str)
+                .unwrap_or("Write a Rust function that reverses a linked list, then explain how it works step by step.");
+            let n: usize = args.iter().position(|a| a == "-n")
+                .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(64);
+            ffnbench(path, prompt, n)
         }
         Some("cpumatbench") => {
             let in_dim: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3584);

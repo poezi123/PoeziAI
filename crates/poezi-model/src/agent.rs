@@ -180,7 +180,7 @@ pub fn run(
             query
         )
     } else {
-        format!("<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", query)
+        format!("<|im_end|>\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n")
     };
     feed(&opening, cache, &mut last, &mut ctx);
 

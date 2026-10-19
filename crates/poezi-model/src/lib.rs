@@ -12,7 +12,10 @@
 pub mod agent;
 pub mod model;
 pub mod tokenizer;
-pub use model::{Config, KvCache, Model, ModelError, SkewStats, SparsityStats, TransferStats};
+pub use model::{
+    estimate_mem, Config, KvCache, LoadOpts, LoadProgress, MemEstimate, Model, ModelError,
+    SkewStats, SparsityStats, TransferStats,
+};
 pub use tokenizer::{Tokenizer, TokenizerError};
 
 /// Crate version string.

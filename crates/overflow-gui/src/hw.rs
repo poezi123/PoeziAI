@@ -136,6 +136,25 @@ fn read_mem() -> Option<(f32, f32)> {
     Some(((total_kb - avail_kb) / gb, total_kb / gb))
 }
 
+/// The GPU model name via nvidia-smi (e.g. "NVIDIA GeForce RTX 3060"), or None
+/// if there is no NVIDIA GPU / nvidia-smi. Queried once at startup — it does not
+/// change while the app runs.
+pub fn gpu_name() -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// (util%, vram_used_mb, vram_total_mb) via nvidia-smi, or Nones if unavailable.
 fn read_gpu() -> (Option<f32>, Option<f32>, Option<f32>) {
     let out = std::process::Command::new("nvidia-smi")

@@ -4,7 +4,7 @@
 # installs a launcher + desktop entry. Models are downloaded on first run into
 # the user's data dir — nothing large is shipped in the package.
 pkgname=overflow
-pkgver=0.2.5
+pkgver=0.2.6
 pkgrel=1
 pkgdesc="OVERFLOW — S1BERIA's local cybersecurity AI (from-scratch Rust LLM engine + GUI)"
 arch=('x86_64')

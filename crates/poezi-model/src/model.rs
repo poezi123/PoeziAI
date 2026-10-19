@@ -100,6 +100,9 @@ pub struct Model<'a> {
     /// = full (default). `< 1.0` skips the up-projection of low-activation
     /// neurons (CATS-style), speeding the CPU/offload path near-losslessly.
     ffn_keep: f32,
+    /// Set when a GPU was wanted (n_gpu > 0) but the backend failed to build, so
+    /// the model fell back to CPU. Lets the UI explain *why* it is on CPU.
+    gpu_error: Option<String>,
 }
 
 /// Key/value cache. On CPU it grows per layer (kv_dim floats/position); on GPU
@@ -194,6 +197,28 @@ pub struct SkewStats {
 
 impl<'a> Model<'a> {
     pub fn load(g: &'a GgufFile) -> Result<Self> {
+        Self::load_with_progress(g, &mut |_| {})
+    }
+
+    /// Like `load`, but reports upload progress. Uses the default load options.
+    pub fn load_with_progress(
+        g: &'a GgufFile,
+        progress: &mut dyn FnMut(LoadProgress),
+    ) -> Result<Self> {
+        Self::load_with_opts(g, LoadOpts::default(), progress)
+    }
+
+    /// Load the model with explicit options and upload-progress reporting.
+    ///
+    /// `opts.n_ctx` is the token limit (KV-cache capacity) and `opts.gpu_layers`
+    /// chooses the GPU/CPU split: `None` auto-fits to free VRAM, `Some(n)` forces
+    /// `n` layers on the GPU (`0` = pure CPU). Progress fires once per uploaded
+    /// layer — the slow part when the file sits on a slow disk.
+    pub fn load_with_opts(
+        g: &'a GgufFile,
+        opts: LoadOpts,
+        progress: &mut dyn FnMut(LoadProgress),
+    ) -> Result<Self> {
         let arch = g
             .meta("general.architecture")
             .and_then(MetaValue::as_str)
@@ -293,21 +318,50 @@ impl<'a> Model<'a> {
             rms_eps,
         };
 
-        // How many layers to keep on the GPU. OVERFLOW_GPU_LAYERS forces a count
-        // (manual / testing); otherwise auto-size to free VRAM so a model bigger
-        // than VRAM still loads (GPU prefix + CPU tail). Default when VRAM is
-        // unknown: all layers (full GPU, current behavior).
-        let n_gpu = match std::env::var("OVERFLOW_GPU_LAYERS").ok().and_then(|s| s.parse::<usize>().ok()) {
+        // Token limit (KV-cache capacity). Clamp to something sane.
+        let kv_cap = opts.n_ctx.clamp(256, 131_072);
+        // How many layers to keep on the GPU. `Some(n)` forces a count (the UI's
+        // explicit GPU/CPU/split choice); `None` auto-sizes to free VRAM so a
+        // model bigger than VRAM still loads (GPU prefix + CPU tail).
+        let n_gpu = match opts.gpu_layers {
             Some(n) => n.min(n_layer),
-            None => auto_gpu_layers(&cfg, &layers, &output),
+            None => auto_gpu_layers(&cfg, &layers, &output, kv_cap),
         };
 
         // Build the resident GPU model (uploads the first `n_gpu` layers + the
         // final norm & output to VRAM). Falls back to CPU if GPU/libs absent.
-        let gpu = GpuBackend::new()
-            .ok()
-            .map(Arc::new)
-            .and_then(|be| build_gpu(&be, &cfg, &out_norm, &output, &layers, n_gpu).ok().map(Arc::new));
+        // Total bytes that will stream into VRAM (output + first n_gpu layers),
+        // so the progress callback can show a percentage and an ETA.
+        let total_upload: u64 = out_norm.len() as u64 * 4
+            + output.data.len() as u64
+            + layers[..n_gpu].iter().map(layer_bytes).sum::<u64>();
+        // Try to build the GPU model when any layers are requested (n_gpu > 0).
+        // On failure (no CUDA libs, out of VRAM, driver mismatch) keep the reason
+        // so the UI can explain why it fell back to CPU instead of silently doing
+        // so. n_gpu == 0 means the user chose CPU, so we don't even try.
+        let mut gpu_error: Option<String> = None;
+        let gpu = if n_gpu == 0 {
+            None
+        } else {
+            match GpuBackend::new() {
+                Ok(be) => {
+                    let be = Arc::new(be);
+                    match build_gpu(&be, &cfg, &out_norm, &output, &layers, n_gpu, kv_cap, &mut |done| {
+                        progress(LoadProgress { done_bytes: done, total_bytes: total_upload });
+                    }) {
+                        Ok(w) => Some(Arc::new(w)),
+                        Err(e) => {
+                            gpu_error = Some(format!("{e}"));
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    gpu_error = Some(format!("{e}"));
+                    None
+                }
+            }
+        };
         let gpu_layers = if gpu.is_some() { n_gpu } else { 0 };
 
         // Activation-sparsity keep fraction for the CPU path (opt-in). Only a
@@ -327,6 +381,7 @@ impl<'a> Model<'a> {
             gpu,
             gpu_layers,
             ffn_keep,
+            gpu_error,
         })
     }
 
@@ -342,6 +397,18 @@ impl<'a> Model<'a> {
     /// Number of GPU-resident layers (for reporting the offload split).
     pub fn gpu_layers(&self) -> usize {
         self.gpu_layers
+    }
+
+    /// Total transformer layers in the model (for reporting the offload split).
+    pub fn n_layers(&self) -> usize {
+        self.cfg.n_layer
+    }
+
+    /// Why the GPU was not used, if a GPU backend was requested but failed to
+    /// initialize (missing CUDA libs, out of VRAM, driver mismatch). `None` when
+    /// the GPU is in use or was never attempted (CPU mode).
+    pub fn gpu_error(&self) -> Option<&str> {
+        self.gpu_error.as_deref()
     }
 
     /// Set the CPU-path FFN keep fraction at runtime (research: sweep quality vs
@@ -852,6 +919,29 @@ impl<'a> Model<'a> {
 /// Build the resident GPU model: the first `n_gpu` transformer layers plus the
 /// final norm and output projection go to VRAM. `n_gpu < layers.len()` means
 /// offloading — the remaining layers run on the CPU.
+/// Progress of streaming the model into VRAM: bytes done out of the total to
+/// stream. `done_bytes == total_bytes` means the upload is finished.
+#[derive(Clone, Copy)]
+pub struct LoadProgress {
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Bytes one decoder layer contributes to the VRAM upload (quantized weights
+/// plus the small f32 norms/biases).
+fn layer_bytes(l: &Layer) -> u64 {
+    let f32s = l.attn_norm.len() + l.bq.len() + l.bk.len() + l.bv.len() + l.ffn_norm.len();
+    f32s as u64 * 4
+        + l.wq.data.len() as u64
+        + l.wk.data.len() as u64
+        + l.wv.data.len() as u64
+        + l.wo.data.len() as u64
+        + l.w_gate.data.len() as u64
+        + l.w_up.data.len() as u64
+        + l.w_down.data.len() as u64
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_gpu(
     be: &Arc<GpuBackend>,
     cfg: &Config,
@@ -859,6 +949,8 @@ fn build_gpu(
     output: &QTensor,
     layers: &[Layer],
     n_gpu: usize,
+    kv_cap: usize,
+    report: &mut dyn FnMut(u64),
 ) -> std::result::Result<GpuWeights, Box<dyn std::error::Error>> {
     let gcfg = GpuConfig {
         n_layer: n_gpu,
@@ -871,11 +963,13 @@ fn build_gpu(
         vocab: cfg.vocab,
         rope_theta: cfg.rope_theta,
         rms_eps: cfg.rms_eps,
-        kv_cap: GPU_KV_CAP,
+        kv_cap,
     };
     let mut b = be.weights_builder(gcfg);
     b.out_norm(out_norm)?;
     b.output(output.data, output.ty)?;
+    let mut done: u64 = out_norm.len() as u64 * 4 + output.data.len() as u64;
+    report(done);
     for l in &layers[..n_gpu] {
         b.layer(
             &l.attn_norm,
@@ -888,33 +982,135 @@ fn build_gpu(
             (l.w_up.data, l.w_up.ty),
             (l.w_down.data, l.w_down.ty),
         )?;
+        done += layer_bytes(l);
+        report(done);
     }
     b.build()
 }
 
-/// Choose how many layers fit in free VRAM (the rest run on CPU). Reads free
-/// VRAM via nvidia-smi; returns `n_layer` (full GPU) when it can't tell, so the
-/// default path is unchanged. Leaves headroom for the output projection, KV
-/// cache, scratch buffers and the desktop.
-fn auto_gpu_layers(cfg: &Config, layers: &[Layer], output: &QTensor) -> usize {
+/// VRAM kept free for the desktop, fragmentation and headroom (1 GiB).
+pub const VRAM_HEADROOM: u64 = 1024 * 1024 * 1024;
+
+/// Choose how many layers fit in free VRAM (the rest run on CPU) at the given
+/// token limit `kv_cap`. Reads free VRAM via nvidia-smi; returns `n_layer` (full
+/// GPU) when it can't tell, so the default path is unchanged.
+fn auto_gpu_layers(cfg: &Config, layers: &[Layer], output: &QTensor, kv_cap: usize) -> usize {
     let Some(free_mib) = free_vram_mib() else {
         return cfg.n_layer; // unknown -> assume it fits (previous behavior)
     };
     let free = free_mib * 1024 * 1024;
-    // Per-layer VRAM: quantized weights + this layer's KV cache slice.
     let l = &layers[0];
     let per_layer_weight = (l.wq.data.len() + l.wk.data.len() + l.wv.data.len() + l.wo.data.len()
         + l.w_gate.data.len() + l.w_up.data.len() + l.w_down.data.len()) as u64;
-    let per_layer_kv = (GPU_KV_CAP * cfg.kv_dim * 2 * 4) as u64;
+    let per_layer_kv = (kv_cap * cfg.kv_dim * 2 * 4) as u64;
     let per_layer = (per_layer_weight + per_layer_kv).max(1);
-    // Fixed VRAM: output projection + norm + session scratch (vocab-sized logits
-    // dominate). Plus 1 GiB headroom for the desktop and fragmentation.
     let fixed = output.data.len() as u64
         + (cfg.n_embd * 4) as u64
         + (cfg.vocab * 4 + cfg.n_ff * 2 * 4 + cfg.n_embd * 6 * 4) as u64
-        + 1024 * 1024 * 1024;
+        + VRAM_HEADROOM;
     let budget = free.saturating_sub(fixed);
     ((budget / per_layer) as usize).min(cfg.n_layer)
+}
+
+/// Options for loading a model.
+#[derive(Clone, Copy)]
+pub struct LoadOpts {
+    /// Token limit = KV-cache capacity (positions). More tokens = more VRAM.
+    pub n_ctx: usize,
+    /// GPU/CPU split: `None` auto-fits to free VRAM; `Some(n)` forces `n` layers
+    /// on the GPU (`0` = pure CPU).
+    pub gpu_layers: Option<usize>,
+}
+
+impl Default for LoadOpts {
+    fn default() -> Self {
+        LoadOpts { n_ctx: GPU_KV_CAP, gpu_layers: None }
+    }
+}
+
+/// A pre-load memory estimate, read straight from the GGUF header (cheap — no
+/// weights are uploaded). Lets the UI show whether a model fits in VRAM at a
+/// chosen token limit, and how the GPU/CPU split would look if it doesn't.
+#[derive(Clone, Copy)]
+pub struct MemEstimate {
+    pub n_layer: usize,
+    pub kv_dim: usize,
+    /// Weight bytes of one transformer layer (they are near-identical).
+    pub per_layer_weight: u64,
+    /// Fixed GPU bytes independent of the layer split: output projection + norm
+    /// + vocab-sized logits and session scratch.
+    pub fixed_bytes: u64,
+    /// Free VRAM right now (bytes), if nvidia-smi could tell us.
+    pub free_vram: Option<u64>,
+}
+
+impl MemEstimate {
+    /// KV-cache bytes for `gpu_layers` layers at `n_ctx` tokens.
+    pub fn kv_bytes(&self, n_ctx: usize, gpu_layers: usize) -> u64 {
+        (gpu_layers as u64) * (n_ctx as u64) * (self.kv_dim as u64) * 2 * 4
+    }
+
+    /// Total VRAM needed to run `gpu_layers` layers on the GPU at `n_ctx` tokens
+    /// (weights + KV + fixed scratch), excluding the safety headroom.
+    pub fn vram_needed(&self, n_ctx: usize, gpu_layers: usize) -> u64 {
+        self.per_layer_weight * gpu_layers as u64 + self.kv_bytes(n_ctx, gpu_layers) + self.fixed_bytes
+    }
+
+    /// VRAM to run the whole model on the GPU at `n_ctx` tokens.
+    pub fn vram_full(&self, n_ctx: usize) -> u64 {
+        self.vram_needed(n_ctx, self.n_layer)
+    }
+
+    /// Does the whole model fit in free VRAM (with headroom) at `n_ctx`? `None`
+    /// when free VRAM is unknown (no nvidia-smi).
+    pub fn fits_full(&self, n_ctx: usize) -> Option<bool> {
+        self.free_vram.map(|f| self.vram_full(n_ctx) + VRAM_HEADROOM <= f)
+    }
+
+    /// How many layers fit in free VRAM at `n_ctx` (the rest would run in RAM).
+    /// `None` when free VRAM is unknown.
+    pub fn gpu_layers_fit(&self, n_ctx: usize) -> Option<usize> {
+        let free = self.free_vram?;
+        let budget = free.saturating_sub(self.fixed_bytes + VRAM_HEADROOM);
+        let per_layer = (self.per_layer_weight + (n_ctx as u64) * (self.kv_dim as u64) * 2 * 4).max(1);
+        Some(((budget / per_layer) as usize).min(self.n_layer))
+    }
+}
+
+/// Estimate VRAM use from the GGUF header alone (no upload). Returns `None` for
+/// a non-qwen2 file or if required metadata/tensors are missing.
+pub fn estimate_mem(g: &GgufFile) -> Option<MemEstimate> {
+    let arch = g.meta("general.architecture").and_then(MetaValue::as_str)?;
+    if arch != "qwen2" {
+        return None;
+    }
+    let mu = |s: &str| g.meta(&format!("{arch}.{s}")).and_then(MetaValue::as_u64).map(|v| v as usize);
+    let n_layer = mu("block_count")?;
+    let n_embd = mu("embedding_length")?;
+    let n_head = mu("attention.head_count")?;
+    let n_head_kv = mu("attention.head_count_kv")?;
+    let n_ff = mu("feed_forward_length")?;
+    let head_dim = n_embd / n_head;
+    let kv_dim = n_head_kv * head_dim;
+
+    // Sum the weight bytes of the transformer blocks (tensors named "blk.*").
+    // token_embd stays on the CPU, so it is excluded.
+    let layer_total: u64 = g.tensors.iter().filter(|t| t.name.starts_with("blk.")).map(|t| t.n_bytes).sum();
+    let per_layer_weight = if n_layer > 0 { layer_total / n_layer as u64 } else { 0 };
+
+    let output_bytes = g
+        .tensor("output.weight")
+        .or_else(|| g.tensor("token_embd.weight"))
+        .map(|t| t.n_bytes)
+        .unwrap_or(0);
+    let vocab = g.tensor("output.weight").or_else(|| g.tensor("token_embd.weight")).map(|t| t.dims[1] as usize).unwrap_or(0);
+    // Fixed GPU bytes: output projection + final norm + vocab logits + scratch
+    // (mirrors `auto_gpu_layers`'s `fixed`, minus the headroom which callers add).
+    let fixed_bytes = output_bytes
+        + (n_embd * 4) as u64
+        + (vocab * 4 + n_ff * 2 * 4 + n_embd * 6 * 4) as u64;
+
+    Some(MemEstimate { n_layer, kv_dim, per_layer_weight, fixed_bytes, free_vram: free_vram_mib().map(|m| m * 1024 * 1024) })
 }
 
 /// Free VRAM in MiB via nvidia-smi, if available.

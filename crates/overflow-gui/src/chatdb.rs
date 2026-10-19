@@ -585,7 +585,139 @@ impl ChatDb {
             out
         };
 
+        // Query terms (alphanumeric only — split on non-alnum — so they can
+        // never contain a quote and are safe to inline into LIKE patterns).
+        let terms: Vec<String> = query
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 3)
+            .take(10)
+            .map(|w| w.to_string())
+            .collect();
+        // SQL that returns the rows of `table` whose text columns contain any
+        // query term (None when there is nothing to search for).
+        let like_sql = |table: &str, cols: &[&str], k: usize| -> Option<String> {
+            if terms.is_empty() {
+                return None;
+            }
+            let mut clauses = Vec::new();
+            for c in cols {
+                for t in &terms {
+                    clauses.push(format!("{c} LIKE '%{t}%'"));
+                }
+            }
+            Some(format!("SELECT {} FROM {table} WHERE {} LIMIT {k}", cols.join(", "), clauses.join(" OR ")))
+        };
+
+        // ---- 1) QUERY-RELEVANT HITS across every table (put first, so the
+        // char budget can never cut the row that actually answers the question).
+        let mut relevant: Vec<String> = Vec::new();
+        for (table, cols) in [
+            ("entities", &["name", "kind", "description"][..]),
+            ("facts", &["subject", "predicate", "value"][..]),
+            ("memory_packs", &["name", "content"][..]),
+            ("projects", &["name", "status", "description"][..]),
+            ("events", &["title", "description"][..]),
+            ("preferences", &["key", "value"][..]),
+        ] {
+            if table_exists(table) {
+                if let Some(sql) = like_sql(table, cols, 8) {
+                    relevant.extend(rows(&sql, cols.len()));
+                }
+            }
+        }
+        // Document chunks: FTS5 when indexed, else a plain LIKE over a detected
+        // text column (so notes in a non-indexed `chunks` table are still found).
+        if table_exists("chunks_fts") && !terms.is_empty() {
+            let match_expr = terms.join(" OR ").replace('\'', " ");
+            relevant.extend(rows(&format!("SELECT body FROM chunks_fts WHERE chunks_fts MATCH '{match_expr}' LIMIT 6"), 1));
+        } else if table_exists("chunks") && !terms.is_empty() {
+            let mut col: Option<String> = None;
+            if let Ok(mut s) = self.conn.prepare("PRAGMA table_info(chunks)") {
+                if let Ok(mut r) = s.query([]) {
+                    while let Ok(Some(row)) = r.next() {
+                        if let Ok(name) = row.get::<_, String>(1) {
+                            if ["body", "content", "text", "chunk", "data", "note"].contains(&name.to_lowercase().as_str()) {
+                                col = Some(name);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(col) = col {
+                let clauses: Vec<String> = terms.iter().map(|t| format!("{col} LIKE '%{t}%'")).collect();
+                relevant.extend(rows(&format!("SELECT {col} FROM chunks WHERE {} LIMIT 6", clauses.join(" OR ")), 1));
+            }
+        }
+
+        // Generic fallback: search EVERY user table's text columns for the query
+        // terms. This makes a memory DB with a non-standard schema (different
+        // table/column names) still answer, without us knowing its layout. Skips
+        // SQLite internals, FTS shadow tables, and OnlyChat's own bookkeeping.
+        if !terms.is_empty() {
+            let qid = |s: &str| format!("\"{}\"", s.replace('"', "\"\"")); // quote identifier
+            let skip = |n: &str| {
+                n.starts_with("sqlite_")
+                    || n.starts_with("oc_")
+                    || matches!(n, "chats" | "messages" | "summaries" | "meta" | "schema_version")
+                    || n.ends_with("_fts") || n.ends_with("_data") || n.ends_with("_idx")
+                    || n.ends_with("_docsize") || n.ends_with("_config") || n.ends_with("_content")
+            };
+            let mut tables: Vec<String> = Vec::new();
+            if let Ok(mut s) = self.conn.prepare("SELECT name FROM sqlite_master WHERE type='table'") {
+                if let Ok(mut r) = s.query([]) {
+                    while let Ok(Some(row)) = r.next() {
+                        if let Ok(n) = row.get::<_, String>(0) {
+                            if !skip(&n) {
+                                tables.push(n);
+                            }
+                        }
+                    }
+                }
+            }
+            for t in tables.iter().take(40) {
+                if relevant.len() > 40 {
+                    break;
+                }
+                // Text-ish columns of this table (TEXT/CHAR/CLOB or untyped).
+                let mut cols: Vec<String> = Vec::new();
+                if let Ok(mut s) = self.conn.prepare(&format!("PRAGMA table_info({})", qid(t))) {
+                    if let Ok(mut r) = s.query([]) {
+                        while let Ok(Some(row)) = r.next() {
+                            let name: String = row.get(1).unwrap_or_default();
+                            let ty: String = row.get::<_, String>(2).unwrap_or_default().to_uppercase();
+                            if name.is_empty() {
+                                continue;
+                            }
+                            if ty.contains("CHAR") || ty.contains("TEXT") || ty.contains("CLOB") || ty.is_empty() {
+                                cols.push(name);
+                            }
+                        }
+                    }
+                }
+                if cols.is_empty() {
+                    continue;
+                }
+                let where_: Vec<String> = cols
+                    .iter()
+                    .flat_map(|c| terms.iter().map(move |term| format!("{} LIKE '%{term}%'", qid(c))))
+                    .collect();
+                let sel = cols.iter().map(|c| qid(c)).collect::<Vec<_>>().join(", ");
+                let sql = format!("SELECT {sel} FROM {} WHERE {} LIMIT 4", qid(t), where_.join(" OR "));
+                relevant.extend(rows(&sql, cols.len()));
+            }
+        }
+
+        // De-duplicate hits, keeping first-seen order (most relevant first).
+        let mut seen = std::collections::HashSet::new();
+        relevant.retain(|r| seen.insert(r.clone()));
+
+        // ---- 2) GENERAL CURATED DUMP (fills whatever budget is left).
         let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+        if !relevant.is_empty() {
+            sections.push(("Treffer zur aktuellen Frage".into(), relevant));
+        }
         if table_exists("memory_packs") {
             sections.push(("Memory-Packs".into(), rows("SELECT name, content FROM memory_packs", 2)));
         }
@@ -614,34 +746,14 @@ impl ChatDb {
             ));
         }
 
-        // Query-relevant document chunks via FTS5 if available.
-        if table_exists("chunks_fts") || table_exists("chunks") {
-            let terms: Vec<String> = query
-                .to_lowercase()
-                .split(|c: char| !c.is_alphanumeric())
-                .filter(|w| w.len() > 3)
-                .take(12)
-                .map(|w| w.to_string())
-                .collect();
-            if !terms.is_empty() && table_exists("chunks_fts") {
-                let match_expr = terms.join(" OR ").replace('\'', " ");
-                let sql = format!(
-                    "SELECT body FROM chunks_fts WHERE chunks_fts MATCH '{match_expr}' LIMIT 6"
-                );
-                let hits = rows(&sql, 1);
-                if !hits.is_empty() {
-                    sections.push(("Passende Notizen".into(), hits));
-                }
-            }
-        }
-
         if sections.iter().all(|(_, v)| v.is_empty()) {
             return None;
         }
 
         let mut out = String::from(
             "Gespeichertes Wissen über den Nutzer und seine Projekte (aus der Datenbank). \
-             Nutze es, um die Fragen des Nutzers konkret zu beantworten:\n",
+             Nutze diese Angaben, um die Frage konkret zu beantworten. Wenn die Antwort hier \
+             nicht steht, sage ehrlich, dass du sie in der Datenbank nicht findest, und erfinde nichts:\n",
         );
         'outer: for (title, lines) in sections {
             if lines.is_empty() {
@@ -928,6 +1040,34 @@ mod tests {
         assert!(db2.memory_context("x", 8000).is_none());
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&p2).ok();
+    }
+
+    #[test]
+    fn memory_context_finds_query_match_past_budget_and_in_plain_chunks() {
+        let path = tmp("mem_query");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE entities (name TEXT, kind TEXT, description TEXT);
+                 CREATE TABLE chunks (id INTEGER, body TEXT);",
+            )
+            .unwrap();
+            // Many filler entities so the target would be cut by a tight budget
+            // in the old wholesale dump; the query-relevant pass must surface it.
+            for i in 0..300 {
+                c.execute("INSERT INTO entities VALUES(?1,'person','filler')", params![format!("Filler Person {i}")]).unwrap();
+            }
+            c.execute("INSERT INTO entities VALUES('Leon Pelzmann','person','baut OVERFLOW in der Steiermark')", []).unwrap();
+            // A note in a NON-indexed chunks table (no FTS) must still be found.
+            c.execute("INSERT INTO chunks VALUES(1,'Leon Pelzmann wohnt in der Steiermark und mag Katzen.')", []).unwrap();
+        }
+        let db = ChatDb::open(&path, None).unwrap();
+        // Tight budget: the old code would fill it with filler and drop the hit.
+        let ctx = db.memory_context("Wer ist Leon Pelzmann aus der Steiermark?", 1200).expect("context");
+        assert!(ctx.contains("Treffer zur aktuellen Frage"), "has a relevant-hits section");
+        assert!(ctx.contains("Pelzmann"), "surfaces the entity row for the query");
+        assert!(ctx.contains("Katzen"), "finds the note in a non-indexed chunks table");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -33,8 +33,10 @@
   @row{Schneller schreiben, identisch | 1,67-mal schneller, gleiche Ausgabe}
   @row{Großes Modell, kleine Karte | läuft in voller Qualität, 2 bis 3 Wörter pro Sekunde}
   @row{Prozessor-Rechnen beschleunigt | 4-mal schneller}
-  @row{Neuronen sparen (optional) | 13 bis 24 Prozent schneller; bei Hälfte behalten 94 Prozent gleich}
+  @row{Neuronen sparen (optional) | nur rund 10 bis 15 Prozent schneller (ehrlich gemessen), nur auf dem Prozessor}
 }
+
+@note{Ehrliche Nachmessung des Neuronen-Sparens (CATS). Eine frühere Messung zeigte scheinbar 1,7-fache Geschwindigkeit. Das war ein Messfehler: der dichte Lauf las die Gewichte kalt von der Platte\, die sparsamen Läufe danach aus dem warmen Zwischenspeicher. Mit vorgewärmtem Speicher bleibt beim verlustfreien Punkt (ein Viertel weggelassen) nur etwa 1,15-fach übrig — Wort für Wort identisch. Die Hälfte weggelassen: rund 1,06-fach bei 97 Prozent gleicher Ausgabe. Erst drei Viertel weggelassen bringen 1,37-fach\, aber die Qualität bricht ein (62 Prozent). Dazu kommt: das Sparen gibt es nur im Prozessor-Pfad\, die Grafikkarte rechnet immer dicht und gewinnt nichts. Fazit: als "spart Rechenleistung" trägt dieses Verfahren in der Praxis kaum. Gemessen mit @code{poezi ffnbench} an einem 7B-Q8_0-Modell.}
 
 @pagebreak
 
