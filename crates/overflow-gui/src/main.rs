@@ -671,7 +671,9 @@ impl OverflowApp {
         self.sync_server_bridge();
         match server::start(self.server.bridge.clone(), self.gen.clone()) {
             Ok(h) => {
-                self.server.status = format!("läuft auf {}", h.url);
+                // The URL (with its secret token) is shown separately as a
+                // selectable field, not folded into the status line.
+                self.server.status = "läuft".into();
                 self.server.handle = Some(h);
             }
             Err(e) => self.server.status = format!("Fehler: {e}"),
@@ -715,6 +717,7 @@ impl OverflowApp {
                 "--progress-bar".into(), // emit a parseable progress meter (redrawn with \r)
                 "-o".into(),
                 out.display().to_string(),
+                "--".into(), // stop option parsing: a URL can't act as a curl flag
                 url.to_string(),
             ],
         );
@@ -778,16 +781,25 @@ impl OverflowApp {
     }
 
     fn start(&mut self, label: &str, program: &str, args: Vec<String>) {
+        self.start_env(label, program, args, vec![]);
+    }
+
+    /// Like `start`, but with extra environment variables for the child. Config
+    /// (dataset path, base, …) is passed this way instead of interpolated into a
+    /// `sh -c` string, so a value with a quote or space can't break out into the
+    /// shell — there is no shell.
+    fn start_env(&mut self, label: &str, program: &str, args: Vec<String>, extra: Vec<(String, String)>) {
         if self.trainer.is_some() {
             self.log("a task is already running");
             return;
         }
-        let envs = vec![
+        let mut envs = vec![
             ("HF_HOME".to_string(), Self::cwd().join("training/hf-cache").display().to_string()),
             // The xet transfer can hang at 0% on some networks — use plain HTTPS.
             ("HF_HUB_DISABLE_XET".to_string(), "1".to_string()),
             ("HF_HUB_DOWNLOAD_TIMEOUT".to_string(), "60".to_string()),
         ];
+        envs.extend(extra);
         self.log(format!("$ {label}"));
         self.learn.status = format!("running: {label}");
         self.learn.task = label.to_string();
@@ -2052,8 +2064,15 @@ impl OverflowApp {
                         ui.label(egui::RichText::new(&self.server.status).color(if running { GREEN } else { MUTED }).size(12.5).monospace());
                     }
                     if running {
+                        if let Some(h) = self.server.handle.as_ref() {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Adresse fürs Handy (antippen zum Markieren/Kopieren):").color(MUTED).size(11.0));
+                            ui.add(egui::Label::new(egui::RichText::new(&h.url).color(CYAN).size(12.0).monospace()).selectable(true).wrap());
+                        }
                         ui.add_space(6.0);
                         ui.label(egui::RichText::new("Öffne diese Adresse am Handy (gleiches Tailscale-Netz). Beim ersten Mal die Zertifikatswarnung bestätigen (selbst-signiert).").color(MUTED).size(11.0));
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("⚠ Der Teil nach #k= ist ein Zugangstoken — wer den Link hat, kann mit deinem Modell schreiben. Nicht teilen. Bei jedem Serverstart neu.").color(AMBER).size(10.5));
                     }
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Hinweis: Port 443 braucht ggf. Rechte — sonst nutzt der Server automatisch 8443.").color(MUTED).size(10.5));
@@ -2154,10 +2173,17 @@ impl OverflowApp {
                         let lc = Self::llama_dir().map(|p| p.display().to_string()).unwrap_or_default();
                         let out = model_out_name(&b);
                         self.learn.out_name = out.clone();
-                        let cmd = format!(
-                            "rm -rf training/out && env LC='{lc}' BASE='{b}' DATA='{d}' EPOCHS='{e}' OUT='models/{out}' bash training/build_overflow_wt.sh"
-                        );
-                        self.start("train + build", "sh", vec!["-c".into(), cmd]);
+                        // Force a fresh train on the selected dataset (done in
+                        // Rust, not via the shell). Config goes in as env vars.
+                        let _ = std::fs::remove_dir_all(Self::cwd().join("training/out"));
+                        let envs = vec![
+                            ("LC".to_string(), lc),
+                            ("BASE".to_string(), b),
+                            ("DATA".to_string(), d),
+                            ("EPOCHS".to_string(), e),
+                            ("OUT".to_string(), format!("models/{out}")),
+                        ];
+                        self.start_env("train + build", "bash", vec!["training/build_overflow_wt.sh".into()], envs);
                     }
                     if ui.add_enabled(!busy, egui::Button::new("3 · Load trained model")).clicked() {
                         self.load_model(Self::cwd().join("models").join(&self.learn.out_name));
