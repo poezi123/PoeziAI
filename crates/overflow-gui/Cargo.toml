@@ -19,3 +19,6 @@ argon2 = "0.5.3"
 chacha20poly1305 = "0.10.1"
 rand = "0.8.5"
 serde_json = "1.0.128"
+# Server mode (HTTPS web UI): TLS via rustls + a self-signed cert (rcgen).
+rustls = { version = "0.23.16", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13.1"

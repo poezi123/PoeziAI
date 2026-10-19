@@ -410,7 +410,9 @@ impl ChatDb {
     /// message content, a role/author/sender column (if any) sets the speaker
     /// else roles alternate, and rows are ordered by an id/time-like column or
     /// `rowid`. Foreign tables are only read, never modified. Returns how many
-    /// tables yielded at least one message.
+    /// tables yielded at least one message. (Kept for conversation-style files;
+    /// structured memory DBs use `memory_context` instead.)
+    #[allow(dead_code)]
     pub fn import_foreign(&self) -> Result<usize, String> {
         let tables: Vec<String> = {
             let mut stmt = self
@@ -542,6 +544,120 @@ impl ChatDb {
             }
         }
         Ok(imported)
+    }
+}
+
+impl ChatDb {
+    /// Build a knowledge/context block from a structured "memory" database (the
+    /// kind with facts/chunks/memory_packs/projects/… tables, optionally with
+    /// FTS5 indexes). Curated rows plus query-relevant chunks, char-budgeted so
+    /// it never blows the context window. Returns None if the file has none of
+    /// these tables (then there is nothing to inject). Read-only.
+    pub fn memory_context(&self, query: &str, budget: usize) -> Option<String> {
+        let table_exists = |t: &str| -> bool {
+            self.conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=?1",
+                    params![t],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        // Collect rows from a query into "- col1 col2 …" lines, ignoring errors.
+        let rows = |sql: &str, ncols: usize| -> Vec<String> {
+            let mut out = Vec::new();
+            if let Ok(mut stmt) = self.conn.prepare(sql) {
+                if let Ok(mut r) = stmt.query([]) {
+                    while let Ok(Some(row)) = r.next() {
+                        let parts: Vec<String> = (0..ncols)
+                            .filter_map(|i| row.get_ref(i).ok().map(value_to_string))
+                            .filter(|s| !s.trim().is_empty())
+                            .collect();
+                        if !parts.is_empty() {
+                            out.push(format!("- {}", parts.join(" — ")));
+                        }
+                    }
+                }
+            }
+            out
+        };
+
+        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+        if table_exists("memory_packs") {
+            sections.push(("Memory-Packs".into(), rows("SELECT name, content FROM memory_packs", 2)));
+        }
+        if table_exists("preferences") {
+            sections.push(("Präferenzen".into(), rows("SELECT key, value FROM preferences", 2)));
+        }
+        if table_exists("facts") {
+            sections.push((
+                "Fakten".into(),
+                rows("SELECT subject, predicate, value FROM facts WHERE COALESCE(is_current,1)=1 ORDER BY COALESCE(priority,0) DESC LIMIT 200", 3),
+            ));
+        }
+        if table_exists("projects") {
+            sections.push(("Projekte".into(), rows("SELECT name, status, description FROM projects", 3)));
+        }
+        if table_exists("skills") {
+            sections.push(("Skills".into(), rows("SELECT category, name FROM skills", 2)));
+        }
+        if table_exists("entities") {
+            sections.push(("Entitäten".into(), rows("SELECT name, kind, description FROM entities", 3)));
+        }
+        if table_exists("events") {
+            sections.push((
+                "Ereignisse".into(),
+                rows("SELECT event_date, title, description FROM events ORDER BY event_date DESC LIMIT 25", 3),
+            ));
+        }
+
+        // Query-relevant document chunks via FTS5 if available.
+        if table_exists("chunks_fts") || table_exists("chunks") {
+            let terms: Vec<String> = query
+                .to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() > 3)
+                .take(12)
+                .map(|w| w.to_string())
+                .collect();
+            if !terms.is_empty() && table_exists("chunks_fts") {
+                let match_expr = terms.join(" OR ").replace('\'', " ");
+                let sql = format!(
+                    "SELECT body FROM chunks_fts WHERE chunks_fts MATCH '{match_expr}' LIMIT 6"
+                );
+                let hits = rows(&sql, 1);
+                if !hits.is_empty() {
+                    sections.push(("Passende Notizen".into(), hits));
+                }
+            }
+        }
+
+        if sections.iter().all(|(_, v)| v.is_empty()) {
+            return None;
+        }
+
+        let mut out = String::from(
+            "Gespeichertes Wissen über den Nutzer und seine Projekte (aus der Datenbank). \
+             Nutze es, um die Fragen des Nutzers konkret zu beantworten:\n",
+        );
+        'outer: for (title, lines) in sections {
+            if lines.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n[{title}]\n"));
+            for l in lines {
+                if out.len() + l.len() + 1 > budget {
+                    out.push_str("…\n");
+                    break 'outer;
+                }
+                out.push_str(&l);
+                out.push('\n');
+            }
+        }
+        Some(out)
     }
 }
 
@@ -786,6 +902,32 @@ mod tests {
         assert!(msgs[0].role == Role::User);
         assert!(msgs[1].role == Role::Assistant);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn memory_context_from_structured_db() {
+        let path = tmp("mem");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE facts (subject TEXT, predicate TEXT, value TEXT, is_current INTEGER, priority INTEGER);
+                 INSERT INTO facts VALUES('Leon','lebt in','Österreich',1,5);
+                 INSERT INTO facts VALUES('Leon','Projekt','OVERFLOW',1,9);
+                 CREATE TABLE memory_packs (name TEXT, content TEXT);
+                 INSERT INTO memory_packs VALUES('Profil','Leon baut eine lokale KI namens OVERFLOW.');",
+            )
+            .unwrap();
+        }
+        let db = ChatDb::open(&path, None).unwrap();
+        let ctx = db.memory_context("Was ist OVERFLOW?", 8000).expect("some context");
+        assert!(ctx.contains("OVERFLOW"));
+        assert!(ctx.contains("Fakten") && ctx.contains("Memory-Packs"));
+        // A plain db with no knowledge tables yields None.
+        let p2 = tmp("mem_none");
+        let db2 = ChatDb::create(&p2, None).unwrap();
+        assert!(db2.memory_context("x", 8000).is_none());
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&p2).ok();
     }
 
     #[test]

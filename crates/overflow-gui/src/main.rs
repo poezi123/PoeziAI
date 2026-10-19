@@ -8,6 +8,7 @@
 
 mod chatdb;
 mod hw;
+mod server;
 mod trainer;
 mod worker;
 
@@ -26,7 +27,26 @@ enum Tab {
     Chat,
     OnlyChat,
     Learning,
+    Server,
     Docs,
+}
+
+/// Server-mode state: the running HTTPS server (if any) and the shared bridge
+/// to the model worker that it forwards requests through.
+struct ServerState {
+    handle: Option<server::ServerHandle>,
+    bridge: server::Bridge,
+    status: String,
+}
+
+impl Default for ServerState {
+    fn default() -> Self {
+        ServerState {
+            handle: None,
+            bridge: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            status: String::new(),
+        }
+    }
 }
 
 /// Where streamed tokens from the worker should land. OnlyChat shares the same
@@ -140,6 +160,57 @@ fn strip_think(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Percent-encode a query string for a URL.
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Very small HTML→text: drop tags/scripts, decode a few entities, collapse
+/// whitespace. Good enough to feed search snippets to the model.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut skip_depth = 0i32;
+    let lower = html.to_lowercase();
+    let mut i = 0;
+    let bytes = html.as_bytes();
+    while i < bytes.len() {
+        if lower[i..].starts_with("<script") || lower[i..].starts_with("<style") {
+            skip_depth += 1;
+        }
+        if lower[i..].starts_with("</script") || lower[i..].starts_with("</style") {
+            skip_depth = (skip_depth - 1).max(0);
+        }
+        let c = bytes[i] as char;
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+            out.push(' ');
+        } else if !in_tag && skip_depth == 0 {
+            out.push(c);
+        }
+        i += 1;
+    }
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Default location for a new OnlyChat database (under the data dir).
 fn default_db_path() -> String {
     data_models_dir()
@@ -148,6 +219,27 @@ fn default_db_path() -> String {
         .unwrap_or_else(|| PathBuf::from("chats.sqlite"))
         .display()
         .to_string()
+}
+
+/// OnlyChat system focus: tells the model it works against a saved database.
+const ONLYCHAT_FOCUS: &str = "Du bist OVERFLOW im OnlyChat-Modus. Du arbeitest mit einer gespeicherten \
+Datenbank als Gedächtnis: nutze das unten gegebene gespeicherte Wissen und den bisherigen \
+Gesprächsverlauf aktiv, um konkret und konsistent zu antworten. Erfinde keine Fakten dazu; wenn etwas \
+nicht in den Daten steht, sage es.";
+
+/// Combine the OnlyChat focus instruction, retrieved database knowledge, and an
+/// optional conversation summary into the system prelude.
+fn compose_prelude(memory: Option<String>, summary: Option<String>) -> String {
+    let mut out = String::from(ONLYCHAT_FOCUS);
+    if let Some(m) = memory {
+        out.push_str("\n\n");
+        out.push_str(&m);
+    }
+    if let Some(s) = summary {
+        out.push_str("\n\n");
+        out.push_str(&s);
+    }
+    out
 }
 
 /// Short display name for a database path (its file name).
@@ -165,6 +257,8 @@ fn db_name(path: &str) -> String {
 const DATASETS: &[(&str, &str, &str)] = &[
     ("OVERFLOW_WT · Infosec professor + offensive", "training/data/overflow_wt.jsonl", "training/data_gen_wt.py"),
     ("Identity + security basics (small)", "training/data/overflow.jsonl", "training/data_gen.py"),
+    ("CTF · binary exploitation walkthroughs", "training/data/overflow_ctf.jsonl", "training/data_gen_ctf.py"),
+    ("Web security · vulns + secure coding", "training/data/overflow_websec.jsonl", "training/data_gen_websec.py"),
 ];
 
 struct LearnState {
@@ -212,7 +306,37 @@ const CYAN: Color32 = Color32::from_rgb(0x49, 0xd6, 0xe6);
 
 // Qwen2.5-Coder GGUF downloads (our engine is Qwen2-architecture).
 const QWEN_1_5B_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
-const QWEN_7B_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf";
+
+/// Selectable models to download: (label, url, filename). All single-file
+/// Qwen2.5-Coder GGUFs the engine can load. The bigger ones ("schlauer") need
+/// more than 12 GB VRAM and run via whole-layer CPU offloading at full quality.
+const MODELS: &[(&str, &str, &str)] = &[
+    (
+        "Qwen2.5-Coder 0.5B · Q4 (~0.4 GB, winzig)",
+        "https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+        "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+    ),
+    (
+        "Qwen2.5-Coder 1.5B · Q4 (~1.1 GB, schnell)",
+        QWEN_1_5B_URL,
+        "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+    ),
+    (
+        "Qwen2.5-Coder 3B · Q4 (~2.0 GB)",
+        "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+        "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+    ),
+    (
+        "Qwen2.5-Coder 7B · Q4 (~4.7 GB)",
+        "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+    ),
+    (
+        "Qwen2.5-Coder 14B · Q4 (~9 GB, schlau · CPU-Offload)",
+        "https://huggingface.co/bartowski/Qwen2.5-Coder-14B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+        "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+    ),
+];
 
 /// Split assistant text into (thinking, answer) around a `<think>…</think>` block.
 fn split_think(s: &str) -> (Option<&str>, &str) {
@@ -271,6 +395,7 @@ fn list_gguf() -> Vec<PathBuf> {
         PathBuf::from("models"),
         data_models_dir(),
         PathBuf::from("/usr/share/overflow/models"),
+        PathBuf::from("/mnt/ai/Overflow Models"),
     ];
     dirs.dedup();
     let mut out = Vec::new();
@@ -403,10 +528,16 @@ struct OverflowApp {
     learn: LearnState,
     trainer: Option<trainer::Trainer>,
     dl_url: String,
+    dl_sel: usize,
     gen: GenCfg,
     show_thinking: bool,
+    gen_tokens: u32,
     only: OnlyChatState,
     stream: Stream,
+    server: ServerState,
+    /// Pending internet-research fetch (result arrives on this channel).
+    research_rx: Option<std::sync::mpsc::Receiver<String>>,
+    research_query: String,
 }
 
 impl OverflowApp {
@@ -415,7 +546,7 @@ impl OverflowApp {
             Some(p) => (Some(worker::spawn(p.clone())), Some(p.display().to_string()), Status::Loading),
             None => (None, None, Status::NoModel),
         };
-        OverflowApp {
+        let app = OverflowApp {
             handle,
             current_model,
             status,
@@ -434,10 +565,41 @@ impl OverflowApp {
             learn: LearnState::default(),
             trainer: None,
             dl_url: String::new(),
+            dl_sel: 1,
             gen: GenCfg::default(),
             show_thinking: true,
+            gen_tokens: 0,
             only: OnlyChatState::default(),
             stream: Stream::Chat,
+            server: ServerState::default(),
+            research_rx: None,
+            research_query: String::new(),
+        };
+        app.sync_server_bridge();
+        app
+    }
+
+    /// Point the server bridge at the current worker (or None), so server-mode
+    /// requests reach whatever model is loaded now.
+    fn sync_server_bridge(&self) {
+        if let Ok(mut b) = self.server.bridge.lock() {
+            *b = self.handle.as_ref().map(|h| h.tx.clone());
+        }
+    }
+
+    fn toggle_server(&mut self) {
+        if let Some(h) = self.server.handle.take() {
+            h.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.server.status = "Server gestoppt".into();
+            return;
+        }
+        self.sync_server_bridge();
+        match server::start(self.server.bridge.clone(), self.gen.clone()) {
+            Ok(h) => {
+                self.server.status = format!("läuft auf {}", h.url);
+                self.server.handle = Some(h);
+            }
+            Err(e) => self.server.status = format!("Fehler: {e}"),
         }
     }
 
@@ -450,12 +612,14 @@ impl OverflowApp {
         self.status = Status::Loading;
         self.backend = "…".into();
         self.transcript.clear();
+        self.sync_server_bridge();
         self.tab = Tab::Chat;
     }
 
     /// Unload the current model and free its memory.
     fn unload_model(&mut self) {
         self.handle = None;
+        self.sync_server_bridge();
         self.current_model = None;
         self.status = Status::NoModel;
         self.backend = "…".into();
@@ -567,6 +731,54 @@ impl OverflowApp {
         }
     }
 
+    /// Start an internet-research fetch for the current input. Requires network
+    /// access to be enabled; otherwise it errors and tells the user to turn it
+    /// on first. The result is fed to the model as context when it arrives.
+    fn start_research(&mut self) {
+        let q = self.input.trim().to_string();
+        if q.is_empty() || self.research_rx.is_some() {
+            return;
+        }
+        if !self.perms.network {
+            self.log("Recherche: Netzwerkzugriff ist AUS — bitte erst in den Einstellungen aktivieren.");
+            self.status = Status::Error("Netzwerk aus — erst in Einstellungen aktivieren".into());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.research_rx = Some(rx);
+        self.research_query = q.clone();
+        self.log(format!("🌐 Recherche: {q}"));
+        std::thread::spawn(move || {
+            let url = format!("https://lite.duckduckgo.com/lite/?q={}", url_encode(&q));
+            let out = std::process::Command::new("curl")
+                .args(["-sL", "--max-time", "20", "-A", "Mozilla/5.0 (OVERFLOW)", &url])
+                .output();
+            let text = match out {
+                Ok(o) if o.status.success() => {
+                    let t = html_to_text(&String::from_utf8_lossy(&o.stdout));
+                    t.chars().take(2000).collect()
+                }
+                Ok(o) => format!("(Recherche fehlgeschlagen: curl exit {:?})", o.status.code()),
+                Err(e) => format!("(Recherche fehlgeschlagen: {e})"),
+            };
+            let _ = tx.send(text);
+        });
+    }
+
+    /// Poll the research channel; when the fetch finishes, feed results + the
+    /// original question to the model as a normal turn.
+    fn drain_research(&mut self) {
+        let done = self.research_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(results) = done {
+            self.research_rx = None;
+            let q = std::mem::take(&mut self.research_query);
+            self.input = format!(
+                "Nutze diese Web-Suchergebnisse (können unvollständig oder ungenau sein) und beantworte damit meine Frage. Nenne, worauf du dich stützt.\n\n[Suchergebnisse]\n{results}\n\n[Frage]\n{q}"
+            );
+            self.send_current_input();
+        }
+    }
+
     fn send_current_input(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() {
@@ -586,6 +798,7 @@ impl OverflowApp {
             self.perms.confirm_outside,
         );
         handle.cancel.store(false, Ordering::Relaxed);
+        self.gen_tokens = 0;
         let _ = handle.tx.send(ToWorker::User { text: text.clone(), perms, gen: self.gen.clone() });
         self.raw_stream.clear();
         self.transcript.push(Msg { role: Role::User, text });
@@ -667,12 +880,6 @@ impl OverflowApp {
         };
         match result {
             Ok(db) => {
-                // Opening an existing file with data but no OnlyChat chats yet:
-                // read its own tables into chats so the AI sees that content.
-                // (Creating a fresh file has nothing to import.)
-                if !create && db.list_chats().is_empty() {
-                    let _ = db.import_foreign();
-                }
                 self.only.dbs.push(OpenDb { path: path.display().to_string(), db });
                 self.only.status = format!("{}: {}", if create { "erstellt" } else { "geöffnet" }, path.display());
                 self.only_reload();
@@ -757,9 +964,11 @@ impl OverflowApp {
     fn only_request_tokens(&mut self) {
         let (Some(handle), Some((di, id))) = (&self.handle, self.only.active) else { return };
         let full: String = self.only.msgs.iter().map(|m| m.text.clone()).collect::<Vec<_>>().join("\n");
-        let summary = self.only.dbs[di].db.summary(id).map(|(s, _)| s);
-        let (prelude, turns) = chatdb::assemble(&self.only.msgs, self.only.active_mode, summary.as_deref());
-        let mut ctx = prelude.unwrap_or_default();
+        let db = &self.only.dbs[di].db;
+        let summary = db.summary(id).map(|(s, _)| s);
+        let query = self.only.msgs.last().map(|m| m.text.clone()).unwrap_or_default();
+        let (asm, turns) = chatdb::assemble(&self.only.msgs, self.only.active_mode, summary.as_deref());
+        let mut ctx = compose_prelude(db.memory_context(&query, 8000), asm);
         for (_, t) in &turns {
             ctx.push('\n');
             ctx.push_str(t);
@@ -787,10 +996,13 @@ impl OverflowApp {
         let mode = self.only.active_mode;
         db.set_mode(id, mode);
         let summary = db.summary(id).map(|(s, _)| s);
-        let (prelude, turns) = chatdb::assemble(&self.only.msgs, mode, summary.as_deref());
+        let (asm, turns) = chatdb::assemble(&self.only.msgs, mode, summary.as_deref());
+        let mem = db.memory_context(&text, 8000);
+        let prelude = Some(compose_prelude(mem, asm));
         self.stream = Stream::OnlyChat;
         self.only.stream_buf.clear();
         self.only.generating = true;
+        self.gen_tokens = 0;
         handle.cancel.store(false, Ordering::Relaxed);
         let _ = handle.tx.send(ToWorker::ChatOnly { turns, prelude, gen: self.gen.clone() });
         self.only.input.clear();
@@ -850,7 +1062,10 @@ impl OverflowApp {
                     }
                     self.status = Status::Generating;
                 }
-                FromWorker::Stats { tok_per_s } => self.tok_per_s = tok_per_s,
+                FromWorker::Stats { tok_per_s, produced } => {
+                    self.tok_per_s = tok_per_s;
+                    self.gen_tokens = produced;
+                }
                 FromWorker::ToolCall(desc) => {
                     self.log(format!("[tool] {desc}"));
                     if let Some(last) = self.transcript.last_mut() {
@@ -958,15 +1173,21 @@ impl OverflowApp {
                     self.unload_model();
                 }
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Download a Qwen2.5-Coder base:").color(MUTED).size(11.0));
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("1.5B (~1.1 GB)")).clicked() {
-                        self.download_model("download 1.5B", QWEN_1_5B_URL, "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
-                    }
-                    if ui.add_enabled(!busy, egui::Button::new("7B (~4.4 GB)")).clicked() {
-                        self.download_model("download 7B", QWEN_7B_URL, "qwen2.5-coder-7b-instruct-q4_k_m.gguf");
-                    }
-                });
+                ui.label(egui::RichText::new("Download a model (Qwen2.5-Coder):").color(MUTED).size(11.0));
+                let sel = self.dl_sel.min(MODELS.len() - 1);
+                egui::ComboBox::from_id_salt("dl_model")
+                    .selected_text(MODELS[sel].0)
+                    .width(300.0)
+                    .show_ui(ui, |ui| {
+                        for (i, m) in MODELS.iter().enumerate() {
+                            ui.selectable_value(&mut self.dl_sel, i, m.0);
+                        }
+                    });
+                if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Download").color(GREEN))).clicked() {
+                    let (label, url, file) = MODELS[self.dl_sel.min(MODELS.len() - 1)];
+                    self.download_model(label, url, file);
+                }
+                ui.label(egui::RichText::new("Große Modelle (14B) sind klüger und laufen dank Offloading auch auf 12 GB VRAM — nur langsamer.").color(MUTED).size(10.0));
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("…or your own model (GGUF URL):").color(MUTED).size(11.0));
                 ui.horizontal(|ui| {
@@ -1088,13 +1309,33 @@ impl OverflowApp {
                             ui.selectable_value(&mut self.gen.effort, 2, "high");
                         });
                         ui.add_space(4.0);
+                        // Quick presets.
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("preset").color(MUTED).size(12.0));
+                            if ui.button("Deterministisch").clicked() {
+                                self.gen.temp = 0.0;
+                            }
+                            if ui.button("Präzise").clicked() {
+                                self.gen.temp = 0.3;
+                                self.gen.top_p = 0.9;
+                            }
+                            if ui.button("Kreativ").clicked() {
+                                self.gen.temp = 0.9;
+                                self.gen.top_p = 0.95;
+                            }
+                        });
                         ui.add(egui::Slider::new(&mut self.gen.temp, 0.0..=1.5).text("temperature"));
                         ui.add(egui::Slider::new(&mut self.gen.top_p, 0.1..=1.0).text("top-p"));
                         ui.add(egui::Slider::new(&mut self.gen.top_k, 1..=200).text("top-k"));
-                        ui.add(egui::Slider::new(&mut self.gen.max_tokens, 32..=4096).text("max tokens"));
+                        ui.add(egui::Slider::new(&mut self.gen.max_tokens, 32..=8192).text("max tokens"));
                         ui.add(egui::Slider::new(&mut self.gen.repeat_penalty, 1.0..=2.0).text("repeat penalty"));
-                        ui.add(egui::Slider::new(&mut self.gen.repeat_last_n, 16..=512).text("repeat window"));
-                        ui.label(egui::RichText::new("temp 0 = deterministic. repeat penalty >1 stops loops.").color(MUTED).size(10.5));
+                        ui.add(egui::Slider::new(&mut self.gen.repeat_last_n, 16..=1024).text("repeat window"));
+                        ui.horizontal(|ui| {
+                            if ui.button("Standard wiederherstellen").clicked() {
+                                self.gen = GenCfg::default();
+                            }
+                        });
+                        ui.label(egui::RichText::new("temp 0 = deterministisch (verlustfreies Spec-Decoding aktiv). repeat penalty >1 bricht Schleifen. max tokens begrenzt die Antwortlänge.").color(MUTED).size(10.5));
                     });
                 }); // end scroll area
             });
@@ -1108,7 +1349,13 @@ impl OverflowApp {
                 ui.set_min_width(340.0);
                 section(ui, "DEV · METRICS");
                 ui.label(egui::RichText::new(format!("backend   {}", self.backend)).color(GREEN).size(12.0));
-                ui.label(egui::RichText::new(format!("speed     {:.1} tok/s", self.tok_per_s)).color(FG).size(12.0));
+                let generating = matches!(self.status, Status::Generating);
+                // Live speed + token count while the model is producing output.
+                let spd = egui::RichText::new(format!("speed     {:.1} tok/s", self.tok_per_s))
+                    .color(if generating { GREEN } else { FG }).size(12.0);
+                ui.label(spd);
+                ui.label(egui::RichText::new(format!("tokens    {}{}", self.gen_tokens, if generating { " ▸" } else { "" }))
+                    .color(if generating { AMBER } else { MUTED }).size(12.0));
                 if self.tab == Tab::OnlyChat {
                     if let Some(full) = self.only.tok_full {
                         ui.label(egui::RichText::new(format!("chat      {full} Token")).color(CYAN).size(12.0));
@@ -1187,6 +1434,8 @@ impl OverflowApp {
             .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(16, 12)))
             .show(ui, |ui| {
                 let generating = matches!(self.status, Status::Generating);
+                let researching = self.research_rx.is_some();
+                let mut do_research = false;
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(">").color(AMBER).strong());
                     if generating {
@@ -1197,16 +1446,29 @@ impl OverflowApp {
                             self.log("stop requested");
                         }
                     }
+                    // Internet research: fetch web results for the query first.
+                    let net = self.perms.network;
+                    let rcol = if net { CYAN } else { MUTED };
+                    let rlabel = if researching { "🌐…" } else { "🌐" };
+                    if ui.add_enabled(can_send && !researching, egui::Button::new(egui::RichText::new(rlabel).color(rcol)))
+                        .on_hover_text(if net { "Internet-Recherche zur Frage" } else { "Netzwerkzugriff ist aus — erst in den Einstellungen aktivieren" })
+                        .clicked()
+                    {
+                        do_research = true;
+                    }
                     let edit = egui::TextEdit::singleline(&mut self.input)
                         .hint_text("type a message, Enter to send")
                         .desired_width(f32::INFINITY);
-                    let resp = ui.add_enabled(can_send, edit);
+                    let resp = ui.add_enabled(can_send && !researching, edit);
                     let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if entered && can_send {
                         self.send_current_input();
                         resp.request_focus();
                     }
                 });
+                if do_research {
+                    self.start_research();
+                }
             });
 
         egui::CentralPanel::default()
@@ -1632,6 +1894,53 @@ impl OverflowApp {
         }
     }
 
+    /// Server tab: expose a mobile chat web UI over HTTPS (reach it via your
+    /// Tailscale IP from anywhere while the PC is on).
+    fn server_body(&mut self, ui: &mut egui::Ui) {
+        let mut toggle = false;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(20, 16)))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("SERVER").color(AMBER).size(20.0).strong());
+                ui.label(egui::RichText::new("Von überall mit der AI schreiben — eine HTTPS-WebUI auf deiner Tailscale-IP.").color(MUTED).size(12.0));
+                ui.add_space(14.0);
+                let running = self.server.handle.is_some();
+                egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::same(16)).stroke(Stroke::new(1.0, LINE)).show(ui, |ui| {
+                    ui.set_max_width(620.0);
+                    let dot = if running { GREEN } else { MUTED };
+                    ui.horizontal(|ui| {
+                        // pulsing status dot while running
+                        let t = ui.input(|i| i.time);
+                        let a = if running { 0.5 + 0.5 * (t * 2.0).sin() as f32 } else { 1.0 };
+                        ui.label(egui::RichText::new("●").color(dot.gamma_multiply(a)).size(14.0));
+                        ui.label(egui::RichText::new(if running { "Server läuft" } else { "Server aus" }).color(if running { GREEN } else { FG }).strong());
+                    });
+                    ui.add_space(8.0);
+                    if self.handle.is_none() {
+                        ui.label(egui::RichText::new("Zuerst ein Modell laden (Einstellungen → Model).").color(RED).size(12.0));
+                    }
+                    let label = if running { "Server stoppen" } else { "Server starten" };
+                    let col = if running { RED } else { GREEN };
+                    if ui.add_enabled(self.handle.is_some() || running, egui::Button::new(egui::RichText::new(label).color(col).strong())).clicked() {
+                        toggle = true;
+                    }
+                    if !self.server.status.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&self.server.status).color(if running { GREEN } else { MUTED }).size(12.5).monospace());
+                    }
+                    if running {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Öffne diese Adresse am Handy (gleiches Tailscale-Netz). Beim ersten Mal die Zertifikatswarnung bestätigen (selbst-signiert).").color(MUTED).size(11.0));
+                    }
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Hinweis: Port 443 braucht ggf. Rechte — sonst nutzt der Server automatisch 8443.").color(MUTED).size(10.5));
+                });
+            });
+        if toggle {
+            self.toggle_server();
+        }
+    }
+
     /// Learning tab: drive the QLoRA pipeline (Python) from the GUI.
     fn learning_body(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
@@ -1745,6 +2054,7 @@ impl eframe::App for OverflowApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_trainer();
+        self.drain_research();
 
         egui::Panel::top("titlebar")
             .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)))
@@ -1762,6 +2072,9 @@ impl eframe::App for OverflowApp {
                     }
                     if ui.selectable_label(self.tab == Tab::Learning, egui::RichText::new("Learning").size(13.0)).clicked() {
                         self.tab = Tab::Learning;
+                    }
+                    if ui.selectable_label(self.tab == Tab::Server, egui::RichText::new("Server").size(13.0)).clicked() {
+                        self.tab = Tab::Server;
                     }
                     if ui.selectable_label(self.tab == Tab::Docs, egui::RichText::new("Docs").size(13.0)).clicked() {
                         self.tab = Tab::Docs;
@@ -1790,7 +2103,15 @@ impl eframe::App for OverflowApp {
                         };
                         ui.label(egui::RichText::new(label).color(MUTED).size(12.0));
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new(dot).color(col).size(12.0));
+                        // Pulse the dot while the model is busy.
+                        let pulsing = matches!(self.status, Status::Generating | Status::Loading);
+                        let a = if pulsing {
+                            let t = ui.input(|i| i.time);
+                            0.4 + 0.6 * (0.5 + 0.5 * (t * 3.0).sin() as f32)
+                        } else {
+                            1.0
+                        };
+                        ui.label(egui::RichText::new(dot).color(col.gamma_multiply(a)).size(12.0));
                     });
                 });
             });
@@ -1803,12 +2124,18 @@ impl eframe::App for OverflowApp {
             Tab::Chat => self.chat_body(ui),
             Tab::OnlyChat => self.onlychat_body(ui),
             Tab::Learning => self.learning_body(ui),
+            Tab::Server => self.server_body(ui),
             Tab::Docs => docs_body(ui),
         }
 
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(1000));
-        if matches!(self.status, Status::Generating | Status::Loading) || self.trainer.is_some() {
+        if matches!(self.status, Status::Generating | Status::Loading)
+            || self.trainer.is_some()
+            || self.research_rx.is_some()
+            || self.only.generating
+            || self.server.handle.is_some()
+        {
             ctx.request_repaint();
         }
     }
@@ -1840,9 +2167,47 @@ fn docs_body(ui: &mut egui::Ui) {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 doc_section(ui, "Getting started", &[
                     "Load a model (Settings -> Model), then type in the Chat tab.",
-                    "Everything runs locally on your machine — nothing is sent anywhere.",
-                    "Tabs: Chat (talk + agent), Learning (fine-tune), Docs (this).",
-                    "Toggle 'dev' (top bar) for live metrics, the math, and a raw console.",
+                    "Everything runs locally on your machine — nothing is sent anywhere,",
+                    "except an internet-research request or a model download you trigger.",
+                    "Tabs: Chat (talk + agent), OnlyChat (chat over a database),",
+                    "Learning (fine-tune), Server (phone access), Docs (this).",
+                    "Toggle 'dev' (top bar) for live metrics (tokens/s, token count), the math, a console.",
+                ]);
+                doc_section(ui, "OnlyChat (database-backed chat)", &[
+                    "OnlyChat keeps each conversation in a SQLite database instead of the",
+                    "context window, so very long chats stay cheap to run.",
+                    "",
+                    "# Pick the database per chat.",
+                    "When you create a chat you choose which .sqlite file it lives in, or make",
+                    "a new one. Open an existing file with 'DB öffnen' to see its chats.",
+                    "",
+                    "# It reads a memory database.",
+                    "Open a structured memory/RAG database (facts, notes, projects, ...) and",
+                    "OnlyChat retrieves the relevant rows (incl. FTS) and gives them to the AI",
+                    "as context — so it actually knows your stored data. It only reads your tables.",
+                    "",
+                    "# Context modes (per chat).",
+                    "Ganzer Chat / Letzte N Runden / Zusammenfassung + Abruf — the last two keep",
+                    "the token cost bounded. The dev panel shows chat vs. context token counts.",
+                    "",
+                    "# Encryption.",
+                    "A database can be encrypted at rest (Argon2id + XChaCha20-Poly1305).",
+                    "",
+                    "# Manage.",
+                    "The gear (⚙) per chat renames or deletes it (optionally the whole DB file).",
+                ]);
+                doc_section(ui, "Internet research", &[
+                    "The 🌐 button next to the Chat input searches the web for your question",
+                    "and feeds the results to the model as context.",
+                    "It needs network access ON (Settings -> permissions); otherwise it tells",
+                    "you to enable it first. Results can be incomplete — treat them as hints.",
+                ]);
+                doc_section(ui, "Server mode (chat from your phone)", &[
+                    "The Server tab serves a small HTTPS chat web UI from this PC.",
+                    "Load a model, open the Server tab, press 'Server starten'.",
+                    "Open the shown https://<tailscale-ip> address on your phone (same Tailnet).",
+                    "First visit: accept the certificate warning (self-signed), then chat.",
+                    "Port 443 is used if allowed, otherwise 8443. The one model is shared.",
                 ]);
                 doc_section(ui, "Prompting tips", &[
                     "# Be specific about the goal and the context.",
@@ -1899,12 +2264,20 @@ fn docs_body(ui: &mut egui::Ui) {
                     "For authorized security work and learning.",
                 ]);
                 doc_section(ui, "Models", &[
-                    "Settings -> Model: load, unload, or download a model (like LM Studio).",
+                    "Settings -> Model: pick a model from the dropdown and Download, or load",
+                    "your own GGUF. Choices range from 0.5B (tiny/fast) to 14B (smart).",
+                    "Bigger = smarter but needs more memory; thanks to whole-layer CPU",
+                    "offloading a 14B still runs on a 12 GB card at full quality, just slower.",
                     "Models live in ~/.local/share/overflow/models (or ./models in a dev build);",
-                    "the package also installs to /usr/share/overflow/models.",
-                    "Download a base model to get started, or load your own fine-tuned GGUF.",
+                    "the package also installs to /usr/share/overflow/models, and OVERFLOW also",
+                    "scans /mnt/ai/Overflow Models.",
                     "Unload frees the memory/VRAM; load a different one anytime.",
                     "The engine runs Qwen2-architecture GGUFs.",
+                ]);
+                doc_section(ui, "Datasets (Learning tab)", &[
+                    "Several ready-made datasets to fine-tune on, selectable in the Learning tab:",
+                    "infosec professor, identity + basics, CTF/binary exploitation, web security.",
+                    "Or drop in your own JSONL (chat format). Train -> export GGUF -> load.",
                 ]);
                 ui.add_space(16.0);
             });

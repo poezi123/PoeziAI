@@ -82,6 +82,20 @@ $$ f(x) = p @paren{h_L @paren{@dots h_1(x)}} $$
 
 @bold{Alltagsbild.} Ein Fließband, das in der Mitte an einen zweiten Arbeiter übergibt. Das fertige Produkt ist identisch, es dauert nur etwas länger.
 
+@chapter{Was das Programm OVERFLOW kann}
+
+@note{Dieses Kapitel beschreibt die Anwendung OVERFLOW\, nicht die Forschung. Es sind praktische Funktionen\, keine wissenschaftlichen Funde.}
+
+@list{
+  @item{@bold{Chat und Agent.} Lokales Schreiben mit der KI\; der Agent kann Dateien lesen und schreiben sowie Befehle ausführen\, mit Nachfrage bei heiklen Aktionen.}
+  @item{@bold{OnlyChat.} Gespräche liegen in einer Datenbank statt im Kontextfenster. Die Datenbank wird je Chat gewählt. Eine vorhandene Wissens-Datenbank wird gelesen und die passenden Einträge der KI als Kontext gegeben\, damit sie den gespeicherten Inhalt kennt. Drei Kontext-Modi begrenzen die Rechenkosten. Die Datenbank kann verschlüsselt werden.}
+  @item{@bold{Internet-Recherche.} Auf Wunsch holt das Programm Web-Ergebnisse zur Frage und gibt sie der KI als Kontext. Nur wenn der Netzwerkzugriff eingeschaltet ist.}
+  @item{@bold{Server-Modus.} Das Programm stellt eine kleine Weboberfläche über HTTPS bereit\, erreichbar über die Tailscale-Adresse\, damit man vom Handy aus mit der KI schreiben kann.}
+  @item{@bold{Modelle.} Auswahl mehrerer Modelle von sehr klein bis groß. Große Modelle sind klüger und laufen dank Auslagerung auch auf kleiner Grafikkarte\, nur langsamer.}
+  @item{@bold{Eigene Modelle trainieren.} Mehrere fertige Datensätze stehen zur Wahl\, oder eigene Daten.}
+  @item{@bold{Live-Anzeige.} Während die KI schreibt\, sieht man Geschwindigkeit und Tokenzahl in Echtzeit.}
+}
+
 @chapter{Das ehrliche Fazit}
 
 @note{Keine dieser Aussagen ist eine neue Weltformel, und die einzelnen Verfahren sind bekannt. Eigen ist die Kombination auf schwacher Hardware ohne fremde Bibliotheken, die bit-genaue Überprüfung, dass nichts an Qualität verloren geht, und die ehrlichen Messungen, bis hin zum widerlegten Spezialisierungs-Versuch.}

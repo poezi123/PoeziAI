@@ -28,6 +28,9 @@ pub enum ToWorker {
     /// OnlyChat: count tokens in the whole chat and in the context a turn would
     /// actually feed; replies with `OnlyChatTokens`.
     CountTokens { full: String, ctx: String },
+    /// Server mode: a plain chat turn from the web UI; the full reply is sent
+    /// back on `reply` (no GUI streaming).
+    ServerChat { turns: Vec<(bool, String)>, gen: GenCfg, reply: Sender<String> },
 }
 
 /// worker -> UI.
@@ -38,7 +41,7 @@ pub enum FromWorker {
     ToolCall(String),
     ToolResult(String),
     Approval { desc: String, outside: bool },
-    Stats { tok_per_s: f32 },
+    Stats { tok_per_s: f32, produced: u32 },
     /// OnlyChat: a summary produced by `Summarize`, to be stored by the UI.
     Summary(String),
     /// OnlyChat: (whole-chat tokens, context tokens) for the active chat.
@@ -128,6 +131,13 @@ fn run(
                 let ctx = tok.encode(&ctx, false, true).len();
                 let _ = tx_out.send(FromWorker::OnlyChatTokens { full, ctx });
             }
+            ToWorker::ServerChat { turns, gen, reply } => {
+                cancel.store(false, Ordering::Relaxed);
+                let mut c = model.new_cache();
+                let mut silent = SilentHost;
+                let out = agent::chat_plain(&model, &tok, &mut c, &turns, None, &gen, cancel, &mut silent);
+                let _ = reply.send(out);
+            }
             ToWorker::Approve(_) => {}
         }
     }
@@ -172,7 +182,7 @@ impl Host for GuiHost<'_> {
                 self.n += 1;
                 let secs = t0.elapsed().as_secs_f32();
                 if secs > 0.0 {
-                    let _ = self.tx.send(FromWorker::Stats { tok_per_s: self.n as f32 / secs });
+                    let _ = self.tx.send(FromWorker::Stats { tok_per_s: self.n as f32 / secs, produced: self.n });
                 }
                 let _ = self.tx.send(FromWorker::Token(s.to_string()));
             }
