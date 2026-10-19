@@ -48,8 +48,8 @@ by the weights and the local prompt, not by a built-in filter.
 
 | System | Package | |
 |---|---|---|
-| **Arch Linux**, CachyOS, Manjaro, EndeavourOS | `overflow-0.2.0-1-x86_64.pkg.tar.zst` | [Download](https://github.com/poezi123/PoeziAI/releases/latest) |
-| **Any other Linux** (x86_64) | `overflow-0.2.0-linux-x64.tar.gz` | [Download](https://github.com/poezi123/PoeziAI/releases/latest) |
+| **Arch Linux**, CachyOS, Manjaro, EndeavourOS | `overflow-0.2.3-1-x86_64.pkg.tar.zst` | [Download](https://github.com/poezi123/PoeziAI/releases/download/v0.2.3/overflow-0.2.3-1-x86_64.pkg.tar.zst) |
+| **Any other Linux** (x86_64) | `overflow-0.2.3-linux-x64.tar.gz` | [Download](https://github.com/poezi123/PoeziAI/releases/download/v0.2.3/overflow-0.2.3-linux-x64.tar.gz) |
 
 All versions and checksums (`SHA256SUMS.txt`) are on the
 [releases page](https://github.com/poezi123/PoeziAI/releases).
@@ -67,14 +67,14 @@ folder.
 **Arch Linux and derivatives**
 
 ```sh
-sudo pacman -U overflow-0.2.0-1-x86_64.pkg.tar.zst
+sudo pacman -U overflow-0.2.3-1-x86_64.pkg.tar.zst
 ```
 
 **Any other Linux (portable tarball)**
 
 ```sh
-tar xf overflow-0.2.0-linux-x64.tar.gz
-cd overflow-0.2.0
+tar xf overflow-0.2.3-linux-x64.tar.gz
+cd overflow-0.2.3
 ./overflow
 ```
 
