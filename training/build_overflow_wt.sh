@@ -19,13 +19,19 @@ ADAPTER="${ADAPTER:-training/out/wt-adapter}"
 OUT="${OUT:-models/overflow_wt-7b-q8_0.gguf}"
 EPOCHS="${EPOCHS:-3}"
 disk() { df -h /home | tail -1; }
+mkdir -p training/out "$(dirname "$OUT")"
+# Prefer plain HTTPS downloads from the HF Hub — the xet transfer can stall at 0%.
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-60}"
 
-echo "[1/7] QLoRA fine-tune (downloads 7B base ~15GB if not cached) ..."; disk
-# GPU_MEM_GIB>0 caps GPU memory and offloads the rest to CPU RAM, so the 7B can
-# train while the GPU is busy. Skip if the adapter is already trained.
+echo "[1/7] QLoRA fine-tune (downloads the base if not cached) ..."; disk
+# GPU_MEM_GIB>0 caps GPU memory and offloads the rest to CPU RAM, so a big base
+# can train while the GPU is busy. MAXSTEPS>0 caps steps (quick test). Skip if
+# the adapter is already trained.
 if [ ! -d "$ADAPTER" ]; then
     "$PY" training/train_qlora.py --base "$BASE" --data "$DATA" --out "$ADAPTER" \
-        --epochs "$EPOCHS" --gpu-mem-gib "${GPU_MEM_GIB:-0}"
+        --epochs "$EPOCHS" --gpu-mem-gib "${GPU_MEM_GIB:-0}" \
+        ${MAXSTEPS:+--max-steps "$MAXSTEPS"}
 else
     echo "    adapter exists ($ADAPTER) — skipping training"
 fi
@@ -43,8 +49,7 @@ echo "[4/7] convert LoRA adapter -> GGUF ..."
 "$PY" "$LC/convert_lora_to_gguf.py" "$ADAPTER" --base "$SNAP" --outfile training/out/adapter.gguf --outtype f16
 disk
 
-echo "[5/7] free HF base cache ..."
-rm -rf "$ROOT/training/hf-cache"
+echo "[5/7] (HF base cache kept for next time) ..."
 disk
 
 echo "[6/7] merge (mmap) + quantize -> Q8_0 ..."

@@ -274,12 +274,15 @@ struct LearnState {
     task: String,
     /// Download progress in percent, when the task reports one.
     pct: Option<f32>,
+    /// Output GGUF filename of the last train+build (what "Load" loads).
+    out_name: String,
 }
 
 impl Default for LearnState {
     fn default() -> Self {
+        let base = "Qwen/Qwen2.5-Coder-1.5B-Instruct";
         LearnState {
-            base: "Qwen/Qwen2.5-Coder-7B-Instruct".into(),
+            base: base.into(),
             data: DATASETS[0].1.into(),
             gen_script: DATASETS[0].2.into(),
             epochs: "3".into(),
@@ -288,8 +291,25 @@ impl Default for LearnState {
             status: "idle".into(),
             task: String::new(),
             pct: None,
+            out_name: model_out_name(base),
         }
     }
+}
+
+/// Fine-tune bases offered in the Learning tab (HF repo ids). Smaller trains and
+/// downloads faster; the default is a small one so it finishes on a laptop.
+const BASES: &[&str] = &[
+    "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+    "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+    "Qwen/Qwen2.5-Coder-3B-Instruct",
+    "Qwen/Qwen2.5-Coder-7B-Instruct",
+];
+
+/// Output GGUF filename derived from a base repo id, e.g.
+/// "Qwen/Qwen2.5-Coder-1.5B-Instruct" -> "overflow-qwen2.5-coder-1.5b-instruct-q8_0.gguf".
+fn model_out_name(base: &str) -> String {
+    let tail = base.rsplit('/').next().unwrap_or(base).to_lowercase();
+    format!("overflow-{tail}-q8_0.gguf")
 }
 
 // --- OVERFLOW palette ---
@@ -738,10 +758,12 @@ impl OverflowApp {
             self.log("a task is already running");
             return;
         }
-        let envs = vec![(
-            "HF_HOME".to_string(),
-            Self::cwd().join("training/hf-cache").display().to_string(),
-        )];
+        let envs = vec![
+            ("HF_HOME".to_string(), Self::cwd().join("training/hf-cache").display().to_string()),
+            // The xet transfer can hang at 0% on some networks — use plain HTTPS.
+            ("HF_HUB_DISABLE_XET".to_string(), "1".to_string()),
+            ("HF_HUB_DOWNLOAD_TIMEOUT".to_string(), "60".to_string()),
+        ];
         self.log(format!("$ {label}"));
         self.learn.status = format!("running: {label}");
         self.learn.task = label.to_string();
@@ -2039,7 +2061,16 @@ impl OverflowApp {
                 section(ui, "CONFIG");
                 egui::Grid::new("learncfg").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                     ui.label(egui::RichText::new("base model").color(MUTED).size(12.0));
-                    ui.add(egui::TextEdit::singleline(&mut self.learn.base).desired_width(380.0));
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("base_pick").width(300.0).selected_text(self.learn.base.clone()).show_ui(ui, |ui| {
+                            for b in BASES {
+                                if ui.selectable_label(self.learn.base == *b, *b).clicked() {
+                                    self.learn.base = (*b).into();
+                                    self.learn.out_name = model_out_name(b);
+                                }
+                            }
+                        });
+                    });
                     ui.end_row();
                     ui.label(egui::RichText::new("dataset").color(MUTED).size(12.0));
                     let cur_label = DATASETS.iter().find(|d| d.1 == self.learn.data.as_str()).map(|d| d.0).unwrap_or("custom");
@@ -2074,13 +2105,15 @@ impl OverflowApp {
                         // stale adapter forces a fresh train on the selected dataset.
                         let (b, d, e) = (self.learn.base.clone(), self.learn.data.clone(), self.learn.epochs.clone());
                         let lc = Self::llama_dir().map(|p| p.display().to_string()).unwrap_or_default();
+                        let out = model_out_name(&b);
+                        self.learn.out_name = out.clone();
                         let cmd = format!(
-                            "rm -rf training/out && env LC='{lc}' BASE='{b}' DATA='{d}' EPOCHS='{e}' bash training/build_overflow_wt.sh"
+                            "rm -rf training/out && env LC='{lc}' BASE='{b}' DATA='{d}' EPOCHS='{e}' OUT='models/{out}' bash training/build_overflow_wt.sh"
                         );
                         self.start("train + build", "sh", vec!["-c".into(), cmd]);
                     }
                     if ui.add_enabled(!busy, egui::Button::new("3 · Load trained model")).clicked() {
-                        self.load_model(Self::cwd().join("models/overflow_wt-7b-q8_0.gguf"));
+                        self.load_model(Self::cwd().join("models").join(&self.learn.out_name));
                     }
                 });
                 ui.add_space(4.0);
