@@ -8,7 +8,10 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 export HF_HOME="$ROOT/training/hf-cache"
 PY="$ROOT/training/venv/bin/python"
-LC="$ROOT/vendor/llama.cpp"
+# llama.cpp dir: overridable (the GUI passes LC=/usr/share/overflow/llama.cpp on
+# an installed system); default to the repo's vendored copy.
+LC="${LC:-$ROOT/vendor/llama.cpp}"
+export LD_LIBRARY_PATH="$LC/build/bin:${LD_LIBRARY_PATH:-}"
 # Overridable via env (the Learning tab passes DATA/BASE/OUT).
 BASE="${BASE:-Qwen/Qwen2.5-Coder-7B-Instruct}"
 DATA="${DATA:-training/data/overflow_wt.jsonl}"

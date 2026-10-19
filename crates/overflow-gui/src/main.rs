@@ -403,16 +403,20 @@ use std::path::{Path, PathBuf};
 
 /// Standard per-user data dir for models: ./models in a dev checkout, else
 /// $XDG_DATA_HOME/overflow/models (defaulting to ~/.local/share). No stray dirs.
+/// The user's XDG data dir (`$XDG_DATA_HOME` or `~/.local/share`).
+fn xdg_data_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn data_models_dir() -> PathBuf {
     if Path::new("models").is_dir() {
         return PathBuf::from("models");
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("overflow/models")
+    xdg_data_dir().join("overflow/models")
 }
 
 /// All .gguf models found in the dev ./models dir, the XDG data dir, and the
@@ -685,9 +689,44 @@ impl OverflowApp {
         }
     }
 
-    /// Project root (where the training scripts expect to run).
+    /// Working root for the Learning pipeline: where `training/…` resolves and
+    /// where the venv / data / outputs are written. In a dev checkout that is
+    /// the repo (training/ sits next to us). In the installed package the
+    /// scripts live read-only under /usr/share/overflow, so we use a writable
+    /// data dir and seed the training scripts into it (so `training/…` commands
+    /// both exist and can write).
     fn cwd() -> std::path::PathBuf {
-        std::env::current_dir().unwrap_or_else(|_| ".".into())
+        if PathBuf::from("training/build_overflow_wt.sh").exists() {
+            return std::env::current_dir().unwrap_or_else(|_| ".".into());
+        }
+        let base = xdg_data_dir().join("overflow");
+        let dest = base.join("training");
+        let _ = std::fs::create_dir_all(&dest);
+        let src = PathBuf::from("/usr/share/overflow/training");
+        if src.join("build_overflow_wt.sh").exists() {
+            if let Ok(rd) = std::fs::read_dir(&src) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_file() {
+                        if let Some(n) = p.file_name() {
+                            let _ = std::fs::copy(&p, dest.join(n));
+                        }
+                    }
+                }
+            }
+        }
+        base
+    }
+
+    /// Where the llama.cpp GGUF-export tools live (convert scripts + binaries):
+    /// the repo's vendored copy in dev, or the system copy in the package.
+    fn llama_dir() -> Option<PathBuf> {
+        for d in [Self::cwd().join("vendor/llama.cpp"), PathBuf::from("/usr/share/overflow/llama.cpp")] {
+            if d.join("convert_hf_to_gguf.py").exists() {
+                return Some(d);
+            }
+        }
+        None
     }
 
     fn venv_python() -> std::path::PathBuf {
@@ -2034,13 +2073,14 @@ impl OverflowApp {
                         // RAM/disk-safe pipeline: QLoRA -> mmap merge -> Q8. Removing any
                         // stale adapter forces a fresh train on the selected dataset.
                         let (b, d, e) = (self.learn.base.clone(), self.learn.data.clone(), self.learn.epochs.clone());
+                        let lc = Self::llama_dir().map(|p| p.display().to_string()).unwrap_or_default();
                         let cmd = format!(
-                            "rm -rf training/out && env BASE='{b}' DATA='{d}' EPOCHS='{e}' bash training/build_overflow_wt.sh"
+                            "rm -rf training/out && env LC='{lc}' BASE='{b}' DATA='{d}' EPOCHS='{e}' bash training/build_overflow_wt.sh"
                         );
                         self.start("train + build", "sh", vec!["-c".into(), cmd]);
                     }
                     if ui.add_enabled(!busy, egui::Button::new("3 · Load trained model")).clicked() {
-                        self.load_model("models/overflow_wt-7b-q8_0.gguf".into());
+                        self.load_model(Self::cwd().join("models/overflow_wt-7b-q8_0.gguf"));
                     }
                 });
                 ui.add_space(4.0);
