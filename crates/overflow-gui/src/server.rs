@@ -221,7 +221,7 @@ fn handle_conn<S: Read + Write>(
             let ok = bearer.as_deref().map(|t| ct_eq(t.as_bytes(), token.as_bytes())).unwrap_or(false);
             if !ok {
                 let msg = serde_json::json!({
-                    "reply": "Nicht autorisiert — öffne die vom Server angezeigte Adresse (mit #k=...)."
+                    "reply": "Not allowed — open the address shown in OVERFLOW (the one with #k=...)."
                 })
                 .to_string();
                 return respond(stream, 401, "application/json", msg.as_bytes());
@@ -238,7 +238,7 @@ fn handle_conn<S: Read + Write>(
 fn run_chat(body: &[u8], bridge: &Bridge, gen: &GenCfg) -> String {
     let v: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(_) => return "Fehler: ungültige Anfrage".to_string(),
+        Err(_) => return "Error: bad request".to_string(),
     };
     let mut turns: Vec<(bool, String)> = Vec::new();
     if let Some(arr) = v.get("messages").and_then(|m| m.as_array()) {
@@ -256,15 +256,15 @@ fn run_chat(body: &[u8], bridge: &Bridge, gen: &GenCfg) -> String {
     }
     let tx = { bridge.lock().ok().and_then(|g| g.clone()) };
     let Some(tx) = tx else {
-        return "Kein Modell geladen — lade in OVERFLOW ein Modell.".to_string();
+        return "No model loaded — load one in OVERFLOW.".to_string();
     };
     let (rtx, rrx) = channel::<String>();
     if tx.send(ToWorker::ServerChat { turns, gen: gen.clone(), reply: rtx }).is_err() {
-        return "Modell nicht erreichbar.".to_string();
+        return "Can't reach the model.".to_string();
     }
     match rrx.recv_timeout(Duration::from_secs(600)) {
         Ok(s) => strip_think(&s),
-        Err(_) => "Zeitüberschreitung.".to_string(),
+        Err(_) => "Timed out.".to_string(),
     }
 }
 
@@ -334,14 +334,14 @@ const PAGE: &str = r#"<!doctype html>
 </style></head><body>
 <header>OVERFLOW · remote</header>
 <div id="log"></div>
-<form id="f"><input id="t" placeholder="Nachricht…" autocomplete="off"><button id="b">Senden</button></form>
+<form id="f"><input id="t" placeholder="Message…" autocomplete="off"><button id="b">Send</button></form>
 <script>
 const log=document.getElementById('log'),f=document.getElementById('f'),t=document.getElementById('t'),b=document.getElementById('b');
 const msgs=[];
 const TOKEN=(new URLSearchParams(location.hash.slice(1)).get('k'))||'';
-function add(role,text){const d=document.createElement('div');d.className='msg '+(role==='user'?'you':'ai');d.innerHTML='<div class="who">'+(role==='user'?'du':'overflow')+'</div>';d.appendChild(document.createTextNode(text));log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-if(!TOKEN){add('assistant','Kein Zugangstoken in der URL. Öffne die Adresse, die OVERFLOW im Server-Reiter anzeigt (…/#k=…).');b.disabled=true;t.disabled=true;}
-f.onsubmit=async e=>{e.preventDefault();const text=t.value.trim();if(!text)return;t.value='';add('user',text);msgs.push({role:'user',content:text});b.disabled=true;const d=add('assistant','…');try{const r=await fetch('/api/chat',{method:'POST',headers:{'content-type':'application/json','authorization':'Bearer '+TOKEN},body:JSON.stringify({messages:msgs})});const j=await r.json();d.removeChild(d.lastChild);d.appendChild(document.createTextNode(j.reply||'(leer)'));msgs.push({role:'assistant',content:j.reply||''});}catch(err){d.appendChild(document.createTextNode(' Fehler: '+err));}b.disabled=false;log.scrollTop=log.scrollHeight;};
+function add(role,text){const d=document.createElement('div');d.className='msg '+(role==='user'?'you':'ai');d.innerHTML='<div class="who">'+(role==='user'?'you':'overflow')+'</div>';d.appendChild(document.createTextNode(text));log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+if(!TOKEN){add('assistant','No access key in the link. Open the address that OVERFLOW shows in the Server tab (…/#k=…).');b.disabled=true;t.disabled=true;}
+f.onsubmit=async e=>{e.preventDefault();const text=t.value.trim();if(!text)return;t.value='';add('user',text);msgs.push({role:'user',content:text});b.disabled=true;const d=add('assistant','…');try{const r=await fetch('/api/chat',{method:'POST',headers:{'content-type':'application/json','authorization':'Bearer '+TOKEN},body:JSON.stringify({messages:msgs})});const j=await r.json();d.removeChild(d.lastChild);d.appendChild(document.createTextNode(j.reply||'(empty)'));msgs.push({role:'assistant',content:j.reply||''});}catch(err){d.appendChild(document.createTextNode(' Error: '+err));}b.disabled=false;log.scrollTop=log.scrollHeight;};
 </script></body></html>"#;
 
 #[cfg(test)]

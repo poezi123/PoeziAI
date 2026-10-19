@@ -357,13 +357,13 @@ const QWEN_1_5B_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Inst
 /// quality. The last field drives the per-model hardware-fit badge.
 const MODELS: &[(&str, &str, &str, f32)] = &[
     (
-        "Qwen2.5-Coder 0.5B · Q4 (winzig)",
+        "Qwen2.5-Coder 0.5B · Q4 (tiny)",
         "https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
         "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
         1.0,
     ),
     (
-        "Qwen2.5-Coder 1.5B · Q4 (schnell)",
+        "Qwen2.5-Coder 1.5B · Q4 (fast)",
         QWEN_1_5B_URL,
         "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
         2.0,
@@ -381,7 +381,7 @@ const MODELS: &[(&str, &str, &str, f32)] = &[
         6.0,
     ),
     (
-        "Qwen2.5-Coder 14B · Q4 (am schlausten)",
+        "Qwen2.5-Coder 14B · Q4 (smartest)",
         "https://huggingface.co/bartowski/Qwen2.5-Coder-14B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
         "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
         10.5,
@@ -393,17 +393,17 @@ const MODELS: &[(&str, &str, &str, f32)] = &[
 /// quality as long as it fits in VRAM + RAM (GPU prefix + CPU tail).
 fn model_fit(need_gb: f32, vram_gb: Option<f32>, ram_gb: f32) -> (String, Color32) {
     match vram_gb {
-        Some(v) if need_gb <= v * 0.9 => ("✓ passt komplett in die GPU — voll schnell".into(), GREEN),
+        Some(v) if need_gb <= v * 0.9 => ("✓ fits fully in the GPU — nice and fast".into(), GREEN),
         Some(v) if need_gb <= v + ram_gb * 0.8 => (
-            format!("↯ läuft per Offload (GPU {v:.0} GB + CPU) — volle Qualität, langsamer"),
+            format!("↯ runs split (GPU {v:.0} GB + computer memory) — full quality, slower"),
             CYAN,
         ),
-        Some(_) => ("✗ zu groß für diese Hardware".into(), RED),
+        Some(_) => ("✗ too big for this computer".into(), RED),
         None => {
             if need_gb <= ram_gb * 0.8 {
-                ("↯ läuft auf der CPU — volle Qualität, langsamer".into(), CYAN)
+                ("↯ runs on the processor — full quality, slower".into(), CYAN)
             } else {
-                ("✗ zu groß für den Arbeitsspeicher".into(), RED)
+                ("✗ too big for this computer's memory".into(), RED)
             }
         }
     }
@@ -665,7 +665,7 @@ impl OverflowApp {
     fn toggle_server(&mut self) {
         if let Some(h) = self.server.handle.take() {
             h.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            self.server.status = "Server gestoppt".into();
+            self.server.status = "Server stopped".into();
             return;
         }
         self.sync_server_bridge();
@@ -673,10 +673,10 @@ impl OverflowApp {
             Ok(h) => {
                 // The URL (with its secret token) is shown separately as a
                 // selectable field, not folded into the status line.
-                self.server.status = "läuft".into();
+                self.server.status = "running".into();
                 self.server.handle = Some(h);
             }
-            Err(e) => self.server.status = format!("Fehler: {e}"),
+            Err(e) => self.server.status = format!("Error: {e}"),
         }
     }
 
@@ -864,14 +864,14 @@ impl OverflowApp {
             return;
         }
         if !self.perms.network {
-            self.log("Recherche: Netzwerkzugriff ist AUS — bitte erst in den Einstellungen aktivieren.");
-            self.status = Status::Error("Netzwerk aus — erst in Einstellungen aktivieren".into());
+            self.log("Web search: internet is OFF — please turn it on in Settings first.");
+            self.status = Status::Error("Internet is off — turn it on in Settings".into());
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.research_rx = Some(rx);
         self.research_query = q.clone();
-        self.log(format!("🌐 Recherche: {q}"));
+        self.log(format!("🌐 Searching the web: {q}"));
         std::thread::spawn(move || {
             let url = format!("https://lite.duckduckgo.com/lite/?q={}", url_encode(&q));
             let out = std::process::Command::new("curl")
@@ -882,8 +882,8 @@ impl OverflowApp {
                     let t = html_to_text(&String::from_utf8_lossy(&o.stdout));
                     t.chars().take(2000).collect()
                 }
-                Ok(o) => format!("(Recherche fehlgeschlagen: curl exit {:?})", o.status.code()),
-                Err(e) => format!("(Recherche fehlgeschlagen: {e})"),
+                Ok(o) => format!("(web search failed: curl exit {:?})", o.status.code()),
+                Err(e) => format!("(web search failed: {e})"),
             };
             let _ = tx.send(text);
         });
@@ -897,7 +897,7 @@ impl OverflowApp {
             self.research_rx = None;
             let q = std::mem::take(&mut self.research_query);
             self.input = format!(
-                "Nutze diese Web-Suchergebnisse (können unvollständig oder ungenau sein) und beantworte damit meine Frage. Nenne, worauf du dich stützt.\n\n[Suchergebnisse]\n{results}\n\n[Frage]\n{q}"
+                "Use these web search results (they may be incomplete or wrong) to answer my question. Say what you based your answer on.\n\n[Search results]\n{results}\n\n[Question]\n{q}"
             );
             self.send_current_input();
         }
@@ -974,7 +974,7 @@ impl OverflowApp {
     ) -> Option<usize> {
         let path = PathBuf::from(raw_path.trim());
         if raw_path.trim().is_empty() {
-            self.only.status = "Pfad fehlt".into();
+            self.only.status = "Please enter a file path".into();
             return None;
         }
         // Already open? reuse it.
@@ -987,17 +987,17 @@ impl OverflowApp {
             }
             let pass = (encrypt).then(|| pass.clone().unwrap_or_default());
             if encrypt && pass.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
-                self.only.status = "Für Verschlüsselung ein Passwort setzen".into();
+                self.only.status = "To encrypt it, please set a password".into();
                 return None;
             }
             chatdb::ChatDb::create(&path, pass.as_deref())
         } else {
             if !path.exists() {
-                self.only.status = "Datei nicht gefunden".into();
+                self.only.status = "File not found".into();
                 return None;
             }
             if chatdb::ChatDb::is_encrypted(&path) && pass.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
-                self.only.status = "Datenbank ist verschlüsselt — Passwort eingeben".into();
+                self.only.status = "This database is locked — please enter the password".into();
                 return None;
             }
             chatdb::ChatDb::open(&path, pass.as_deref())
@@ -1005,7 +1005,7 @@ impl OverflowApp {
         match result {
             Ok(db) => {
                 self.only.dbs.push(OpenDb { path: path.display().to_string(), db });
-                self.only.status = format!("{}: {}", if create { "erstellt" } else { "geöffnet" }, path.display());
+                self.only.status = format!("{}: {}", if create { "created" } else { "opened" }, path.display());
                 self.only_reload();
                 Some(self.only.dbs.len() - 1)
             }
@@ -1028,7 +1028,7 @@ impl OverflowApp {
     fn only_new_chat(&mut self) {
         let name = {
             let n = self.only.new_name.trim();
-            if n.is_empty() { "Neuer Chat".to_string() } else { n.to_string() }
+            if n.is_empty() { "New chat".to_string() } else { n.to_string() }
         };
         let mode = self.only.new_mode;
         // Resolve the target database from the picker.
@@ -1106,11 +1106,11 @@ impl OverflowApp {
             return;
         }
         let Some(handle) = &self.handle else {
-            self.only.status = "kein Modell geladen".into();
+            self.only.status = "No model loaded".into();
             return;
         };
         let Some((di, id)) = self.only.active else {
-            self.only.status = "keinen Chat ausgewählt".into();
+            self.only.status = "No chat picked".into();
             return;
         };
         let db = &self.only.dbs[di].db;
@@ -1145,7 +1145,7 @@ impl OverflowApp {
         // Summarize everything older than the verbatim window.
         let cut = self.only.msgs.len().saturating_sub(chatdb::LAST_N * 2);
         if cut == 0 {
-            self.only.status = "noch nichts zu kürzen".into();
+            self.only.status = "nothing old enough to shorten yet".into();
             return;
         }
         let mut body = String::new();
@@ -1156,7 +1156,7 @@ impl OverflowApp {
         self.only.summarizing = true;
         self.stream = Stream::Chat; // summary is silent; keep Chat routing idle
         let _ = handle.tx.send(ToWorker::Summarize { text: body, gen: self.gen.clone() });
-        self.only.status = "fasse zusammen …".into();
+        self.only.status = "making a summary …".into();
     }
 
     fn drain_events(&mut self) {
@@ -1211,7 +1211,7 @@ impl OverflowApp {
                     if let Some((di, id)) = self.only.active {
                         let upto = self.only.msgs.len().saturating_sub(chatdb::LAST_N * 2) as i64;
                         self.only.dbs[di].db.set_summary(id, &s, upto);
-                        self.only.status = "Zusammenfassung gespeichert".into();
+                        self.only.status = "Summary saved".into();
                     }
                     self.only.summarizing = false;
                     self.only_request_tokens();
@@ -1258,7 +1258,7 @@ impl OverflowApp {
             .show(ui, |ui| {
                 ui.set_min_width(340.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("SETTINGS").color(AMBER).size(14.0).strong());
+                    ui.label(egui::RichText::new("Settings").color(AMBER).size(14.0).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button(egui::RichText::new("✕").color(MUTED)).clicked() {
                             self.settings_open = false;
@@ -1269,17 +1269,17 @@ impl OverflowApp {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
 
                 // ---- model management (load / unload / download) ----
-                section(ui, "MODEL");
+                section(ui, "Model");
                 let current = self.current_model.clone();
                 let cur_name = current
                     .as_deref()
                     .and_then(|p| p.rsplit('/').next())
                     .unwrap_or("none");
-                ui.label(egui::RichText::new(format!("loaded: {cur_name}")).color(if current.is_some() { GREEN } else { MUTED }).size(12.0));
+                ui.label(egui::RichText::new(format!("in use: {cur_name}")).color(if current.is_some() { GREEN } else { MUTED }).size(12.0));
                 let busy = self.trainer.is_some();
                 let models = list_gguf();
                 if models.is_empty() {
-                    ui.label(egui::RichText::new("no models found").color(MUTED).size(11.0));
+                    ui.label(egui::RichText::new("No models yet").color(MUTED).size(11.0));
                 }
                 let mut to_load: Option<PathBuf> = None;
                 for m in &models {
@@ -1293,11 +1293,11 @@ impl OverflowApp {
                     self.load_model(p);
                 }
                 ui.add_space(4.0);
-                if ui.add_enabled(self.handle.is_some(), egui::Button::new("Unload (free memory)")).clicked() {
+                if ui.add_enabled(self.handle.is_some(), egui::Button::new("Unload model (free up memory)")).clicked() {
                     self.unload_model();
                 }
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("Download a model (Qwen2.5-Coder):").color(MUTED).size(11.0));
+                ui.label(egui::RichText::new("Get a model (Qwen2.5-Coder):").color(MUTED).size(11.0));
                 // Hardware for the fit badge (VRAM + total RAM).
                 let (vram_gb, ram_gb) = {
                     let hw = self.hw.lock().map(|g| *g).unwrap_or_default();
@@ -1322,9 +1322,9 @@ impl OverflowApp {
                     let (label, url, file, _) = MODELS[sel];
                     self.download_model(label, url, file);
                 }
-                ui.label(egui::RichText::new("Grün = passt in die GPU · Cyan = läuft dank unserer Offload-Forschung trotzdem in voller Qualität (langsamer) · Rot = zu groß.").color(MUTED).size(10.0));
+                ui.label(egui::RichText::new("Green = fits fully in the GPU · Cyan = still runs at full quality thanks to our offload work (just slower) · Red = too big.").color(MUTED).size(10.0));
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new("…or your own model (GGUF URL):").color(MUTED).size(11.0));
+                ui.label(egui::RichText::new("…or your own model (GGUF link):").color(MUTED).size(11.0));
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.dl_url).hint_text("https://…/model.gguf").desired_width(210.0));
                     let ok = !busy && self.dl_url.trim().ends_with(".gguf");
@@ -1338,19 +1338,19 @@ impl OverflowApp {
                 ui.add_space(12.0);
                 let hw = self.hw.lock().map(|g| *g).unwrap_or_default();
 
-                section(ui, "MODEL — THIS PROCESS");
+                section(ui, "This app right now");
                 meter(ui, "CPU", hw.proc_cpu_pct / 100.0, format!("{:.0}%", hw.proc_cpu_pct), GREEN);
                 let rssf = if hw.mem_total_gb > 0.0 { hw.proc_rss_gb / hw.mem_total_gb } else { 0.0 };
                 meter(ui, "RAM", rssf, format!("{:.2} GB", hw.proc_rss_gb), AMBER);
                 let bcol = if self.backend == "GPU" { GREEN } else { MUTED };
                 ui.label(
-                    egui::RichText::new(format!("compute: {}", self.backend))
+                    egui::RichText::new(format!("running on: {}", self.backend))
                         .color(bcol)
                         .size(11.0),
                 );
 
                 ui.add_space(12.0);
-                section(ui, "SYSTEM");
+                section(ui, "Your computer");
                 meter(ui, "CPU", hw.cpu_pct / 100.0, format!("{:.0}%", hw.cpu_pct), GREEN);
                 let memf = if hw.mem_total_gb > 0.0 { hw.mem_used_gb / hw.mem_total_gb } else { 0.0 };
                 meter(ui, "RAM", memf, format!("{:.1} / {:.1} GB", hw.mem_used_gb, hw.mem_total_gb), AMBER);
@@ -1361,31 +1361,31 @@ impl OverflowApp {
                         meter(ui, "VRAM", vf, format!("{vu:.0} / {vt:.0} MB"), AMBER);
                     }
                     _ => {
-                        ui.label(egui::RichText::new("GPU   n/a (nvidia-smi)").color(MUTED).size(12.0));
+                        ui.label(egui::RichText::new("GPU   not found (nvidia-smi)").color(MUTED).size(12.0));
                     }
                 }
 
                 ui.add_space(12.0);
-                section(ui, "GENERATION");
+                section(ui, "Speed");
                 ui.label(
-                    egui::RichText::new(format!("{:.1} tokens / sec", self.tok_per_s))
+                    egui::RichText::new(format!("{:.1} words per second (tokens)", self.tok_per_s))
                         .color(GREEN)
                         .size(13.0),
                 );
 
                 ui.add_space(12.0);
-                section(ui, "PERMISSIONS");
-                ui.checkbox(&mut self.perms.sandbox, "Sandbox mode — no system access");
+                section(ui, "What the AI is allowed to do");
+                ui.checkbox(&mut self.perms.sandbox, "Safe mode — the AI can't touch your computer");
                 let tools = !self.perms.sandbox;
                 ui.add_enabled_ui(tools, |ui| {
                     ui.checkbox(&mut self.perms.fs_read, "Read files");
-                    ui.checkbox(&mut self.perms.fs_write, "Create / modify files");
-                    ui.checkbox(&mut self.perms.shell, "Run shell commands");
-                    ui.checkbox(&mut self.perms.network, "Network access");
+                    ui.checkbox(&mut self.perms.fs_write, "Create and change files");
+                    ui.checkbox(&mut self.perms.shell, "Run commands");
+                    ui.checkbox(&mut self.perms.network, "Use the internet");
 
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new("Workspace folder — free access inside:")
+                        egui::RichText::new("Work folder — the AI can do anything inside it:")
                             .color(MUTED)
                             .size(11.0),
                     );
@@ -1396,14 +1396,14 @@ impl OverflowApp {
                     );
                     ui.checkbox(
                         &mut self.perms.confirm_outside,
-                        "Ask before anything outside this folder",
+                        "Ask me first before touching anything outside this folder",
                     );
                 });
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "Inside the workspace the agent acts freely; outside, it asks first — \
-                         like Claude Code. Enforced with the agent (Phase D).",
+                        "Inside the work folder the AI acts on its own; outside it, it asks you \
+                         first — just like Claude Code.",
                     )
                     .color(MUTED)
                     .size(11.0),
@@ -1411,8 +1411,8 @@ impl OverflowApp {
 
                 // ---- where the model files live (absolute paths) ----
                 ui.add_space(12.0);
-                section(ui, "MODEL FILES");
-                ui.label(egui::RichText::new("Put or drop .gguf models in these folders:").color(MUTED).size(11.0));
+                section(ui, "Where models live");
+                ui.label(egui::RichText::new("Put your .gguf models in one of these folders:").color(MUTED).size(11.0));
                 let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
                 for d in [PathBuf::from("models"), data_models_dir(), PathBuf::from("/usr/share/overflow/models")] {
                     let abs = if d.is_absolute() { d.clone() } else { cwd.join(&d) };
@@ -1425,52 +1425,52 @@ impl OverflowApp {
                     );
                 }
                 ui.label(
-                    egui::RichText::new("qwen2.5-coder-* = base models · overflow-* = your fine-tunes")
+                    egui::RichText::new("qwen2.5-coder-* = base models · overflow-* = models you trained")
                         .color(MUTED)
                         .size(10.5),
                 );
 
                 // ---- advanced settings (collapsed by default, at the bottom) ----
                 ui.add_space(14.0);
-                egui::CollapsingHeader::new(egui::RichText::new("ADVANCED").color(AMBER).size(12.0).strong())
+                egui::CollapsingHeader::new(egui::RichText::new("More settings").color(AMBER).size(12.0).strong())
                     .id_salt("advanced")
                     .show(ui, |ui| {
-                        ui.checkbox(&mut self.gen.thinking, "Thinking mode (reason before answering)");
-                        ui.checkbox(&mut self.show_thinking, "Show thinking in chat");
+                        ui.checkbox(&mut self.gen.thinking, "Thinking mode (think first, then answer)");
+                        ui.checkbox(&mut self.show_thinking, "Show the thinking in the chat");
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("effort").color(MUTED).size(12.0));
+                            ui.label(egui::RichText::new("how hard it thinks").color(MUTED).size(12.0));
                             ui.selectable_value(&mut self.gen.effort, 0, "low");
-                            ui.selectable_value(&mut self.gen.effort, 1, "med");
+                            ui.selectable_value(&mut self.gen.effort, 1, "medium");
                             ui.selectable_value(&mut self.gen.effort, 2, "high");
                         });
                         ui.add_space(4.0);
                         // Quick presets.
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("preset").color(MUTED).size(12.0));
-                            if ui.button("Deterministisch").clicked() {
+                            ui.label(egui::RichText::new("quick set").color(MUTED).size(12.0));
+                            if ui.button("Always same answer").clicked() {
                                 self.gen.temp = 0.0;
                             }
-                            if ui.button("Präzise").clicked() {
+                            if ui.button("Careful").clicked() {
                                 self.gen.temp = 0.3;
                                 self.gen.top_p = 0.9;
                             }
-                            if ui.button("Kreativ").clicked() {
+                            if ui.button("Creative").clicked() {
                                 self.gen.temp = 0.9;
                                 self.gen.top_p = 0.95;
                             }
                         });
-                        ui.add(egui::Slider::new(&mut self.gen.temp, 0.0..=1.5).text("temperature"));
+                        ui.add(egui::Slider::new(&mut self.gen.temp, 0.0..=1.5).text("randomness (temperature)"));
                         ui.add(egui::Slider::new(&mut self.gen.top_p, 0.1..=1.0).text("top-p"));
                         ui.add(egui::Slider::new(&mut self.gen.top_k, 1..=200).text("top-k"));
-                        ui.add(egui::Slider::new(&mut self.gen.max_tokens, 32..=8192).text("max tokens"));
-                        ui.add(egui::Slider::new(&mut self.gen.repeat_penalty, 1.0..=2.0).text("repeat penalty"));
-                        ui.add(egui::Slider::new(&mut self.gen.repeat_last_n, 16..=1024).text("repeat window"));
+                        ui.add(egui::Slider::new(&mut self.gen.max_tokens, 32..=8192).text("longest answer (tokens)"));
+                        ui.add(egui::Slider::new(&mut self.gen.repeat_penalty, 1.0..=2.0).text("stop repeating"));
+                        ui.add(egui::Slider::new(&mut self.gen.repeat_last_n, 16..=1024).text("how far back to check"));
                         ui.horizontal(|ui| {
-                            if ui.button("Standard wiederherstellen").clicked() {
+                            if ui.button("Back to default").clicked() {
                                 self.gen = GenCfg::default();
                             }
                         });
-                        ui.label(egui::RichText::new("temp 0 = deterministisch (verlustfreies Spec-Decoding aktiv). repeat penalty >1 bricht Schleifen. max tokens begrenzt die Antwortlänge.").color(MUTED).size(10.5));
+                        ui.label(egui::RichText::new("Randomness 0 = always the same answer (and the lossless speed-up is on). \"Stop repeating\" above 1 breaks loops. \"Longest answer\" caps how much it writes.").color(MUTED).size(10.5));
                     });
                 }); // end scroll area
             });
@@ -1482,8 +1482,8 @@ impl OverflowApp {
             .frame(egui::Frame::NONE.fill(SURFACE).inner_margin(egui::Margin::same(12)).stroke(Stroke::new(1.0, LINE)))
             .show(ui, |ui| {
                 ui.set_min_width(340.0);
-                section(ui, "DEV · METRICS");
-                ui.label(egui::RichText::new(format!("backend   {}", self.backend)).color(GREEN).size(12.0));
+                section(ui, "Live info");
+                ui.label(egui::RichText::new(format!("runs on   {}", self.backend)).color(GREEN).size(12.0));
                 let generating = matches!(self.status, Status::Generating);
                 // Live speed + token count while the model is producing output.
                 let spd = egui::RichText::new(format!("speed     {:.1} tok/s", self.tok_per_s))
@@ -1493,10 +1493,10 @@ impl OverflowApp {
                     .color(if generating { AMBER } else { MUTED }).size(12.0));
                 if self.tab == Tab::OnlyChat {
                     if let Some(full) = self.only.tok_full {
-                        ui.label(egui::RichText::new(format!("chat      {full} Token")).color(CYAN).size(12.0));
+                        ui.label(egui::RichText::new(format!("whole chat   {full} tokens")).color(CYAN).size(12.0));
                     }
                     if let Some(ctx) = self.only.tok_ctx {
-                        ui.label(egui::RichText::new(format!("context   {ctx} Token (Modus: {})", self.only.active_mode.label())).color(CYAN).size(12.0));
+                        ui.label(egui::RichText::new(format!("sent to AI   {ctx} tokens (mode: {})", self.only.active_mode.label())).color(CYAN).size(12.0));
                     }
                 }
                 if let Some(l) = self.learn.loss {
@@ -1507,25 +1507,25 @@ impl OverflowApp {
                 }
 
                 ui.add_space(10.0);
-                section(ui, "DEV · RAW TOKENS");
+                section(ui, "Raw output");
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .max_height(180.0)
                     .auto_shrink([false, false])
                     .id_salt("raw_tokens")
                     .show(ui, |ui| {
-                        let raw = if self.raw_stream.is_empty() { "(nothing generated yet)" } else { &self.raw_stream };
+                        let raw = if self.raw_stream.is_empty() { "(nothing yet)" } else { &self.raw_stream };
                         ui.label(egui::RichText::new(raw).color(GREEN).size(10.5).monospace());
                     });
 
                 ui.add_space(10.0);
-                section(ui, "DEV · MATH");
+                section(ui, "The math behind it");
                 for f in FORMULAS {
                     ui.label(egui::RichText::new(f).color(CYAN).size(11.5));
                 }
 
                 ui.add_space(10.0);
-                section(ui, "DEV · CONSOLE");
+                section(ui, "Log");
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
@@ -1546,18 +1546,18 @@ impl OverflowApp {
                 .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, RED)))
                 .show(ui, |ui| {
                     let head = if outside {
-                        format!("⚠ allow tool (OUTSIDE workspace): {desc}")
+                        format!("⚠ Let the AI do this OUTSIDE your work folder: {desc}")
                     } else {
-                        format!("allow tool: {desc}")
+                        format!("Let the AI do this: {desc}")
                     };
                     ui.label(egui::RichText::new(head).color(if outside { RED } else { FG }).strong());
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button(egui::RichText::new("Allow once").color(GREEN)).clicked() {
+                        if ui.button(egui::RichText::new("Yes, once").color(GREEN)).clicked() {
                             if let Some(h) = &self.handle { let _ = h.tx.send(ToWorker::Approve(true)); }
                             self.pending_approval = None;
                         }
-                        if ui.button(egui::RichText::new("Deny").color(RED)).clicked() {
+                        if ui.button(egui::RichText::new("No").color(RED)).clicked() {
                             if let Some(h) = &self.handle { let _ = h.tx.send(ToWorker::Approve(false)); }
                             self.pending_approval = None;
                         }
@@ -1586,13 +1586,13 @@ impl OverflowApp {
                     let rcol = if net { CYAN } else { MUTED };
                     let rlabel = if researching { "🌐…" } else { "🌐" };
                     if ui.add_enabled(can_send && !researching, egui::Button::new(egui::RichText::new(rlabel).color(rcol)))
-                        .on_hover_text(if net { "Internet-Recherche zur Frage" } else { "Netzwerkzugriff ist aus — erst in den Einstellungen aktivieren" })
+                        .on_hover_text(if net { "Search the web for this question" } else { "Internet is off — turn it on in Settings first" })
                         .clicked()
                     {
                         do_research = true;
                     }
                     let edit = egui::TextEdit::singleline(&mut self.input)
-                        .hint_text("type a message, Enter to send")
+                        .hint_text("Type a message, press Enter to send")
                         .desired_width(f32::INFINITY);
                     let resp = ui.add_enabled(can_send && !researching, edit);
                     let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1617,17 +1617,17 @@ impl OverflowApp {
                     ui.vertical_centered(|ui| {
                         ui.label(egui::RichText::new("OVERFLOW").color(AMBER).size(28.0).strong());
                         ui.label(egui::RichText::new("S1BERIA'S CYBERSECURITY AI").color(FG).size(14.0).strong());
-                        ui.label(egui::RichText::new("runs entirely on this machine").color(MUTED).size(12.0));
+                        ui.label(egui::RichText::new("runs fully on your own computer").color(MUTED).size(12.0));
                         if no_model {
                             ui.add_space(16.0);
-                            ui.label(egui::RichText::new("No model loaded.").color(RED).size(13.0));
-                            ui.label(egui::RichText::new("Download one to begin, or drop a .gguf in the models folder and load it in Settings.").color(MUTED).size(11.5));
+                            ui.label(egui::RichText::new("No model loaded yet.").color(RED).size(13.0));
+                            ui.label(egui::RichText::new("Download one to start, or put a .gguf file in the models folder and load it in Settings.").color(MUTED).size(11.5));
                             ui.add_space(8.0);
-                            if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Download base model (1.5B)").color(GREEN))).clicked() {
+                            if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Download a starter model (1.5B)").color(GREEN))).clicked() {
                                 do_dl = true;
                             }
                             if busy {
-                                ui.label(egui::RichText::new(format!("{} — see dev console", self.learn.status)).color(AMBER).size(11.0));
+                                ui.label(egui::RichText::new(format!("{} — see the Log under 'details'", self.learn.status)).color(AMBER).size(11.0));
                             }
                         }
                     });
@@ -1710,11 +1710,11 @@ impl OverflowApp {
                 ui.label(egui::RichText::new("ONLYCHAT").color(AMBER).size(13.0).strong());
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button(egui::RichText::new("+ Neuer Chat").color(GREEN).size(12.0)).clicked() {
+                    if ui.button(egui::RichText::new("+ New chat").color(GREEN).size(12.0)).clicked() {
                         self.only.show_new = !self.only.show_new;
                         self.only.show_open = false;
                     }
-                    if ui.button(egui::RichText::new("DB öffnen").color(CYAN).size(12.0)).clicked() {
+                    if ui.button(egui::RichText::new("Open a database").color(CYAN).size(12.0)).clicked() {
                         self.only.show_open = !self.only.show_open;
                         self.only.show_new = false;
                     }
@@ -1723,10 +1723,10 @@ impl OverflowApp {
                 // -- open an existing database (so its chats show up) --
                 if self.only.show_open {
                     egui::Frame::NONE.fill(SURFACE).inner_margin(egui::Margin::same(8)).stroke(Stroke::new(1.0, LINE)).show(ui, |ui| {
-                        ui.label(egui::RichText::new("vorhandene .sqlite öffnen").color(FG).size(11.5));
+                        ui.label(egui::RichText::new("Open an existing .sqlite file").color(FG).size(11.5));
                         ui.add(egui::TextEdit::singleline(&mut self.only.open_path).desired_width(f32::INFINITY).hint_text("…/memory.sqlite3"));
-                        ui.add(egui::TextEdit::singleline(&mut self.only.open_pass).password(true).desired_width(f32::INFINITY).hint_text("Passwort (falls verschlüsselt)"));
-                        if ui.button(egui::RichText::new("öffnen").color(GREEN).size(11.5)).clicked() {
+                        ui.add(egui::TextEdit::singleline(&mut self.only.open_pass).password(true).desired_width(f32::INFINITY).hint_text("Password (if it's locked)"));
+                        if ui.button(egui::RichText::new("Open").color(GREEN).size(11.5)).clicked() {
                             open_db = true;
                         }
                     });
@@ -1737,7 +1737,7 @@ impl OverflowApp {
                     egui::Frame::NONE.fill(SURFACE).inner_margin(egui::Margin::same(8)).stroke(Stroke::new(1.0, LINE)).show(ui, |ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.only.new_name).desired_width(f32::INFINITY).hint_text("Name"));
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Modus").color(MUTED).size(11.0));
+                            ui.label(egui::RichText::new("Mode").color(MUTED).size(11.0));
                             egui::ComboBox::from_id_salt("new_mode")
                                 .selected_text(self.only.new_mode.label())
                                 .show_ui(ui, |ui| {
@@ -1750,7 +1750,7 @@ impl OverflowApp {
                             ui.label(egui::RichText::new("DB").color(MUTED).size(11.0));
                             let sel_label = match &self.only.new_db_pick {
                                 DbPick::Existing(i) => self.only.dbs.get(*i).map(|d| db_name(&d.path)).unwrap_or_else(|| "?".into()),
-                                DbPick::NewFile => "＋ neue Datei…".to_string(),
+                                DbPick::NewFile => "＋ new file…".to_string(),
                             };
                             egui::ComboBox::from_id_salt("new_db_pick")
                                 .selected_text(sel_label)
@@ -1758,19 +1758,19 @@ impl OverflowApp {
                                     for (i, od) in self.only.dbs.iter().enumerate() {
                                         ui.selectable_value(&mut self.only.new_db_pick, DbPick::Existing(i), db_name(&od.path));
                                     }
-                                    ui.selectable_value(&mut self.only.new_db_pick, DbPick::NewFile, "＋ neue Datei…");
+                                    ui.selectable_value(&mut self.only.new_db_pick, DbPick::NewFile, "＋ new file…");
                                 });
                         });
                         if self.only.new_db_pick == DbPick::NewFile {
                             ui.add(egui::TextEdit::singleline(&mut self.only.new_file_path).desired_width(f32::INFINITY).hint_text("…/chats.sqlite"));
                             ui.horizontal(|ui| {
-                                ui.checkbox(&mut self.only.new_file_encrypt, egui::RichText::new("verschlüsseln").color(FG).size(11.0));
+                                ui.checkbox(&mut self.only.new_file_encrypt, egui::RichText::new("Lock it (encrypt)").color(FG).size(11.0));
                                 if self.only.new_file_encrypt {
-                                    ui.add(egui::TextEdit::singleline(&mut self.only.new_file_pass).password(true).desired_width(140.0).hint_text("Passwort"));
+                                    ui.add(egui::TextEdit::singleline(&mut self.only.new_file_pass).password(true).desired_width(140.0).hint_text("Password"));
                                 }
                             });
                         }
-                        if ui.button(egui::RichText::new("anlegen").color(AMBER).size(12.0)).clicked() {
+                        if ui.button(egui::RichText::new("Create").color(AMBER).size(12.0)).clicked() {
                             new_chat = true;
                         }
                     });
@@ -1781,7 +1781,7 @@ impl OverflowApp {
                 // -- chat list across all open databases --
                 egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(ui.available_height() - 150.0).show(ui, |ui| {
                     if self.only.chats.is_empty() {
-                        ui.label(egui::RichText::new("noch keine Chats — lege einen an oder öffne eine DB").color(MUTED).size(11.0));
+                        ui.label(egui::RichText::new("No chats yet — create one or open a database").color(MUTED).size(11.0));
                     }
                     let multi = self.only.dbs.len() > 1;
                     for (di, meta) in &self.only.chats {
@@ -1794,10 +1794,10 @@ impl OverflowApp {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 // Gear menu: rename / delete (and more).
                                 ui.menu_button(egui::RichText::new("⚙").color(MUTED).size(12.0), |ui| {
-                                    if ui.button("Umbenennen").clicked() {
+                                    if ui.button("Rename").clicked() {
                                         menu_rename = Some((*di, meta.id, meta.name.clone()));
                                     }
-                                    if ui.button(egui::RichText::new("Löschen").color(RED)).clicked() {
+                                    if ui.button(egui::RichText::new("Delete").color(RED)).clicked() {
                                         menu_delete = Some((*di, meta.id));
                                     }
                                 });
@@ -1810,13 +1810,13 @@ impl OverflowApp {
                 });
                 if !self.only.dbs.is_empty() {
                     ui.add_space(6.0);
-                    section(ui, "OFFENE DBs");
+                    section(ui, "Open databases");
                     for (i, od) in self.only.dbs.iter().enumerate() {
                         ui.horizontal(|ui| {
                             let enc = if od.db.encrypted() { "🔒 " } else { "" };
                             ui.label(egui::RichText::new(format!("{enc}{}", db_name(&od.path))).color(FG).size(10.5));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button(egui::RichText::new("schließen").color(MUTED).size(9.5)).clicked() {
+                                if ui.button(egui::RichText::new("Close").color(MUTED).size(9.5)).clicked() {
                                     close_db = Some(i);
                                 }
                             });
@@ -1834,7 +1834,7 @@ impl OverflowApp {
             egui::Panel::bottom("oc_rename")
                 .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, LINE)))
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Chat umbenennen").color(AMBER).strong());
+                    ui.label(egui::RichText::new("Rename chat").color(AMBER).strong());
                     ui.add_space(4.0);
                     let mut save = false;
                     if let Some((_, _, buf)) = self.only.rename.as_mut() {
@@ -1844,10 +1844,10 @@ impl OverflowApp {
                         }
                     }
                     ui.horizontal(|ui| {
-                        if ui.button(egui::RichText::new("Speichern").color(GREEN)).clicked() {
+                        if ui.button(egui::RichText::new("Save").color(GREEN)).clicked() {
                             save = true;
                         }
-                        if ui.button(egui::RichText::new("Abbrechen").color(MUTED)).clicked() {
+                        if ui.button(egui::RichText::new("Cancel").color(MUTED)).clicked() {
                             cancel_rename = true;
                         }
                     });
@@ -1868,20 +1868,20 @@ impl OverflowApp {
             egui::Panel::bottom("oc_delete")
                 .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(16, 12)).stroke(Stroke::new(1.0, RED)))
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Chat löschen").color(RED).strong());
-                    ui.label(egui::RichText::new(format!("Datenbankdatei: {fname}")).color(MUTED).size(11.5));
+                    ui.label(egui::RichText::new("Delete chat").color(RED).strong());
+                    ui.label(egui::RichText::new(format!("Database file: {fname}")).color(MUTED).size(11.5));
                     if others > 0 {
-                        ui.label(egui::RichText::new(format!("Achtung: die Datei enthält noch {others} weitere Chat(s) — beim Mitlöschen gehen die auch verloren.")).color(AMBER).size(11.0));
+                        ui.label(egui::RichText::new(format!("Careful: this file still holds {others} more chat(s) — deleting the file loses those too.")).color(AMBER).size(11.0));
                     }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        if ui.button(egui::RichText::new("Nur diesen Chat").color(FG)).clicked() {
+                        if ui.button(egui::RichText::new("Just this chat").color(FG)).clicked() {
                             do_delete = Some((di, id, false));
                         }
-                        if ui.button(egui::RichText::new("Chat + Datenbankdatei").color(RED)).clicked() {
+                        if ui.button(egui::RichText::new("Chat + the database file").color(RED)).clicked() {
                             do_delete = Some((di, id, true));
                         }
-                        if ui.button(egui::RichText::new("Abbrechen").color(MUTED)).clicked() {
+                        if ui.button(egui::RichText::new("Cancel").color(MUTED)).clicked() {
                             cancel_delete = true;
                         }
                     });
@@ -1904,7 +1904,7 @@ impl OverflowApp {
                         }
                     }
                     let edit = egui::TextEdit::singleline(&mut self.only.input)
-                        .hint_text("Nachricht — Enter zum Senden")
+                        .hint_text("Type a message, press Enter to send")
                         .desired_width(f32::INFINITY);
                     let resp = ui.add_enabled(can_send, edit);
                     let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -1924,12 +1924,12 @@ impl OverflowApp {
                 if self.only.active.is_none() {
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("Wähle links einen Chat oder lege einen neuen an.").color(MUTED).size(13.0));
+                        ui.label(egui::RichText::new("Pick a chat on the left, or create a new one.").color(MUTED).size(13.0));
                     });
                     return;
                 }
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Kontext-Modus:").color(MUTED).size(11.5));
+                    ui.label(egui::RichText::new("How much it reads:").color(MUTED).size(11.5));
                     let mut mode = self.only.active_mode;
                     egui::ComboBox::from_id_salt("active_mode")
                         .selected_text(mode.label())
@@ -1942,13 +1942,13 @@ impl OverflowApp {
                         set_mode = Some(mode);
                     }
                     if self.only.active_mode == chatdb::CtxMode::SummaryRetrieval {
-                        if ui.add_enabled(!self.only.summarizing, egui::Button::new(egui::RichText::new("Älteres zusammenfassen").color(CYAN).size(11.5))).clicked() {
+                        if ui.add_enabled(!self.only.summarizing, egui::Button::new(egui::RichText::new("Summarize older messages").color(CYAN).size(11.5))).clicked() {
                             summarize = true;
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let (Some(full), Some(ctx)) = (self.only.tok_full, self.only.tok_ctx) {
-                            ui.label(egui::RichText::new(format!("Kontext {ctx} / {full} Token")).color(MUTED).size(11.0));
+                            ui.label(egui::RichText::new(format!("sent to AI: {ctx} / {full} tokens")).color(MUTED).size(11.0));
                         }
                     });
                 });
@@ -2037,7 +2037,7 @@ impl OverflowApp {
             .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(20, 16)))
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("SERVER").color(AMBER).size(20.0).strong());
-                ui.label(egui::RichText::new("Von überall mit der AI schreiben — eine HTTPS-WebUI auf deiner Tailscale-IP.").color(MUTED).size(12.0));
+                ui.label(egui::RichText::new("Chat with the AI from anywhere — a secure (HTTPS) web page on your Tailscale address.").color(MUTED).size(12.0));
                 ui.add_space(14.0);
                 let running = self.server.handle.is_some();
                 egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::same(16)).stroke(Stroke::new(1.0, LINE)).show(ui, |ui| {
@@ -2048,13 +2048,13 @@ impl OverflowApp {
                         let t = ui.input(|i| i.time);
                         let a = if running { 0.5 + 0.5 * (t * 2.0).sin() as f32 } else { 1.0 };
                         ui.label(egui::RichText::new("●").color(dot.gamma_multiply(a)).size(14.0));
-                        ui.label(egui::RichText::new(if running { "Server läuft" } else { "Server aus" }).color(if running { GREEN } else { FG }).strong());
+                        ui.label(egui::RichText::new(if running { "Server is running" } else { "Server is off" }).color(if running { GREEN } else { FG }).strong());
                     });
                     ui.add_space(8.0);
                     if self.handle.is_none() {
-                        ui.label(egui::RichText::new("Zuerst ein Modell laden (Einstellungen → Model).").color(RED).size(12.0));
+                        ui.label(egui::RichText::new("Load a model first (Settings → Model).").color(RED).size(12.0));
                     }
-                    let label = if running { "Server stoppen" } else { "Server starten" };
+                    let label = if running { "Stop the server" } else { "Start the server" };
                     let col = if running { RED } else { GREEN };
                     if ui.add_enabled(self.handle.is_some() || running, egui::Button::new(egui::RichText::new(label).color(col).strong())).clicked() {
                         toggle = true;
@@ -2066,16 +2066,16 @@ impl OverflowApp {
                     if running {
                         if let Some(h) = self.server.handle.as_ref() {
                             ui.add_space(8.0);
-                            ui.label(egui::RichText::new("Adresse fürs Handy (antippen zum Markieren/Kopieren):").color(MUTED).size(11.0));
+                            ui.label(egui::RichText::new("Address for your phone (tap to select / copy):").color(MUTED).size(11.0));
                             ui.add(egui::Label::new(egui::RichText::new(&h.url).color(CYAN).size(12.0).monospace()).selectable(true).wrap());
                         }
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new("Öffne diese Adresse am Handy (gleiches Tailscale-Netz). Beim ersten Mal die Zertifikatswarnung bestätigen (selbst-signiert).").color(MUTED).size(11.0));
+                        ui.label(egui::RichText::new("Open this address on your phone (same Tailscale network). The first time, accept the certificate warning (it's self-signed).").color(MUTED).size(11.0));
                         ui.add_space(4.0);
-                        ui.label(egui::RichText::new("⚠ Der Teil nach #k= ist ein Zugangstoken — wer den Link hat, kann mit deinem Modell schreiben. Nicht teilen. Bei jedem Serverstart neu.").color(AMBER).size(10.5));
+                        ui.label(egui::RichText::new("⚠ The part after #k= is an access key — anyone with the link can chat with your model. Don't share it. It's new every time you start the server.").color(AMBER).size(10.5));
                     }
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Hinweis: Port 443 braucht ggf. Rechte — sonst nutzt der Server automatisch 8443.").color(MUTED).size(10.5));
+                    ui.label(egui::RichText::new("Note: port 443 may need extra rights — if so, the server uses 8443 by itself.").color(MUTED).size(10.5));
                 });
             });
         if toggle {
@@ -2090,20 +2090,20 @@ impl OverflowApp {
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("LEARNING").color(AMBER).size(20.0).strong());
                 ui.label(
-                    egui::RichText::new("Fine-tune a model on your own data (QLoRA on the GPU), then load it here.")
+                    egui::RichText::new("Teach a model with your own examples, then load it here. It learns on your GPU.")
                         .color(MUTED)
                         .size(12.0),
                 );
                 ui.add_space(4.0);
                 let have_venv = Self::venv_python().exists();
                 if !have_venv {
-                    ui.label(egui::RichText::new("Python env not set up yet — click 'Set up env' (large download).").color(RED).size(12.0));
+                    ui.label(egui::RichText::new("The setup isn't ready yet — click 'Set things up' first (big download).").color(RED).size(12.0));
                 }
 
                 ui.add_space(10.0);
-                section(ui, "CONFIG");
+                section(ui, "Setup");
                 egui::Grid::new("learncfg").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                    ui.label(egui::RichText::new("base model").color(MUTED).size(12.0));
+                    ui.label(egui::RichText::new("start from").color(MUTED).size(12.0));
                     ui.horizontal(|ui| {
                         let installed = installed_bases(&Self::cwd().join("training/hf-cache/hub"));
                         egui::ComboBox::from_id_salt("base_pick").width(300.0).selected_text(self.learn.base.clone()).show_ui(ui, |ui| {
@@ -2134,8 +2134,8 @@ impl OverflowApp {
                         }
                     });
                     ui.end_row();
-                    ui.label(egui::RichText::new("dataset").color(MUTED).size(12.0));
-                    let cur_label = DATASETS.iter().find(|d| d.1 == self.learn.data.as_str()).map(|d| d.0).unwrap_or("custom");
+                    ui.label(egui::RichText::new("examples").color(MUTED).size(12.0));
+                    let cur_label = DATASETS.iter().find(|d| d.1 == self.learn.data.as_str()).map(|d| d.0).unwrap_or("your own");
                     egui::ComboBox::from_id_salt("dataset_pick").width(380.0).selected_text(cur_label).show_ui(ui, |ui| {
                         for (label, path, gen) in DATASETS {
                             if ui.selectable_label(self.learn.data.as_str() == *path, *label).clicked() {
@@ -2145,28 +2145,28 @@ impl OverflowApp {
                         }
                     });
                     ui.end_row();
-                    ui.label(egui::RichText::new("dataset path").color(MUTED).size(12.0));
+                    ui.label(egui::RichText::new("file path").color(MUTED).size(12.0));
                     ui.add(egui::TextEdit::singleline(&mut self.learn.data).desired_width(380.0));
                     ui.end_row();
-                    ui.label(egui::RichText::new("epochs").color(MUTED).size(12.0));
+                    ui.label(egui::RichText::new("rounds (epochs)").color(MUTED).size(12.0));
                     ui.add(egui::TextEdit::singleline(&mut self.learn.epochs).desired_width(80.0));
                     ui.end_row();
                 });
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(
-                    "Installed bases train with no download. GGUF models in the model folder are inference-only — fine-tuning starts from the HF base."
+                    "Models you already downloaded need no download. The .gguf files in your model folder can't be trained — teaching always starts from a base model."
                 ).color(MUTED).size(10.5));
 
                 ui.add_space(10.0);
-                section(ui, "PIPELINE");
+                section(ui, "Steps");
                 let busy = self.trainer.is_some();
                 let py = Self::venv_python().display().to_string();
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(!busy, egui::Button::new("1 · Generate dataset")).clicked() {
+                    if ui.add_enabled(!busy, egui::Button::new("1 · Make the examples")).clicked() {
                         let gen = self.learn.gen_script.clone();
                         self.start("generate dataset", &py, vec![gen]);
                     }
-                    if ui.add_enabled(!busy && have_venv, egui::Button::new("2 · Train + build GGUF")).clicked() {
+                    if ui.add_enabled(!busy && have_venv, egui::Button::new("2 · Teach + build the model")).clicked() {
                         // RAM/disk-safe pipeline: QLoRA -> mmap merge -> Q8. Removing any
                         // stale adapter forces a fresh train on the selected dataset.
                         let (b, d, e) = (self.learn.base.clone(), self.learn.data.clone(), self.learn.epochs.clone());
@@ -2185,27 +2185,27 @@ impl OverflowApp {
                         ];
                         self.start_env("train + build", "bash", vec!["training/build_overflow_wt.sh".into()], envs);
                     }
-                    if ui.add_enabled(!busy, egui::Button::new("3 · Load trained model")).clicked() {
+                    if ui.add_enabled(!busy, egui::Button::new("3 · Load the new model")).clicked() {
                         self.load_model(Self::cwd().join("models").join(&self.learn.out_name));
                     }
                 });
                 ui.add_space(4.0);
-                if ui.add_enabled(!busy, egui::Button::new("Set up env (venv + deps)")).clicked() {
+                if ui.add_enabled(!busy, egui::Button::new("Set things up (one time)")).clicked() {
                     let cmd = "python3 -m venv training/venv && training/venv/bin/pip install -r training/requirements.txt sentencepiece protobuf".to_string();
                     self.start("setup env", "sh", vec!["-c".into(), cmd]);
                 }
 
                 ui.add_space(12.0);
-                section(ui, "PROGRESS");
+                section(ui, "Progress");
                 ui.label(egui::RichText::new(format!("status: {}", self.learn.status)).color(if busy { AMBER } else { GREEN }).size(13.0));
                 if let Some(l) = self.learn.loss {
-                    ui.label(egui::RichText::new(format!("loss: {l:.4}")).color(AMBER).size(13.0));
+                    ui.label(egui::RichText::new(format!("error score (lower is better): {l:.4}")).color(AMBER).size(13.0));
                 }
                 if let Some((a, b)) = self.learn.step {
                     ui.add(egui::ProgressBar::new(a as f32 / b as f32).desired_width(400.0).fill(AMBER).text(format!("{a}/{b}")));
                 }
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("(toggle 'dev' for the full console)").color(MUTED).size(11.0));
+                ui.label(egui::RichText::new("(turn on 'details' at the top for the full log)").color(MUTED).size(11.0));
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                     for line in self.console.iter().rev().take(14).collect::<Vec<_>>().into_iter().rev() {
                         ui.label(egui::RichText::new(line).color(MUTED).size(10.5));
@@ -2260,7 +2260,7 @@ impl eframe::App for OverflowApp {
                     if ui.selectable_label(self.tab == Tab::Server, egui::RichText::new("Server").size(13.0)).clicked() {
                         self.tab = Tab::Server;
                     }
-                    if ui.selectable_label(self.tab == Tab::Docs, egui::RichText::new("Docs").size(13.0)).clicked() {
+                    if ui.selectable_label(self.tab == Tab::Docs, egui::RichText::new("Help").size(13.0)).clicked() {
                         self.tab = Tab::Docs;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2269,13 +2269,13 @@ impl eframe::App for OverflowApp {
                         }
                         ui.add_space(10.0);
                         if ui
-                            .selectable_label(self.dev, egui::RichText::new("dev").color(if self.dev { CYAN } else { MUTED }).size(12.0))
+                            .selectable_label(self.dev, egui::RichText::new("details").color(if self.dev { CYAN } else { MUTED }).size(12.0))
                             .clicked()
                         {
                             self.dev = !self.dev;
                         }
                         ui.add_space(12.0);
-                        let (plabel, pcol) = if self.perms.sandbox { ("sandboxed", GREEN) } else { ("tools enabled", RED) };
+                        let (plabel, pcol) = if self.perms.sandbox { ("safe mode", GREEN) } else { ("tools on", RED) };
                         ui.label(egui::RichText::new(plabel).color(pcol).size(12.0));
                         ui.add_space(12.0);
                         let (dot, label, col) = match &self.status {
@@ -2346,123 +2346,126 @@ fn docs_body(ui: &mut egui::Ui) {
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(20, 14)))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new("DOCS").color(AMBER).size(20.0).strong());
+            ui.label(egui::RichText::new("HELP").color(AMBER).size(20.0).strong());
             ui.label(egui::RichText::new("OVERFLOW — S1BERIA's local cybersecurity AI").color(MUTED).size(12.0));
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                doc_section(ui, "Getting started", &[
+                doc_section(ui, "First steps", &[
                     "Load a model (Settings -> Model), then type in the Chat tab.",
-                    "Everything runs locally on your machine — nothing is sent anywhere,",
-                    "except an internet-research request or a model download you trigger.",
-                    "Tabs: Chat (talk + agent), OnlyChat (chat over a database),",
-                    "Learning (fine-tune), Server (phone access), Docs (this).",
-                    "Toggle 'dev' (top bar) for live metrics (tokens/s, token count), the math, a console.",
+                    "Everything runs on your own computer. Nothing leaves it, unless you ask",
+                    "for a web search or download a model yourself.",
+                    "Tabs: Chat (talk + let it do tasks), OnlyChat (chat that uses a database),",
+                    "Learning (teach a model), Server (use it from your phone), Help (this).",
+                    "Turn on 'details' (top bar) to see speed, word count, the math, and a log.",
                 ]);
-                doc_section(ui, "OnlyChat (database-backed chat)", &[
-                    "OnlyChat keeps each conversation in a SQLite database instead of the",
-                    "context window, so very long chats stay cheap to run.",
+                doc_section(ui, "OnlyChat (chat that uses a database)", &[
+                    "OnlyChat keeps each chat in a database file, not in the AI's memory,",
+                    "so even very long chats stay cheap and fast.",
                     "",
-                    "# Pick the database per chat.",
-                    "When you create a chat you choose which .sqlite file it lives in, or make",
-                    "a new one. Open an existing file with 'DB öffnen' to see its chats.",
+                    "# You pick the database for each chat.",
+                    "When you make a chat, you choose which .sqlite file it goes in, or make a",
+                    "new one. Use 'Open a database' to open a file you already have.",
                     "",
-                    "# It reads a memory database.",
-                    "Open a structured memory/RAG database (facts, notes, projects, ...) and",
-                    "OnlyChat retrieves the relevant rows (incl. FTS) and gives them to the AI",
-                    "as context — so it actually knows your stored data. It only reads your tables.",
+                    "# It can read a memory database.",
+                    "Open a database full of your notes (facts, projects, ...) and OnlyChat finds",
+                    "the parts that matter and hands them to the AI. So it really knows your",
+                    "saved data. It only reads your tables — it never changes them.",
                     "",
-                    "# Context modes (per chat).",
-                    "Ganzer Chat / Letzte N Runden / Zusammenfassung + Abruf — the last two keep",
-                    "the token cost bounded. The dev panel shows chat vs. context token counts.",
+                    "# How much it reads (per chat).",
+                    "Whole chat / Last few messages / Summary + lookup — the last two keep the",
+                    "cost low. Turn on 'details' to see how much is sent to the AI.",
                     "",
-                    "# Encryption.",
-                    "A database can be encrypted at rest (Argon2id + XChaCha20-Poly1305).",
+                    "# Locking (encryption).",
+                    "A database can be locked with a password, so the text on disk is unreadable",
+                    "without it.",
                     "",
-                    "# Manage.",
-                    "The gear (⚙) per chat renames or deletes it (optionally the whole DB file).",
+                    "# Managing chats.",
+                    "The gear (⚙) on a chat renames or deletes it (and can delete the whole file).",
                 ]);
-                doc_section(ui, "Internet research", &[
-                    "The 🌐 button next to the Chat input searches the web for your question",
-                    "and feeds the results to the model as context.",
-                    "It needs network access ON (Settings -> permissions); otherwise it tells",
-                    "you to enable it first. Results can be incomplete — treat them as hints.",
+                doc_section(ui, "Searching the web", &[
+                    "The 🌐 button next to the chat box searches the web for your question",
+                    "and gives the results to the AI to use.",
+                    "You must turn the internet ON first (Settings -> what the AI may do);",
+                    "if it's off, it tells you to switch it on. Results can be wrong — treat",
+                    "them as hints, not facts.",
                 ]);
-                doc_section(ui, "Server mode (chat from your phone)", &[
-                    "The Server tab serves a small HTTPS chat web UI from this PC.",
-                    "Load a model, open the Server tab, press 'Server starten'.",
-                    "Open the shown https://<tailscale-ip> address on your phone (same Tailnet).",
-                    "First visit: accept the certificate warning (self-signed), then chat.",
-                    "Port 443 is used if allowed, otherwise 8443. The one model is shared.",
+                doc_section(ui, "Using it from your phone (Server)", &[
+                    "The Server tab opens a small, safe (HTTPS) chat page from this computer.",
+                    "Load a model, open the Server tab, press 'Start the server'.",
+                    "Open the address it shows on your phone (same Tailscale network).",
+                    "The first time, accept the certificate warning (it's self-signed), then chat.",
+                    "Keep the link private — it holds an access key. It uses the same one model.",
                 ]);
-                doc_section(ui, "Prompting tips", &[
-                    "# Be specific about the goal and the context.",
-                    "Say the target, the constraints, and the output you want.",
+                doc_section(ui, "Tips for asking", &[
+                    "# Say clearly what you want and the situation.",
+                    "Name the target, the limits, and the output you want.",
                     "Weak:  \"scan the network\"",
-                    "Strong: \"nmap a SYN scan of 10.0.0.0/24, top 100 ports, greppable output\".",
+                    "Better: \"nmap a SYN scan of 10.0.0.0/24, top 100 ports, greppable output\".",
                     "",
-                    "# Give it a role / standing context via the system prompt.",
-                    "Settings -> permissions has a system prompt; state you're doing authorized",
-                    "security work so it answers directly without hedging.",
+                    "# Give it a role up front.",
+                    "Settings has a system prompt; say you're doing authorized security work,",
+                    "so it answers straight without holding back.",
                     "",
-                    "# Ask for steps, then execution.",
-                    "\"First outline the approach, then run the commands\" — lets you review.",
+                    "# Ask for a plan first, then the doing.",
+                    "\"First outline the approach, then run the commands\" — so you can check it.",
                     "",
-                    "# Let it use tools.",
-                    "In the agent, ask it to read files or run commands; it calls tools itself.",
-                    "Keep requests concrete: name files, hosts, and exact commands when you can.",
+                    "# Let it use its tools.",
+                    "Ask it to read files or run commands; it does that by itself.",
+                    "Be concrete: name the files, hosts, and exact commands when you can.",
                     "",
-                    "# Bigger model = better answers.",
-                    "The 1.5B is fast but shallow; the 7B reasons far better (slower).",
+                    "# A bigger model gives better answers.",
+                    "The 1.5B is fast but simple; the 7B thinks much better (but slower).",
                 ]);
-                doc_section(ui, "Teaching it (fine-tuning)", &[
-                    "The Learning tab trains the model on YOUR data (QLoRA on the GPU).",
+                doc_section(ui, "Teaching a model", &[
+                    "The Learning tab teaches a model with YOUR examples (on the GPU).",
                     "",
-                    "# 1. Make a dataset.",
-                    "One JSON object per line, chat format:",
+                    "# 1. Make the examples.",
+                    "One line per example, in chat form:",
                     "  {\"messages\":[{\"role\":\"user\",\"content\":\"Q\"},{\"role\":\"assistant\",\"content\":\"A\"}]}",
-                    "Put good, varied examples — the data is what it learns.",
+                    "Give good, varied examples — the AI learns from exactly this.",
                     "",
-                    "# 2. Train.",
-                    "Learning tab: set base, dataset, epochs -> Train. Watch the loss fall.",
-                    "Bases you already downloaded show as 'installed - no download'; pick one to train without re-fetching.",
+                    "# 2. Teach.",
+                    "Learning tab: choose what to start from, the examples, the rounds -> Teach.",
+                    "Watch the error score fall. Models you already have show as 'installed -",
+                    "no download'; pick one to skip the download.",
                     "",
-                    "# 3. Export + load.",
-                    "Merge + export GGUF, then Load trained model. Done — it's now your model.",
+                    "# 3. Load it.",
+                    "The app builds the new model and you press 'Load the new model'. Done —",
+                    "it's yours now.",
                     "",
                     "# Tips.",
-                    "50-500 focused examples already shift behavior. More epochs = stronger",
-                    "but can overfit. Keep a few 'test' questions to check before/after.",
+                    "50-500 good examples already change how it answers. More rounds = stronger,",
+                    "but too many can make it memorize. Keep a few test questions to compare.",
                 ]);
-                doc_section(ui, "Tools, permissions & sandbox", &[
-                    "The agent can read/write files, list dirs, and run shell commands.",
-                    "Default is sandboxed (no access). Enable tools in Settings.",
-                    "Workspace folder = free access inside; outside it asks first.",
-                    "Shell runs inside bubblewrap: workspace-only, no network unless granted.",
-                    "You approve anything sensitive with an in-app Allow/Deny dialog.",
+                doc_section(ui, "What the AI may do (tools & safety)", &[
+                    "The AI can read and write files, list folders, and run commands for you.",
+                    "By default it's in safe mode (no access). Turn things on in Settings.",
+                    "Work folder = it works freely inside; outside it, it asks you first.",
+                    "Commands run in a locked box (bubblewrap): work folder only, no internet",
+                    "unless you allow it. You say Yes or No to anything risky, right in the app.",
                 ]);
                 doc_section(ui, "The overflow_wt model", &[
-                    "overflow_wt-7b-q8_0 is OVERFLOW's flagship model: Qwen2.5-Coder-7B",
-                    "fine-tuned (QLoRA) to act like an information-security professor —",
-                    "it explains infosec clearly across crypto, network/web security, binary",
-                    "exploitation, privilege escalation, malware, forensics and incident response.",
-                    "It ships with the installed package and is loaded by default.",
-                    "'wt' = walkthrough: it teaches the reasoning, not just the answer.",
+                    "overflow_wt-7b-q8_0 is OVERFLOW's main model: Qwen2.5-Coder-7B, taught to",
+                    "act like an information-security teacher. It explains security clearly —",
+                    "crypto, network and web security, binary exploitation, gaining access,",
+                    "malware, forensics and handling incidents.",
+                    "It comes with the installed package and loads by default.",
+                    "'wt' = walkthrough: it teaches the thinking, not just the answer.",
                     "For authorized security work and learning.",
                 ]);
                 doc_section(ui, "Models", &[
-                    "Settings -> Model: pick a model from the dropdown and Download, or load",
-                    "your own GGUF. Choices range from 0.5B (tiny/fast) to 14B (smart).",
-                    "Bigger = smarter but needs more memory; thanks to whole-layer CPU",
-                    "offloading a 14B still runs on a 12 GB card at full quality, just slower.",
+                    "Settings -> Model: pick a model and Download, or load your own .gguf file.",
+                    "Sizes go from 0.5B (tiny and fast) to 14B (smartest).",
+                    "Bigger = smarter but needs more memory. Thanks to our offload work, even a",
+                    "14B still runs on a 12 GB card at full quality — just slower.",
                     "Models live in ~/.local/share/overflow/models (or ./models in a dev build);",
                     "the package also installs to /usr/share/overflow/models, and OVERFLOW also",
-                    "scans /mnt/ai/Overflow Models.",
-                    "Unload frees the memory/VRAM; load a different one anytime.",
-                    "The engine runs Qwen2-architecture GGUFs.",
+                    "looks in /mnt/ai/Overflow Models.",
+                    "'Unload' frees the memory; you can load another one anytime.",
                 ]);
-                doc_section(ui, "Datasets (Learning tab)", &[
-                    "Several ready-made datasets to fine-tune on, selectable in the Learning tab:",
-                    "infosec professor, identity + basics, CTF/binary exploitation, web security.",
-                    "Or drop in your own JSONL (chat format). Train -> export GGUF -> load.",
+                doc_section(ui, "Ready-made examples (Learning tab)", &[
+                    "A few example sets you can teach from, right in the Learning tab:",
+                    "security teacher, name + basics, CTF / binary exploitation, web security.",
+                    "Or bring your own file (chat form). Teach -> build -> load.",
                 ]);
                 ui.add_space(16.0);
             });

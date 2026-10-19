@@ -46,9 +46,9 @@ impl CtxMode {
     }
     pub fn label(self) -> &'static str {
         match self {
-            CtxMode::Full => "Ganzer Chat",
-            CtxMode::LastN => "Letzte N Runden",
-            CtxMode::SummaryRetrieval => "Zusammenfassung + Abruf",
+            CtxMode::Full => "Whole chat",
+            CtxMode::LastN => "Last few messages",
+            CtxMode::SummaryRetrieval => "Summary + lookup",
         }
     }
 }
@@ -201,7 +201,7 @@ impl ChatDb {
     /// Create a new database. `passphrase = Some(..)` turns on encryption.
     pub fn create(path: &Path, passphrase: Option<&str>) -> Result<ChatDb, String> {
         if path.exists() {
-            return Err("Datei existiert bereits".into());
+            return Err("A file with this name already exists".into());
         }
         let conn = Connection::open(path).map_err(|e| format!("open: {e}"))?;
         Self::schema(&conn)?;
@@ -250,7 +250,7 @@ impl ChatDb {
         if enc == 0 {
             return Ok(ChatDb { conn, crypto: Crypto::Plain });
         }
-        let pw = passphrase.ok_or("Datenbank ist verschlüsselt — Passwort nötig")?;
+        let pw = passphrase.ok_or("This database is locked — a password is needed")?;
         let salt: Vec<u8> = conn
             .query_row("SELECT value FROM oc_meta WHERE key='salt'", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
@@ -260,14 +260,14 @@ impl ChatDb {
         let key = derive_key(pw, &salt)?;
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
         if verifier.len() < 24 {
-            return Err("Datenbank beschädigt (verifier)".into());
+            return Err("This database file looks damaged".into());
         }
         let (nonce, ct) = verifier.split_at(24);
         cipher
             .decrypt(XNonce::from_slice(nonce), ct)
             .ok()
             .filter(|pt| pt == VERIFIER_PLAINTEXT)
-            .ok_or("Falsches Passwort")?;
+            .ok_or("Wrong password")?;
         Ok(ChatDb { conn, crypto: Crypto::Sealed(Box::new(cipher)) })
     }
 
