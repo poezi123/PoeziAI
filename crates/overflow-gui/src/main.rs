@@ -307,36 +307,63 @@ const CYAN: Color32 = Color32::from_rgb(0x49, 0xd6, 0xe6);
 // Qwen2.5-Coder GGUF downloads (our engine is Qwen2-architecture).
 const QWEN_1_5B_URL: &str = "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
 
-/// Selectable models to download: (label, url, filename). All single-file
-/// Qwen2.5-Coder GGUFs the engine can load. The bigger ones ("schlauer") need
-/// more than 12 GB VRAM and run via whole-layer CPU offloading at full quality.
-const MODELS: &[(&str, &str, &str)] = &[
+/// Selectable models to download: (label, url, filename, ~GB needed to load).
+/// All single-file Qwen2.5-Coder GGUFs the engine can load. The bigger ones
+/// ("schlauer") exceed 12 GB VRAM and run via whole-layer CPU offloading at full
+/// quality. The last field drives the per-model hardware-fit badge.
+const MODELS: &[(&str, &str, &str, f32)] = &[
     (
-        "Qwen2.5-Coder 0.5B · Q4 (~0.4 GB, winzig)",
+        "Qwen2.5-Coder 0.5B · Q4 (winzig)",
         "https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
         "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf",
+        1.0,
     ),
     (
-        "Qwen2.5-Coder 1.5B · Q4 (~1.1 GB, schnell)",
+        "Qwen2.5-Coder 1.5B · Q4 (schnell)",
         QWEN_1_5B_URL,
         "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+        2.0,
     ),
     (
-        "Qwen2.5-Coder 3B · Q4 (~2.0 GB)",
+        "Qwen2.5-Coder 3B · Q4",
         "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf",
         "qwen2.5-coder-3b-instruct-q4_k_m.gguf",
+        3.2,
     ),
     (
-        "Qwen2.5-Coder 7B · Q4 (~4.7 GB)",
+        "Qwen2.5-Coder 7B · Q4",
         "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q4_k_m.gguf",
         "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        6.0,
     ),
     (
-        "Qwen2.5-Coder 14B · Q4 (~9 GB, schlau · CPU-Offload)",
+        "Qwen2.5-Coder 14B · Q4 (am schlausten)",
         "https://huggingface.co/bartowski/Qwen2.5-Coder-14B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
         "qwen2.5-coder-14b-instruct-q4_k_m.gguf",
+        10.5,
     ),
 ];
+
+/// Hardware-fit verdict for a model of `need_gb`, given VRAM and total RAM.
+/// Reflects the offloading research: a model bigger than VRAM still runs at full
+/// quality as long as it fits in VRAM + RAM (GPU prefix + CPU tail).
+fn model_fit(need_gb: f32, vram_gb: Option<f32>, ram_gb: f32) -> (String, Color32) {
+    match vram_gb {
+        Some(v) if need_gb <= v * 0.9 => ("✓ passt komplett in die GPU — voll schnell".into(), GREEN),
+        Some(v) if need_gb <= v + ram_gb * 0.8 => (
+            format!("↯ läuft per Offload (GPU {v:.0} GB + CPU) — volle Qualität, langsamer"),
+            CYAN,
+        ),
+        Some(_) => ("✗ zu groß für diese Hardware".into(), RED),
+        None => {
+            if need_gb <= ram_gb * 0.8 {
+                ("↯ läuft auf der CPU — volle Qualität, langsamer".into(), CYAN)
+            } else {
+                ("✗ zu groß für den Arbeitsspeicher".into(), RED)
+            }
+        }
+    }
+}
 
 /// Split assistant text into (thinking, answer) around a `<think>…</think>` block.
 fn split_think(s: &str) -> (Option<&str>, &str) {
@@ -1174,20 +1201,31 @@ impl OverflowApp {
                 }
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("Download a model (Qwen2.5-Coder):").color(MUTED).size(11.0));
+                // Hardware for the fit badge (VRAM + total RAM).
+                let (vram_gb, ram_gb) = {
+                    let hw = self.hw.lock().map(|g| *g).unwrap_or_default();
+                    (hw.vram_total_mb.map(|m| m / 1024.0), hw.mem_total_gb)
+                };
                 let sel = self.dl_sel.min(MODELS.len() - 1);
                 egui::ComboBox::from_id_salt("dl_model")
                     .selected_text(MODELS[sel].0)
                     .width(300.0)
                     .show_ui(ui, |ui| {
                         for (i, m) in MODELS.iter().enumerate() {
-                            ui.selectable_value(&mut self.dl_sel, i, m.0);
+                            let (_, col) = model_fit(m.3, vram_gb, ram_gb);
+                            // Colored dot = fit; label stays readable.
+                            let item = egui::RichText::new(format!("● {}  (~{:.0} GB)", m.0, m.3));
+                            ui.selectable_value(&mut self.dl_sel, i, item.color(col));
                         }
                     });
+                // Verdict line for the selected model.
+                let (verdict, vcol) = model_fit(MODELS[sel].3, vram_gb, ram_gb);
+                ui.label(egui::RichText::new(verdict).color(vcol).size(11.0));
                 if ui.add_enabled(!busy, egui::Button::new(egui::RichText::new("Download").color(GREEN))).clicked() {
-                    let (label, url, file) = MODELS[self.dl_sel.min(MODELS.len() - 1)];
+                    let (label, url, file, _) = MODELS[sel];
                     self.download_model(label, url, file);
                 }
-                ui.label(egui::RichText::new("Große Modelle (14B) sind klüger und laufen dank Offloading auch auf 12 GB VRAM — nur langsamer.").color(MUTED).size(10.0));
+                ui.label(egui::RichText::new("Grün = passt in die GPU · Cyan = läuft dank unserer Offload-Forschung trotzdem in voller Qualität (langsamer) · Rot = zu groß.").color(MUTED).size(10.0));
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("…or your own model (GGUF URL):").color(MUTED).size(11.0));
                 ui.horizontal(|ui| {
