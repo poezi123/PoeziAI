@@ -7,6 +7,11 @@ Cargo.lock
 /tmp/
 /scratch/
 
+# Local databases (OnlyChat / memory stores — never commit personal data)
+*.db
+*.sqlite
+*.sqlite3
+
 # Models, weights, checkpoints (too large for git)
 /models/
 *.gguf

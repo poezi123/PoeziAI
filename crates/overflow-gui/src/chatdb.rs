@@ -1023,10 +1023,10 @@ mod tests {
             let c = Connection::open(&path).unwrap();
             c.execute_batch(
                 "CREATE TABLE facts (subject TEXT, predicate TEXT, value TEXT, is_current INTEGER, priority INTEGER);
-                 INSERT INTO facts VALUES('Leon','lebt in','Österreich',1,5);
-                 INSERT INTO facts VALUES('Leon','Projekt','OVERFLOW',1,9);
+                 INSERT INTO facts VALUES('Mara','lebt in','Lindental',1,5);
+                 INSERT INTO facts VALUES('Mara','Projekt','OVERFLOW',1,9);
                  CREATE TABLE memory_packs (name TEXT, content TEXT);
-                 INSERT INTO memory_packs VALUES('Profil','Leon baut eine lokale KI namens OVERFLOW.');",
+                 INSERT INTO memory_packs VALUES('Profil','Mara baut eine lokale KI namens OVERFLOW.');",
             )
             .unwrap();
         }
@@ -1057,15 +1057,15 @@ mod tests {
             for i in 0..300 {
                 c.execute("INSERT INTO entities VALUES(?1,'person','filler')", params![format!("Filler Person {i}")]).unwrap();
             }
-            c.execute("INSERT INTO entities VALUES('Leon Pelzmann','person','baut OVERFLOW in der Steiermark')", []).unwrap();
+            c.execute("INSERT INTO entities VALUES('Mara Lindqvist','person','baut OVERFLOW in Lindental')", []).unwrap();
             // A note in a NON-indexed chunks table (no FTS) must still be found.
-            c.execute("INSERT INTO chunks VALUES(1,'Leon Pelzmann wohnt in der Steiermark und mag Katzen.')", []).unwrap();
+            c.execute("INSERT INTO chunks VALUES(1,'Mara Lindqvist wohnt in Lindental und mag Katzen.')", []).unwrap();
         }
         let db = ChatDb::open(&path, None).unwrap();
         // Tight budget: the old code would fill it with filler and drop the hit.
-        let ctx = db.memory_context("Wer ist Leon Pelzmann aus der Steiermark?", 1200).expect("context");
+        let ctx = db.memory_context("Wer ist Mara Lindqvist aus Lindental?", 1200).expect("context");
         assert!(ctx.contains("Treffer zur aktuellen Frage"), "has a relevant-hits section");
-        assert!(ctx.contains("Pelzmann"), "surfaces the entity row for the query");
+        assert!(ctx.contains("Lindqvist"), "surfaces the entity row for the query");
         assert!(ctx.contains("Katzen"), "finds the note in a non-indexed chunks table");
         std::fs::remove_file(&path).ok();
     }
